@@ -206,6 +206,9 @@ public struct ArgMaxSampler: LogitSampler {
 
 /// Sampler that uses probability filters (`topP`, `topK`, `minP`) and `temperature`
 /// to sample the logits.
+///
+/// When `topK` is set, uses `argPartition` (O(V)) instead of full `argSort` (O(V log V))
+/// to find the top-K candidates, then sorts only those K elements for cumulative filtering.
 public struct TopPSampler: LogitSampler {
     let temp: MLXArray
     let topP: MLXArray?
@@ -235,10 +238,59 @@ public struct TopPSampler: LogitSampler {
             // Match mlx-lm Python behavior:
             // apply filtering on the base distribution, then apply temperature at sampling time.
             let probs = softmax(logits, axis: -1)
-            let sortedIndices = argSort(probs, axis: -1)
+            let vocabularySize = probs.dim(-1)
 
-            // probs shape is [B,V] and after take it will be [1, B, V], so we squeeze it back to [B, V]
-            let sortedProbs = take(probs, sortedIndices, axis: -1).squeezed(axis: 0)
+            // Fast path: when topK is set and much smaller than vocab, use argPartition
+            // to find top-K candidates in O(V) instead of sorting entire vocab in O(V log V).
+            if let topK, topK < vocabularySize {
+                let kth = vocabularySize - topK
+
+                // O(V) partition: elements at indices >= kth are the top-K largest.
+                // argPartition returns same shape as input: [B, V].
+                let partIndices = argPartition(probs, kth: kth, axis: -1)
+                // Slice to keep only the top-K indices: [B, K]
+                let topKIndices = partIndices[0..., kth...]
+                // Gather the corresponding probabilities: [B, K]
+                let topKProbs = takeAlong(probs, topKIndices, axis: -1)
+
+                if topP != nil || minP != nil {
+                    // Need sorted order within top-K for cumulative filtering.
+                    // O(K log K) sort on K elements instead of O(V log V) on full vocab.
+                    let localSort = argSort(topKProbs, axis: -1)
+                    let sortedProbs = takeAlong(topKProbs, localSort, axis: -1)
+                    let sortedIndices = takeAlong(topKIndices, localSort, axis: -1)
+
+                    var filteredProbs = sortedProbs
+
+                    if let topP {
+                        let cumulativeProbs = cumsum(sortedProbs, axis: -1)
+                        filteredProbs = MLX.where(
+                            cumulativeProbs .> (1 - topP), filteredProbs,
+                            zeros(like: filteredProbs))
+                    }
+
+                    if let minP {
+                        let maxProbs = sortedProbs[0..., -1].expandedDimensions(axis: -1)
+                        let keepMask = sortedProbs .>= (maxProbs * minP)
+                        filteredProbs = MLX.where(
+                            keepMask, filteredProbs, zeros(like: filteredProbs))
+                    }
+
+                    // Always keep the max-probability token as a valid sampling candidate.
+                    filteredProbs[0..., -1] = sortedProbs[0..., -1]
+
+                    let sampledLocal = categorical(log(filteredProbs) * (1 / temp))
+                    return sortedIndices.squeezed(axis: 0)[sampledLocal]
+                } else {
+                    // topK-only: sample directly from top-K probs, no sort needed.
+                    let sampledLocal = categorical(log(topKProbs) * (1 / temp))
+                    return topKIndices.squeezed(axis: 0)[sampledLocal]
+                }
+            }
+
+            // Fallback: full sort for topP/minP without topK.
+            let sortedIndices = argSort(probs, axis: -1)
+            let sortedProbs = takeAlong(probs, sortedIndices, axis: -1)
 
             var filteredProbs = sortedProbs
 
@@ -252,17 +304,6 @@ public struct TopPSampler: LogitSampler {
                 let maxProbs = sortedProbs[0..., -1].expandedDimensions(axis: -1)
                 let keepMask = sortedProbs .>= (maxProbs * minP)
                 filteredProbs = MLX.where(keepMask, filteredProbs, zeros(like: filteredProbs))
-            }
-
-            if let topK {
-                let vocabularySize = sortedProbs.dim(-1)
-                if topK < vocabularySize {
-                    let cutOff = vocabularySize - topK
-                    let sortedPositions = MLXArray(Array(0 ..< vocabularySize))
-                    let keepMask = sortedPositions .>= cutOff
-                    filteredProbs = MLX.where(
-                        keepMask, filteredProbs, zeros(like: filteredProbs))
-                }
             }
 
             // Always keep the maximum-probability token so sampling always has a valid candidate.
