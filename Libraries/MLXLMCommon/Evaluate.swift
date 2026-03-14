@@ -375,7 +375,8 @@ public struct RepetitionContext: LogitProcessor {
     public func process(logits: MLXArray) -> MLXArray {
         guard count > 0 else { return logits }
 
-        let validTokens = count < repetitionContextSize
+        let validTokens =
+            count < repetitionContextSize
             ? tokenRing[..<count] : tokenRing
         let indices = validTokens.asType(.uint32)
         var selectedLogits = logits[0..., indices]
@@ -391,7 +392,7 @@ public struct RepetitionContext: LogitProcessor {
     mutating public func didSample(token: MLXArray) {
         // GPU-only: update ring buffer position without CPU←GPU sync.
         // writeIndex is a CPU-side counter (just an integer position, not a token value).
-        let positions = MLXArray(0..<Int32(repetitionContextSize))
+        let positions = MLXArray(0 ..< Int32(repetitionContextSize))
         let mask = positions .== Int32(writeIndex)
         tokenRing = MLX.where(mask, token.asType(.int32), tokenRing)
         writeIndex = (writeIndex + 1) % repetitionContextSize
@@ -441,7 +442,8 @@ public struct PresencePenaltyContext: LogitProcessor {
     public func process(logits: MLXArray) -> MLXArray {
         guard count > 0 else { return logits }
 
-        let validTokens = count < presenceContextSize
+        let validTokens =
+            count < presenceContextSize
             ? tokenRing[..<count] : tokenRing
         let indices = validTokens.asType(.uint32)
         // Scatter-write of (logit - penalty) is idempotent for duplicate indices:
@@ -451,7 +453,7 @@ public struct PresencePenaltyContext: LogitProcessor {
     }
 
     mutating public func didSample(token: MLXArray) {
-        let positions = MLXArray(0..<Int32(presenceContextSize))
+        let positions = MLXArray(0 ..< Int32(presenceContextSize))
         let mask = positions .== Int32(writeIndex)
         tokenRing = MLX.where(mask, token.asType(.int32), tokenRing)
         writeIndex = (writeIndex + 1) % presenceContextSize
@@ -500,7 +502,8 @@ public struct FrequencyPenaltyContext: LogitProcessor {
     public func process(logits: MLXArray) -> MLXArray {
         guard count > 0 else { return logits }
 
-        let validTokens = count < frequencyContextSize
+        let validTokens =
+            count < frequencyContextSize
             ? tokenRing[..<count] : tokenRing
 
         // Build frequency histogram on GPU via scatter_add.
@@ -516,7 +519,7 @@ public struct FrequencyPenaltyContext: LogitProcessor {
     }
 
     mutating public func didSample(token: MLXArray) {
-        let positions = MLXArray(0..<Int32(frequencyContextSize))
+        let positions = MLXArray(0 ..< Int32(frequencyContextSize))
         let mask = positions .== Int32(writeIndex)
         tokenRing = MLX.where(mask, token.asType(.int32), tokenRing)
         writeIndex = (writeIndex + 1) % frequencyContextSize
