@@ -583,9 +583,17 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
     }
 
     public func newCache(parameters: GenerateParameters?) -> [KVCache] {
+        let useClustered = parameters?.clusteredKV == true && parameters?.maxKVSize == nil
         return model.layers.map { layer in
             if layer.isLinear {
                 return MambaCache()
+            }
+            if useClustered, let params = parameters {
+                return ClusteredKVCache(
+                    numClusters: params.kvClusters,
+                    topClusters: params.kvTopClusters,
+                    recentWindow: params.kvRecentWindow
+                )
             }
             return KVCacheSimple()
         }

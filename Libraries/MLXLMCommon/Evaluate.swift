@@ -72,6 +72,20 @@ public struct GenerateParameters: Sendable {
     /// Step to begin using a quantized KV cache when kvBits is non-nil (default: 0)
     public var quantizedKVStart: Int
 
+    /// Enable clustered KV cache for long-context generation.
+    /// When true, uses ``ClusteredKVCache`` for full-attention layers.
+    /// Incompatible with `maxKVSize` (falls back to ``RotatingKVCache`` if set).
+    public var clusteredKV: Bool
+
+    /// Number of K-means clusters for clustered KV cache (default: 256)
+    public var kvClusters: Int
+
+    /// Number of top clusters to retrieve per query (default: 32)
+    public var kvTopClusters: Int
+
+    /// Recent window size for clustered KV cache (default: 2048)
+    public var kvRecentWindow: Int
+
     /// sampling temperature
     public var temperature: Float
 
@@ -108,6 +122,10 @@ public struct GenerateParameters: Sendable {
         kvBits: Int? = nil,
         kvGroupSize: Int = 64,
         quantizedKVStart: Int = 0,
+        clusteredKV: Bool = false,
+        kvClusters: Int = 256,
+        kvTopClusters: Int = 32,
+        kvRecentWindow: Int = 2048,
         temperature: Float = 0.6,
         topP: Float = 1.0,
         topK: Int = 0,
@@ -125,6 +143,10 @@ public struct GenerateParameters: Sendable {
         self.kvBits = kvBits
         self.kvGroupSize = kvGroupSize
         self.quantizedKVStart = quantizedKVStart
+        self.clusteredKV = clusteredKV
+        self.kvClusters = kvClusters
+        self.kvTopClusters = kvTopClusters
+        self.kvRecentWindow = kvRecentWindow
         self.temperature = temperature
         self.topP = topP
         self.topK = topK

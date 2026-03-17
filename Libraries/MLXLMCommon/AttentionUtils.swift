@@ -51,7 +51,11 @@ public func attentionWithCacheUpdate(
             mask: mask
         )
     }
-    if let quantizedKVCache = cache as? QuantizedKVCacheProtocol {
+    if let clusteredCache = cache as? ClusteredKVCacheProtocol {
+        let (_, _) = cache.update(keys: keys, values: values)
+        return clusteredCache.clusteredAttention(
+            queries: queries, scale: scale, mask: mask)
+    } else if let quantizedKVCache = cache as? QuantizedKVCacheProtocol {
         let (quantizedKeys, quantizedValues) = quantizedKVCache.updateQuantized(
             keys: keys, values: values)
         return quantizedScaledDotProductAttention(

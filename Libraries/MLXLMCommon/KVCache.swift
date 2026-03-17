@@ -1178,6 +1178,8 @@ public func savePromptCache(
             return "RotatingKVCache"
         case is QuantizedKVCache:
             return "QuantizedKVCache"
+        case is ClusteredKVCache:
+            return "ClusteredKVCache"  // Must precede KVCacheSimple (not a subclass, but check early)
         case is MambaCache:
             return "MambaCache"  // Must precede ArraysCache because of inheritance
         case is ArraysCache:
@@ -1278,6 +1280,10 @@ public func loadPromptCache(
             cache = RotatingKVCache(maxSize: maxSize)  // Create with parsed maxSize
         case "QuantizedKVCache":
             cache = QuantizedKVCache()
+        case "ClusteredKVCache":
+            // Parse metaState to get config, but use defaults for now
+            // Config constants are restored via metaState setter
+            cache = ClusteredKVCache()
         case "ChunkedKVCache":
             cache = ChunkedKVCache()
         case "MambaCache":
