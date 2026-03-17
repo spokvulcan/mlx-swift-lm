@@ -592,7 +592,9 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
                 return ClusteredKVCache(
                     numClusters: params.kvClusters,
                     topClusters: params.kvTopClusters,
-                    recentWindow: params.kvRecentWindow
+                    recentWindow: params.kvRecentWindow,
+                    prefillClusterThreshold: params.prefillClusterThreshold,
+                    prefillTopClusters: params.prefillTopClusters
                 )
             }
             return KVCacheSimple()

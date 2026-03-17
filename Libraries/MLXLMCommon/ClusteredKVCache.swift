@@ -16,8 +16,8 @@ import MLXNN
 /// `attentionWithCacheUpdate()` detects this protocol via `as?` and
 /// routes to `clusteredAttention()` instead of full attention.
 public protocol ClusteredKVCacheProtocol: KVCache {
-    /// Total number of clusters (K)
-    var numClusters: Int { get }
+    /// Total number of clusters (K). Mutable for adaptive sizing.
+    var numClusters: Int { get set }
 
     /// Number of top clusters to retrieve per query (C)
     var topClusters: Int { get }
@@ -57,8 +57,8 @@ public class ClusteredKVCache: BaseKVCache {
 
     // MARK: - Configuration
 
-    /// Number of K-means clusters
-    public let numClusters: Int
+    /// Number of K-means clusters (mutable for adaptive sizing)
+    public var numClusters: Int
 
     /// Number of top clusters retrieved per query
     public let topClusters: Int
@@ -74,6 +74,25 @@ public class ClusteredKVCache: BaseKVCache {
 
     /// Re-cluster every N new tokens
     public let reclusterInterval: Int
+
+    // MARK: - Prefill Configuration
+
+    /// Minimum sequence length to trigger gather-based clustered prefill
+    public let prefillClusterThreshold: Int
+
+    /// Number of top clusters for prefill (higher than generation's topClusters for quality)
+    public let prefillTopClusters: Int
+
+    // MARK: - Adaptive Cluster Configuration
+
+    /// Target number of tokens per cluster for adaptive sizing
+    public let targetClusterSize: Int
+
+    /// Minimum number of clusters for adaptive sizing
+    public let minClusters: Int
+
+    /// Maximum number of clusters for adaptive sizing
+    public let maxClusters: Int
 
     // MARK: - Full KV Storage (same as KVCacheSimple)
 
@@ -109,7 +128,12 @@ public class ClusteredKVCache: BaseKVCache {
         recentWindow: Int = 2048,
         sinkTokens: Int = 4,
         clusterThreshold: Int = 4096,
-        reclusterInterval: Int = 1024
+        reclusterInterval: Int = 1024,
+        prefillClusterThreshold: Int = 64,
+        prefillTopClusters: Int = 48,
+        targetClusterSize: Int = 1024,
+        minClusters: Int = 32,
+        maxClusters: Int = 512
     ) {
         self.numClusters = numClusters
         self.topClusters = topClusters
@@ -117,6 +141,11 @@ public class ClusteredKVCache: BaseKVCache {
         self.sinkTokens = sinkTokens
         self.clusterThreshold = clusterThreshold
         self.reclusterInterval = reclusterInterval
+        self.prefillClusterThreshold = prefillClusterThreshold
+        self.prefillTopClusters = prefillTopClusters
+        self.targetClusterSize = targetClusterSize
+        self.minClusters = minClusters
+        self.maxClusters = maxClusters
         super.init()
     }
 
@@ -231,22 +260,27 @@ public class ClusteredKVCache: BaseKVCache {
     public override var metaState: [String] {
         get {
             [
-                "\(offset)",
-                "\(numClusters)",
-                "\(topClusters)",
-                "\(recentWindow)",
-                "\(sinkTokens)",
-                "\(clusterThreshold)",
-                "\(reclusterInterval)",
-                clustersInitialized ? "1" : "0",
-                "\(tokensSinceRecluster)",
+                "\(offset)",  // 0
+                "\(numClusters)",  // 1
+                "\(topClusters)",  // 2
+                "\(recentWindow)",  // 3
+                "\(sinkTokens)",  // 4
+                "\(clusterThreshold)",  // 5
+                "\(reclusterInterval)",  // 6
+                clustersInitialized ? "1" : "0",  // 7
+                "\(tokensSinceRecluster)",  // 8
+                "\(prefillClusterThreshold)",  // 9
+                "\(prefillTopClusters)",  // 10
+                "\(targetClusterSize)",  // 11
+                "\(minClusters)",  // 12
+                "\(maxClusters)",  // 13
             ]
         }
         set {
             guard newValue.count >= 9 else { return }
             offset = Int(newValue[0]) ?? 0
-            // numClusters, topClusters, etc. are let constants — set at init time.
-            // They must match when loading. We just restore mutable state:
+            // Restore mutable numClusters (adaptive sizing may have changed it)
+            numClusters = Int(newValue[1]) ?? numClusters
             clustersInitialized = newValue[7] == "1"
             tokensSinceRecluster = Int(newValue[8]) ?? 0
         }
@@ -267,6 +301,15 @@ public class ClusteredKVCache: BaseKVCache {
         return trimmed
     }
 
+    // MARK: - Adaptive Cluster Count
+
+    /// Compute the adaptive cluster count based on current context length.
+    /// K = clamp(offset / targetClusterSize, minClusters, maxClusters)
+    private func adaptiveClusterCount() -> Int {
+        let desired = offset / targetClusterSize
+        return min(max(desired, minClusters), maxClusters)
+    }
+
     // MARK: - Clustering
 
     /// Initialize clusters using K-means++ on current key data.
@@ -283,6 +326,8 @@ public class ClusteredKVCache: BaseKVCache {
         // Work on batch 0 (B=1 for generation)
         let keysPerHead = allKeys[0]  // [nKVHeads, L, headDim]
 
+        // Adaptive cluster count
+        numClusters = adaptiveClusterCount()
         let K = min(numClusters, L)
 
         // K-means++ initialization: pick first centroid randomly, then distance-weighted
@@ -384,6 +429,7 @@ public class ClusteredKVCache: BaseKVCache {
     }
 
     /// Full K-means re-clustering (3 iterations) to correct centroid drift.
+    /// Handles adaptive cluster count changes via warm-start from old centroids.
     private func recluster() {
         guard let keys = self.keys, let centroids = self.centroids else { return }
 
@@ -391,10 +437,43 @@ public class ClusteredKVCache: BaseKVCache {
         // [nKVHeads, L, headDim]
         let nKVHeads = allKeys.dim(0)
         let L = allKeys.dim(1)
-        let K = centroids.dim(1)
+        let oldK = centroids.dim(1)
         let headDim = centroids.dim(2)
 
-        var currentCentroids = self.centroids!
+        // Check if adaptive count wants a different K
+        let newK = adaptiveClusterCount()
+        var currentCentroids: MLXArray
+
+        if newK != oldK {
+            numClusters = newK
+            if newK > oldK {
+                // Growing: keep old centroids, add new ones sampled from data
+                let extraCount = newK - oldK
+                var centroidsList = [MLXArray]()
+                for h in 0 ..< nKVHeads {
+                    let headKeys = allKeys[h]  // [L, headDim]
+                    // Pick extra centroids by striding through data
+                    let stride = max(1, L / extraCount)
+                    var extras = [MLXArray]()
+                    for i in 0 ..< extraCount {
+                        let idx = min((i * stride) + stride / 2, L - 1)
+                        extras.append(expandedDimensions(headKeys[idx], axis: 0))
+                    }
+                    let extraCentroids = concatenated(extras, axis: 0)  // [extraCount, headDim]
+                    let merged = concatenated(
+                        [centroids[h], extraCentroids], axis: 0)  // [newK, headDim]
+                    centroidsList.append(expandedDimensions(merged, axis: 0))
+                }
+                currentCentroids = concatenated(centroidsList, axis: 0)
+            } else {
+                // Shrinking: keep first newK centroids (simplest approach)
+                currentCentroids = centroids[.ellipsis, ..<newK, 0...]
+            }
+        } else {
+            currentCentroids = self.centroids!
+        }
+
+        let K = newK
 
         for _ in 0 ..< 3 {
             // Assignment: [nKVHeads, L, K]
@@ -426,6 +505,114 @@ public class ClusteredKVCache: BaseKVCache {
         }
 
         self.centroids = currentCentroids
+    }
+
+    // MARK: - Prefill Helpers
+
+    /// Manual attention returning both output and log-sum-exp for LSE merging.
+    ///
+    /// Required because `MLXFast.scaledDotProductAttention` doesn't expose LSE,
+    /// which is needed to correctly merge attention over disjoint key sets.
+    ///
+    /// - Parameters:
+    ///   - queries: [B, nH, S, D]
+    ///   - keys: [B, nH, L, D]
+    ///   - values: [B, nH, L, D]
+    ///   - mask: Optional boolean mask [broadcastable to B, nH, S, L]. False = masked out.
+    ///   - scale: Attention scale (1/sqrt(D))
+    /// - Returns: (output: [B, nH, S, D], lse: [B, nH, S, 1])
+    internal func attentionWithLSE(
+        queries: MLXArray,
+        keys: MLXArray,
+        values: MLXArray,
+        mask: MLXArray?,
+        scale: Float
+    ) -> (output: MLXArray, lse: MLXArray) {
+        // scores: [B, nH, S, L]
+        var scores = MLX.matmul(queries, keys.transposed(0, 1, 3, 2)) * MLXArray(scale)
+
+        // Apply mask: set masked positions to -inf so they contribute 0 after softmax
+        if let mask = mask {
+            scores = MLX.where(mask, scores, MLXArray(Float(-1e9)))
+        }
+
+        // LSE: [B, nH, S, 1] — log of sum of exp(scores) across key dimension
+        let lse = scores.logSumExp(axis: -1, keepDims: true)
+
+        // Softmax weights: [B, nH, S, L]
+        let weights = softmax(scores, axis: -1)
+
+        // Output: [B, nH, S, D]
+        let output = MLX.matmul(weights, values)
+
+        return (output, lse)
+    }
+
+    /// Build a 1D index tensor of token positions to gather from the old KV region.
+    ///
+    /// Collects: sink tokens ∪ tokens in selected clusters ∪ recent window.
+    /// The indices are shared across all KV heads (head-uniform gather).
+    ///
+    /// - Parameters:
+    ///   - topClusterIndices: [B, nKVHeads, C] — selected cluster IDs
+    ///   - oldLen: Number of tokens in the "old" region (sinkEnd ..< recentStart)
+    ///   - sinkEnd: End of sink region
+    ///   - recentStart: Start of recent window
+    ///   - totalLen: Total KV length (offset)
+    /// - Returns: Sorted 1D gather indices [gatheredCount] (int32)
+    internal func buildGatherIndices(
+        topClusterIndices: MLXArray,
+        oldLen: Int,
+        sinkEnd: Int,
+        recentStart: Int,
+        totalLen: Int
+    ) -> MLXArray {
+        guard let assignments = self.assignments else {
+            // No assignments — return all indices (fallback)
+            return MLXArray(Array(Int32(0) ..< Int32(totalLen)))
+        }
+
+        // Old region assignments: [nKVHeads, oldLen]
+        let oldAssignments = assignments[.ellipsis, sinkEnd ..< recentStart]
+
+        // topClusterIndices: [B, nKVHeads, C] — use batch 0
+        let topC = topClusterIndices[0]  // [nKVHeads, C]
+
+        // For each position in old region, check if ANY head's assignment matches
+        // ANY of that head's top-C clusters. Union across heads for head-uniform gather.
+        // oldAssignments: [nKVHeads, oldLen] → [nKVHeads, oldLen, 1]
+        // topC: [nKVHeads, C] → [nKVHeads, 1, C]
+        let oldExpanded = expandedDimensions(oldAssignments, axis: -1).asType(.int32)
+        let topExpanded = expandedDimensions(topC, axis: 1).asType(.int32)
+
+        // match: [nKVHeads, oldLen, C] → any across C → [nKVHeads, oldLen]
+        let matchPerHead = (oldExpanded .== topExpanded).any(axis: -1)
+
+        // Union across heads: any head selects this position → [oldLen]
+        let selected = matchPerHead.any(axis: 0)  // [oldLen]
+        eval(selected)
+
+        // Build index list: sink + selected old + recent
+        var indices = [Int32]()
+
+        // Sink tokens
+        for i in Int32(0) ..< Int32(sinkEnd) {
+            indices.append(i)
+        }
+
+        // Selected old tokens
+        for i in 0 ..< oldLen {
+            if selected[i].item(Bool.self) {
+                indices.append(Int32(sinkEnd + i))
+            }
+        }
+
+        // Recent window
+        for i in Int32(recentStart) ..< Int32(totalLen) {
+            indices.append(i)
+        }
+
+        return MLXArray(indices)
     }
 
     // MARK: - Mask
@@ -473,9 +660,16 @@ extension ClusteredKVCache: ClusteredKVCacheProtocol {
 
         // --- Clustered retrieval path ---
 
+        let S = queries.dim(2)  // 1 during generation, >1 during prefill
+
+        // Dispatch to gather-based prefill for multi-token chunks
+        if S >= prefillClusterThreshold {
+            return clusteredPrefillAttention(
+                queries: queries, allKeys: allKeys, allValues: allValues, scale: scale)
+        }
+
         let B = queries.dim(0)
         let nQHeads = queries.dim(1)
-        let S = queries.dim(2)  // 1 during generation, >1 during prefill
         let headDim = queries.dim(3)
         let nKVHeads = allKeys.dim(1)
         let nRepeats = nQHeads / nKVHeads
@@ -581,10 +775,6 @@ extension ClusteredKVCache: ClusteredKVCacheProtocol {
         // For each head, gather masked tokens and pad to maxSelected
         // This is the Phase 1 "ragged gather + pad" approach
 
-        // Create indices for the old region where mask is true
-        // We use a dense gather: for each head, collect indices where mask=true, pad rest
-        let totalRetrieved = sinkEnd + maxSelected + recentLen
-
         // Build the subset K/V by concatenating sink + padded_old + recent
         // For the old region, we apply the mask directly in attention scores
         // rather than physically gathering (simpler, avoids per-head scatter)
@@ -626,5 +816,172 @@ extension ClusteredKVCache: ClusteredKVCacheProtocol {
             scale: scale,
             mask: .array(attentionMask)
         )
+    }
+
+    // MARK: - Gather-Based Clustered Prefill
+
+    /// Two-pass gather-based attention for prefill chunks.
+    ///
+    /// Instead of masking the full KV (reads all L entries), physically **gathers** only
+    /// selected KV entries into a compact tensor for true bandwidth reduction.
+    ///
+    /// Pass 1 (within-chunk): Exact causal attention on just the new chunk's K/V.
+    /// Pass 2 (cross-chunk): Attention on gathered sink + top-C clusters + recent window.
+    /// Merge via numerically stable log-sum-exp combination.
+    ///
+    /// At 262K context with 8x compression: reads ~33K entries instead of 262K.
+    private func clusteredPrefillAttention(
+        queries: MLXArray,
+        allKeys: MLXArray,
+        allValues: MLXArray,
+        scale: Float
+    ) -> MLXArray {
+        let B = queries.dim(0)
+        let nQHeads = queries.dim(1)
+        let S = queries.dim(2)
+        let headDim = queries.dim(3)
+        let nKVHeads = allKeys.dim(1)
+        let nRepeats = nQHeads / nKVHeads
+        let L = offset
+
+        // The new chunk is the last S tokens in the cache
+        let chunkStart = L - S
+
+        // Determine regions in the OLD cache (before this chunk)
+        let sinkEnd = min(sinkTokens, chunkStart)
+        let recentStart = max(sinkEnd, chunkStart - recentWindow)
+
+        // If there's not enough old context to benefit from clustering, use full attention
+        if chunkStart <= clusterThreshold || !clustersInitialized || recentStart <= sinkEnd {
+            return MLXFast.scaledDotProductAttention(
+                queries: queries,
+                keys: allKeys,
+                values: allValues,
+                scale: scale,
+                mask: .causal
+            )
+        }
+
+        // --- Pass 1: Within-chunk exact causal attention ---
+        // chunkK/V: [B, nKVHeads, S, D]
+        let chunkKeys = allKeys[.ellipsis, chunkStart ..< L, 0...]
+        let chunkValues = allValues[.ellipsis, chunkStart ..< L, 0...]
+
+        // GQA expand for within-chunk
+        let chunkKeysExpanded: MLXArray
+        let chunkValuesExpanded: MLXArray
+        if nRepeats > 1 {
+            chunkKeysExpanded = expandForGQA(chunkKeys, nRepeats: nRepeats)
+            chunkValuesExpanded = expandForGQA(chunkValues, nRepeats: nRepeats)
+        } else {
+            chunkKeysExpanded = chunkKeys
+            chunkValuesExpanded = chunkValues
+        }
+
+        // Causal mask for S×S within-chunk: lower-triangular
+        let causalMask = MLXArray.tri(S, m: S, k: 0, dtype: .bool)  // [S, S]
+
+        let (outWithin, lseWithin) = attentionWithLSE(
+            queries: queries,
+            keys: chunkKeysExpanded,
+            values: chunkValuesExpanded,
+            mask: causalMask,
+            scale: scale
+        )
+
+        // --- Cross-chunk cluster selection ---
+        // Average queries across GQA groups → [B, nKVHeads, S, D]
+        let queryPerKVHead: MLXArray
+        if nRepeats > 1 {
+            let reshaped = queries.reshaped(B, nKVHeads, nRepeats, S, headDim)
+            queryPerKVHead = reshaped.mean(axis: 2)
+        } else {
+            queryPerKVHead = queries
+        }
+
+        // Mean-of-queries for shared cluster selection: [B, nKVHeads, 1, D]
+        let meanQuery = queryPerKVHead.mean(axis: 2, keepDims: true)
+
+        // Similarity to centroids: [B, nKVHeads, 1, K]
+        let centroidsExp = expandedDimensions(centroids!, axis: 0)
+        let similarity = MLX.matmul(
+            meanQuery,
+            centroidsExp.transposed(0, 1, 3, 2)
+        )  // [B, nKVHeads, 1, K]
+
+        let simFlat = similarity.squeezed(axis: 2)  // [B, nKVHeads, K]
+        let K = numClusters
+        let C = min(prefillTopClusters, K)
+        let kth = K - C
+        let topIndices = MLX.argPartition(simFlat, kth: kth, axis: -1)[
+            .ellipsis, kth...]  // [B, nKVHeads, C]
+
+        // --- Build gather indices and gather compact KV ---
+        let gatherIndices = buildGatherIndices(
+            topClusterIndices: topIndices,
+            oldLen: recentStart - sinkEnd,
+            sinkEnd: sinkEnd,
+            recentStart: recentStart,
+            totalLen: chunkStart  // Only gather from old cache, not the new chunk
+        )
+        eval(gatherIndices)
+        let gatheredCount = gatherIndices.dim(0)
+
+        if gatheredCount == 0 {
+            // No cross-chunk tokens — return within-chunk only
+            return outWithin
+        }
+
+        // Gather compact KV: [B, nKVHeads, gatheredCount, D]
+        let oldKeys = allKeys[.ellipsis, ..<chunkStart, 0...]
+        let oldValues = allValues[.ellipsis, ..<chunkStart, 0...]
+        let gatheredKeys = oldKeys.take(gatherIndices, axis: 2)
+        let gatheredValues = oldValues.take(gatherIndices, axis: 2)
+
+        // GQA expand gathered KV
+        let gatheredKeysExpanded: MLXArray
+        let gatheredValuesExpanded: MLXArray
+        if nRepeats > 1 {
+            gatheredKeysExpanded = expandForGQA(gatheredKeys, nRepeats: nRepeats)
+            gatheredValuesExpanded = expandForGQA(gatheredValues, nRepeats: nRepeats)
+        } else {
+            gatheredKeysExpanded = gatheredKeys
+            gatheredValuesExpanded = gatheredValues
+        }
+
+        // --- Pass 2: Cross-chunk attention (no causal mask needed) ---
+        // All gathered keys precede all query positions, so no causal masking
+        let (outCross, lseCross) = attentionWithLSE(
+            queries: queries,
+            keys: gatheredKeysExpanded,
+            values: gatheredValuesExpanded,
+            mask: nil,
+            scale: scale
+        )
+
+        // --- LSE merge ---
+        // Numerically stable combination of two disjoint attention passes
+        let maxLSE: MLXArray = MLX.maximum(lseWithin, lseCross)
+        let diffWithin: MLXArray = subtract(lseWithin, maxLSE)
+        let diffCross: MLXArray = subtract(lseCross, maxLSE)
+        let expWithin: MLXArray = MLX.exp(diffWithin)
+        let expCross: MLXArray = MLX.exp(diffCross)
+        let denom: MLXArray = expWithin + expCross
+        let merged: MLXArray = (outWithin * expWithin + outCross * expCross) / denom
+
+        return merged
+    }
+
+    /// Expand KV tensor for GQA: [B, nKVH, L, D] → [B, nQH, L, D]
+    private func expandForGQA(_ tensor: MLXArray, nRepeats: Int) -> MLXArray {
+        let B = tensor.dim(0)
+        let nKVH = tensor.dim(1)
+        let seqLen = tensor.dim(2)
+        let D = tensor.dim(3)
+        // [B, nKVH, 1, L, D] → broadcast → [B, nKVH, nRepeats, L, D] → reshape
+        let expanded = broadcast(
+            expandedDimensions(tensor, axis: 2),
+            to: [B, nKVH, nRepeats, seqLen, D])
+        return expanded.reshaped(B, nKVH * nRepeats, seqLen, D)
     }
 }
