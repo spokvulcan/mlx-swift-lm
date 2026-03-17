@@ -365,77 +365,120 @@ public func loadParoQuantModel(
     var config = ModelConfiguration(directory: directory, toolCallFormat: toolCallFormat)
     config.eosTokenIds = eosTokenIds
 
-    // 5. Load raw safetensors
-    var weights = [String: MLXArray]()
-    let enumerator = FileManager.default.enumerator(
-        at: directory, includingPropertiesForKeys: nil)!
-    while let url = enumerator.nextObject() as? URL {
-        if url.pathExtension == "safetensors" {
-            let w = try loadArrays(url: url)
-            for (key, value) in w {
-                weights[key] = value
+    // 5. Check for pre-rotated weight cache
+    let cacheURL = directory.appendingPathComponent("prerotated_cache.safetensors")
+    let hasCachedWeights = FileManager.default.fileExists(atPath: cacheURL.path)
+
+    if hasCachedWeights {
+        // Fast path: load pre-rotated weights directly (no AWQ conversion, no rotation)
+        logger.info("Loading pre-rotated weight cache")
+        let cachedWeights = try loadArrays(url: cacheURL)
+        var sanitized = model.sanitize(weights: cachedWeights)
+
+        // Swap Linear → QuantizedLinear where .scales exist
+        quantize(model: model) { path, module in
+            guard module is Quantizable else { return nil }
+            guard sanitized["\(path).scales"] != nil else { return nil }
+            return (paroConfig.groupSize, paroConfig.bits, .affine)
+        }
+
+        let params = ModuleParameters.unflattened(sanitized)
+        try model.update(parameters: params, verify: [.allModelKeysSet, .shapeMismatch])
+        eval(model)
+        logger.info("ParoQuant model loaded from cache")
+    } else {
+        // Full path: AWQ conversion + rotation patching + pre-rotation + cache save
+
+        // 5a. Load raw safetensors
+        var weights = [String: MLXArray]()
+        let enumerator = FileManager.default.enumerator(
+            at: directory, includingPropertiesForKeys: nil)!
+        while let url = enumerator.nextObject() as? URL {
+            if url.pathExtension == "safetensors" {
+                let w = try loadArrays(url: url)
+                for (key, value) in w {
+                    weights[key] = value
+                }
             }
         }
-    }
 
-    logger.info("Loaded \(weights.count) weight keys from safetensors")
+        logger.info("Loaded \(weights.count) weight keys from safetensors")
 
-    // 6. Convert AutoAWQ format → MLX format (BEFORE sanitize)
-    if weights.keys.contains(where: { $0.hasSuffix(".qweight") }) {
-        convertAutoAWQ(&weights, groupSize: paroConfig.groupSize)
-        logger.info("Converted AutoAWQ weights to MLX format")
-    }
-
-    // 7. Model-specific sanitization
-    weights = model.sanitize(weights: weights)
-
-    // 8. Patch rotation layers
-    try patchRotationLayers(
-        model: model, weights: weights,
-        bits: paroConfig.bits, groupSize: paroConfig.groupSize
-    )
-
-    // 9. Quantize non-rotation layers in MLX quantized form
-    quantize(model: model) { path, module in
-        guard module is Quantizable else { return nil }
-        guard isCheckpointQuantizedLayer(path: path, weights: weights) else {
-            return nil
+        // 6. Convert AutoAWQ format → MLX format (BEFORE sanitize)
+        if weights.keys.contains(where: { $0.hasSuffix(".qweight") }) {
+            convertAutoAWQ(&weights, groupSize: paroConfig.groupSize)
+            logger.info("Converted AutoAWQ weights to MLX format")
         }
-        return (paroConfig.groupSize, paroConfig.bits, .affine)
-    }
 
-    // 10. Load checkpoint weights into the patched model
-    let parameters = ModuleParameters.unflattened(weights)
-    let verify: Module.VerifyUpdate = [.allModelKeysSet, .shapeMismatch]
-    try model.update(parameters: parameters, verify: verify)
+        // 7. Model-specific sanitization
+        weights = model.sanitize(weights: weights)
 
-    // 11. Quantize IO embedding path from FP16 weights
-    quantize(model: model) { path, module in
-        guard isParoQuantIOLayer(path: path, module: module) else {
-            return nil
+        // 8. Patch rotation layers
+        try patchRotationLayers(
+            model: model, weights: weights,
+            bits: paroConfig.bits, groupSize: paroConfig.groupSize
+        )
+
+        // 9. Quantize non-rotation layers in MLX quantized form
+        quantize(model: model) { path, module in
+            guard module is Quantizable else { return nil }
+            guard isCheckpointQuantizedLayer(path: path, weights: weights) else {
+                return nil
+            }
+            return (paroConfig.groupSize, paroConfig.bits, .affine)
         }
-        return (paroConfig.groupSize, paroConfig.bits, .affine)
-    }
 
-    // 12. Pre-rotate weights: bake rotation + channel_scales into quantized weights
-    //     Eliminates ~144 rotation kernel dispatches per token (~7% throughput gain)
-    let rotationModules = model.leafModules().flattened()
-        .compactMap { (_, module) in module as? RotateQuantizedLinear }
-    if !rotationModules.isEmpty {
-        logger.info(
-            "Pre-rotating weights for \(rotationModules.count) RotateQuantizedLinear layers")
-        for (i, module) in rotationModules.enumerated() {
-            module.preRotateWeights()
-            // Clear GPU cache between layers to bound peak memory
-            if (i + 1) % 6 == 0 {
-                Memory.clearCache()
+        // 10. Load checkpoint weights into the patched model
+        let parameters = ModuleParameters.unflattened(weights)
+        let verify: Module.VerifyUpdate = [.allModelKeysSet, .shapeMismatch]
+        try model.update(parameters: parameters, verify: verify)
+
+        // 11. Quantize IO embedding path from FP16 weights
+        quantize(model: model) { path, module in
+            guard isParoQuantIOLayer(path: path, module: module) else {
+                return nil
+            }
+            return (paroConfig.groupSize, paroConfig.bits, .affine)
+        }
+
+        // 12. Pre-rotate weights: bake rotation + channel_scales into quantized weights
+        let rotationModules = model.leafModules().flattened()
+            .compactMap { (_, module) in module as? RotateQuantizedLinear }
+        if !rotationModules.isEmpty {
+            logger.info(
+                "Pre-rotating weights for \(rotationModules.count) RotateQuantizedLinear layers"
+            )
+            for (i, module) in rotationModules.enumerated() {
+                module.preRotateWeights()
+                if (i + 1) % 6 == 0 {
+                    Memory.clearCache()
+                }
             }
         }
-    }
 
-    // 13. Materialize
-    eval(model)
-    logger.info("ParoQuant model loaded and evaluated")
+        // 13. Materialize
+        eval(model)
+        logger.info("ParoQuant model loaded and evaluated")
+
+        // 14. Save pre-rotated weight cache for fast subsequent loads
+        do {
+            var cacheWeights = [String: MLXArray]()
+            for (key, value) in model.parameters().flattened() {
+                // Skip rotation-specific keys (already baked into weights)
+                if key.hasSuffix(".theta") || key.hasSuffix(".pairs")
+                    || key.hasSuffix(".channel_scales")
+                {
+                    continue
+                }
+                cacheWeights[key] = value
+            }
+            eval(cacheWeights)
+            try save(arrays: cacheWeights, url: cacheURL)
+            logger.info("Saved pre-rotated weight cache (\(cacheWeights.count) keys)")
+        } catch {
+            logger.warning("Failed to save weight cache: \(error)")
+        }
+    }
 
     // 13. Load tokenizer
     let tokenizer = try await loadTokenizer(configuration: config, hub: defaultHubApi)
