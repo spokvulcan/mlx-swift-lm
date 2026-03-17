@@ -424,8 +424,12 @@ public func loadParoQuantModel(
     if !rotationModules.isEmpty {
         logger.info(
             "Pre-rotating weights for \(rotationModules.count) RotateQuantizedLinear layers")
-        for module in rotationModules {
+        for (i, module) in rotationModules.enumerated() {
             module.preRotateWeights()
+            // Clear GPU cache between layers to bound peak memory
+            if (i + 1) % 6 == 0 {
+                Memory.clearCache()
+            }
         }
     }
 

@@ -232,48 +232,64 @@ nonisolated open class RotateQuantizedLinear: QuantizedLinear {
         let gs = groupSize
         let numGroups = c.numGroups
 
-        // 1. Dequantize current weights to float
+        // 1. Dequantize current weights to float16
         let wFloat = dequantized(
             weight, scales: scales, biases: biases,
             groupSize: gs, bits: bits
-        ).asType(.float32)
-        // wFloat is [outputDims, inputDims]
+        )
+        // wFloat is [outputDims, inputDims] in float16
 
-        // 2. Build rotation matrix group-by-group and pre-rotate columns of W
-        //    rotate(I) = diag(s) @ R^T (where R is the rotation matrix)
-        //    W_pre = W @ rotate(I)^T
-        var wPre = wFloat
+        // 2. Build rotation matrix group-by-group and pre-rotate columns of W.
+        //    rotate(I_g) computes the rotation+scale block for group g.
+        //    W_pre[:, g] = wFloat[:, g] @ block_g^T
+        var preRotatedGroups = [MLXArray]()
+        preRotatedGroups.reserveCapacity(numGroups)
 
         for g in 0 ..< numGroups {
             let colStart = g * gs
             let colEnd = colStart + gs
 
-            // Create identity vectors for this group embedded in full dim
-            var groupInput = MLXArray.zeros([gs, dim], dtype: .float32)
-            // Set the diagonal block: groupInput[i, colStart+i] = 1
-            for i in 0 ..< gs {
-                groupInput[i, colStart + i] = MLXArray(Float(1.0))
+            // Build [gs, dim] input: identity block at columns [colStart, colEnd), zeros elsewhere
+            let eye = MLXArray.identity(gs).asType(.float16)
+            if colStart == 0 && colEnd == dim {
+                // Single group spans entire dim
+                let rotated = rotate(eye, cache: c)
+                let wCols = wFloat[0..., colStart ..< colEnd]
+                preRotatedGroups.append(matmul(wCols, rotated.transposed()))
+            } else {
+                let leftPad =
+                    colStart > 0
+                    ? MLXArray.zeros([gs, colStart], dtype: .float16) : nil
+                let rightPad =
+                    colEnd < dim
+                    ? MLXArray.zeros([gs, dim - colEnd], dtype: .float16) : nil
+                var parts = [MLXArray]()
+                if let leftPad { parts.append(leftPad) }
+                parts.append(eye)
+                if let rightPad { parts.append(rightPad) }
+                let groupInput = concatenated(parts, axis: 1)
+
+                let rotated = rotate(groupInput, cache: c)
+                let block = rotated[0..., colStart ..< colEnd]
+
+                let wCols = wFloat[0..., colStart ..< colEnd]
+                preRotatedGroups.append(matmul(wCols, block.transposed()))
             }
-            eval(groupInput)
 
-            // Apply the rotation kernel (includes channel_scales)
-            let rotated = rotate(groupInput, cache: c)
-            // rotated[i, :] = rotate(e_{colStart+i}) → only cols colStart..<colEnd are nonzero
-            // Extract the [gs, gs] block
-            let block = rotated[0..., colStart ..< colEnd]
-            eval(block)
-
-            // Pre-rotate the corresponding columns of W
-            // W_pre[:, colStart:colEnd] = wFloat[:, colStart:colEnd] @ block^T
-            let wCols = wFloat[0..., colStart ..< colEnd]  // [outputDims, gs]
-            wPre[0..., colStart ..< colEnd] = matmul(wCols, block.transposed())
+            // Eval every few groups to bound computation graph size
+            if (g + 1) % 8 == 0 || g == numGroups - 1 {
+                eval(preRotatedGroups)
+            }
         }
+
+        // 3. Reassemble the full pre-rotated weight matrix
+        let wPre = concatenated(preRotatedGroups, axis: 1)
         eval(wPre)
 
-        // 3. Re-quantize the pre-rotated weights
-        let (wq, sc, bi) = quantized(wPre.asType(.float16), groupSize: gs, bits: bits)
+        // 4. Re-quantize
+        let (wq, sc, bi) = quantized(wPre, groupSize: gs, bits: bits)
 
-        // 4. Update the QuantizedLinear properties via parameter update
+        // 5. Update the QuantizedLinear properties
         let params: [String: MLXArray] = [
             "weight": wq,
             "scales": sc,
