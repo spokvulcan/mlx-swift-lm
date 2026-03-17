@@ -103,6 +103,11 @@ if args.scenario == "all" {
     }
 }
 
+// Correctness check (always runs before benchmarks)
+let checker = CorrectnessCheck(container: container)
+try await checker.run()
+print()
+
 // Run benchmarks
 let runner = BenchmarkRunner(
     container: container,
