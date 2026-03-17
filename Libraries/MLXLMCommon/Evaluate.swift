@@ -77,6 +77,11 @@ public struct GenerateParameters: Sendable {
     /// Incompatible with `maxKVSize` (falls back to ``RotatingKVCache`` if set).
     public var clusteredKV: Bool
 
+    /// Enable per-operation profiling for ClusteredKVCache.
+    /// When true, attaches a ``ClusteredKVCacheProfiler`` to each clustered cache layer.
+    /// Inserts eval+sync barriers (breaks fusion) — use for diagnosis only.
+    public var profileClustered: Bool
+
     /// Number of K-means clusters for clustered KV cache (default: 256)
     public var kvClusters: Int
 
@@ -120,6 +125,7 @@ public struct GenerateParameters: Sendable {
         kvGroupSize: Int = 64,
         quantizedKVStart: Int = 0,
         clusteredKV: Bool = false,
+        profileClustered: Bool = false,
         kvClusters: Int = 256,
         kvRecentWindow: Int = 2048,
         temperature: Float = 0.6,
@@ -140,6 +146,7 @@ public struct GenerateParameters: Sendable {
         self.kvGroupSize = kvGroupSize
         self.quantizedKVStart = quantizedKVStart
         self.clusteredKV = clusteredKV
+        self.profileClustered = profileClustered
         self.kvClusters = kvClusters
         self.kvRecentWindow = kvRecentWindow
         self.temperature = temperature
@@ -621,8 +628,8 @@ public struct TokenIterator: Sequence, IteratorProtocol {
     let kvGroupSize: Int
     let quantizedKVStart: Int
 
-    // Internal metrics
-    var promptPrefillTime: TimeInterval = 0.0
+    // Metrics
+    public private(set) var promptPrefillTime: TimeInterval = 0.0
 
     /// Initialize a `TokenIterator` with the given tokens. Note: this has been
     /// replaced with ``init(input:model:cache:parameters:)``.

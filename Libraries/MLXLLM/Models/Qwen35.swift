@@ -589,10 +589,14 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
                 return MambaCache()
             }
             if useClustered, let params = parameters {
-                return ClusteredKVCache(
+                let cache = ClusteredKVCache(
                     numClusters: params.kvClusters,
                     recentWindow: params.kvRecentWindow
                 )
+                if params.profileClustered {
+                    cache.profiler = ClusteredKVCacheProfiler()
+                }
+                return cache
             }
             return KVCacheSimple()
         }

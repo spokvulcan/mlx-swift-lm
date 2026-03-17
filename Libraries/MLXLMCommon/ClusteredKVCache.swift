@@ -71,6 +71,9 @@ public class ClusteredKVCache: BaseKVCache {
     /// Re-cluster every N new tokens
     public let reclusterInterval: Int
 
+    /// Optional profiler. When set, inserts eval+sync barriers to measure per-op GPU time.
+    public var profiler: ClusteredKVCacheProfiler?
+
     // MARK: - Full KV Storage (same as KVCacheSimple)
 
     internal var keys: MLXArray?
@@ -129,53 +132,88 @@ public class ClusteredKVCache: BaseKVCache {
     public override func update(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
         let previous = self.offset
 
-        // Grow storage (same logic as KVCacheSimple)
-        let reset =
-            if let currentKeys = self.keys, (previous + keys.dim(2)) > currentKeys.dim(2) {
-                true
-            } else {
-                self.keys == nil
-            }
-        if reset {
-            let B = keys.dim(0)
-            let kvHeads = keys.dim(1)
-            let kHeadDim = keys.dim(3)
-            let vHeadDim = values.dim(3)
-
-            let nSteps = (step + keys.dim(2) - 1) / step
-            let kShape = [B, kvHeads, nSteps * step, kHeadDim]
-            let vShape = [B, kvHeads, nSteps * step, vHeadDim]
-            let newK = MLXArray.zeros(kShape, dtype: keys.dtype)
-            let newV = MLXArray.zeros(vShape, dtype: values.dtype)
-
-            if var currentKeys = self.keys, var currentValues = self.values {
-                if previous % step != 0 {
-                    currentKeys = currentKeys[.ellipsis, ..<previous, 0...]
-                    currentValues = currentValues[.ellipsis, ..<previous, 0...]
+        // --- KV store section ---
+        let kvStoreBlock = {
+            let reset =
+                if let currentKeys = self.keys, (previous + keys.dim(2)) > currentKeys.dim(2) {
+                    true
+                } else {
+                    self.keys == nil
                 }
-                self.keys = concatenated([currentKeys, newK], axis: 2)
-                self.values = concatenated([currentValues, newV], axis: 2)
-            } else {
-                self.keys = newK
-                self.values = newV
+            if reset {
+                let B = keys.dim(0)
+                let kvHeads = keys.dim(1)
+                let kHeadDim = keys.dim(3)
+                let vHeadDim = values.dim(3)
+
+                let nSteps = (self.step + keys.dim(2) - 1) / self.step
+                let kShape = [B, kvHeads, nSteps * self.step, kHeadDim]
+                let vShape = [B, kvHeads, nSteps * self.step, vHeadDim]
+                let newK = MLXArray.zeros(kShape, dtype: keys.dtype)
+                let newV = MLXArray.zeros(vShape, dtype: values.dtype)
+
+                if var currentKeys = self.keys, var currentValues = self.values {
+                    if previous % self.step != 0 {
+                        currentKeys = currentKeys[.ellipsis, ..<previous, 0...]
+                        currentValues = currentValues[.ellipsis, ..<previous, 0...]
+                    }
+                    self.keys = concatenated([currentKeys, newK], axis: 2)
+                    self.values = concatenated([currentValues, newV], axis: 2)
+                } else {
+                    self.keys = newK
+                    self.values = newV
+                }
             }
+
+            self.offset += keys.dim(2)
+
+            self.keys?[.ellipsis, previous ..< self.offset, 0...] = keys
+            self.values?[.ellipsis, previous ..< self.offset, 0...] = values
         }
 
-        self.offset += keys.dim(2)
+        if let p = profiler {
+            p.measure(.kvStore) {
+                kvStoreBlock()
+                return [self.keys!, self.values!]
+            }
+        } else {
+            kvStoreBlock()
+        }
 
-        self.keys?[.ellipsis, previous ..< self.offset, 0...] = keys
-        self.values?[.ellipsis, previous ..< self.offset, 0...] = values
-
-        // Update cluster metadata for new tokens
+        // --- Cluster metadata update ---
         let newTokenCount = keys.dim(2)
         if self.offset >= clusterThreshold {
             if !clustersInitialized {
-                initializeClusters()
+                if let p = profiler {
+                    p.measure(.initClusters) {
+                        self.initializeClusters()
+                        return [
+                            self.centroids!, self.assignments!,
+                            self.clusterCounts!, self.centroidValues!,
+                        ]
+                    }
+                } else {
+                    initializeClusters()
+                }
             } else {
-                assignNewTokens(from: previous, count: newTokenCount)
+                if let p = profiler {
+                    p.measure(.clusterAssign) {
+                        self.assignNewTokens(from: previous, count: newTokenCount)
+                        return [self.centroids!, self.assignments!]
+                    }
+                } else {
+                    assignNewTokens(from: previous, count: newTokenCount)
+                }
                 tokensSinceRecluster += newTokenCount
                 if tokensSinceRecluster >= reclusterInterval {
-                    recluster()
+                    if let p = profiler {
+                        p.measure(.recluster) {
+                            self.recluster()
+                            return [self.centroids!, self.assignments!]
+                        }
+                    } else {
+                        recluster()
+                    }
                     tokensSinceRecluster = 0
                 }
             }
@@ -523,36 +561,52 @@ extension ClusteredKVCache: ClusteredKVCacheProtocol {
 
             let recentK = allKeys[.ellipsis, recentStart..., 0...]
             let recentV = allValues[.ellipsis, recentStart..., 0...]
-            let combinedK = concatenated([sinkK, centK, recentK], axis: 2)
-            let combinedV = concatenated([sinkV, centV, recentV], axis: 2)
 
-            return MLXFast.scaledDotProductAttention(
-                queries: queries,
-                keys: combinedK,
-                values: combinedV,
-                scale: scale,
-                mask: .none
-            )
+            var combinedK: MLXArray!
+            var combinedV: MLXArray!
+
+            if let p = profiler {
+                p.measure(.attentionConcat) {
+                    combinedK = concatenated([sinkK, centK, recentK], axis: 2)
+                    combinedV = concatenated([sinkV, centV, recentV], axis: 2)
+                    return [combinedK, combinedV]
+                }
+            } else {
+                combinedK = concatenated([sinkK, centK, recentK], axis: 2)
+                combinedV = concatenated([sinkV, centV, recentV], axis: 2)
+            }
+
+            var result: MLXArray!
+            if let p = profiler {
+                p.measure(.attentionSdpa) {
+                    result = MLXFast.scaledDotProductAttention(
+                        queries: queries,
+                        keys: combinedK,
+                        values: combinedV,
+                        scale: scale,
+                        mask: .none
+                    )
+                    return [result]
+                }
+            } else {
+                result = MLXFast.scaledDotProductAttention(
+                    queries: queries,
+                    keys: combinedK,
+                    values: combinedV,
+                    scale: scale,
+                    mask: .none
+                )
+            }
+            return result
         } else {
-            // Prefill: sink + centroids + chunk (last S tokens)
-            let chunkK = allKeys[.ellipsis, (L - S) ..< L, 0...]
-            let chunkV = allValues[.ellipsis, (L - S) ..< L, 0...]
-            let combinedK = concatenated([sinkK, centK, chunkK], axis: 2)
-            let combinedV = concatenated([sinkV, centV, chunkV], axis: 2)
-
-            // Mask: [1, 1, S, sinkEnd+K+S]
-            // First sinkEnd+K cols: all-true (all queries attend to sink + centroids)
-            // Last S cols: lower-triangular causal (within the chunk)
-            let prefixOnes = MLXArray.ones([1, 1, S, sinkEnd + K], dtype: .bool)
-            let causal = MLXArray.tri(S, m: S, k: 0, dtype: .bool).reshaped(1, 1, S, S)
-            let fullMask = concatenated([prefixOnes, causal], axis: -1)
-
+            // Prefill: full attention (clustering provides no measurable speedup
+            // during prefill — SDPA is <6% of prefill compute at practical lengths)
             return MLXFast.scaledDotProductAttention(
                 queries: queries,
-                keys: combinedK,
-                values: combinedV,
+                keys: allKeys,
+                values: allValues,
                 scale: scale,
-                mask: .array(fullMask)
+                mask: mask
             )
         }
     }
