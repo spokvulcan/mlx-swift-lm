@@ -93,12 +93,20 @@ kernel dispatch latency (~5µs × 144 = 720µs/token), not compute.
 | E6 | **Fuse in_proj_ba** | 99.5 | 95.6 | 94.3 | 95.9 | 96.4 | 8120608 |
 | E7 | **Pre-rotate weights** | **121.7** | **114.4** | **118.7** | **115.7** | **115.5** | ffafdea |
 | E8 | **Optimize pre-rotation mem** | 121.7 | 115.0 | 119.2 | 117.7 | 112.6 | afcf4fa |
+| E9 | **Cache pre-rotated weights** | **121.8** | **115.1** | **118.9** | **117.8** | **117.0** | 1b17257 |
+| E10 | Prefill step 2048 | — | 117.3 | — | — | — | reverted (marginal) |
 
-**Final state (E8)**: Generation 121.7 tok/s (+23.2% vs baseline). Prefill 1995 tok/s (+59.6%).
-Load time: 3.6s (from 12s in E7, 1.6s baseline). Peak memory: 9.0 GB (from 17.4 GB in E7).
+### Final Results (E9)
 
-**Bandwidth analysis**: 121.7 tok/s × 2.04 GB/token = 248 GB/s ≈ 99% memory bandwidth utilization.
-**The model has reached the hardware memory bandwidth limit. No further software optimizations
-can improve generation throughput without reducing per-token weight data.**
+| Metric | Baseline | Final | Change |
+|---|---|---|---|
+| Generation (greedy) | 98.8 tok/s | **121.8 tok/s** | **+23.3%** |
+| Generation (production) | 93.9 tok/s | **117.0 tok/s** | **+24.6%** |
+| Prefill (long) | 1250 tok/s | **1993 tok/s** | **+59.4%** |
+| Load time | 1.6s | **0.7s** | **-56%** |
+| Peak memory | 4000 MB | **3413 MB** | **-15%** |
 
-Generation TPS values are tok/s (higher is better). Prefill improvements noted separately.
+**Bandwidth analysis**: 121.8 tok/s × 2.04 GB/token = 248 GB/s ≈ 99% memory bandwidth.
+The model has reached the hardware limit. Experiment loop complete.
+
+Generation TPS values are tok/s (higher is better).
