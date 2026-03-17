@@ -126,6 +126,9 @@ nonisolated private func packPairs(_ pairs: MLXArray, groupSize: Int) -> MLXArra
 /// Subclasses `QuantizedLinear` so it can replace `Linear` in `@ModuleInfo` slots
 /// via `update(modules:)`. Only overrides `callAsFunction` to insert the rotation
 /// step before the standard quantized matmul.
+///
+/// After `preRotateWeights()` is called, the rotation is baked into the weights
+/// and runtime is identical to a plain QuantizedLinear (no rotation kernel dispatch).
 nonisolated open class RotateQuantizedLinear: QuantizedLinear {
 
     // Rotation parameters — discovered by Module reflection for update(parameters:)
@@ -148,6 +151,9 @@ nonisolated open class RotateQuantizedLinear: QuantizedLinear {
     private var cached: CachedRotation?
     private var cachedParams: MLXArray?
     private var cachedBatch: Int = -1
+
+    /// When true, weights have been pre-rotated and callAsFunction skips the rotation kernel.
+    private var preRotated = false
 
     public init(
         inputDims: Int, outputDims: Int, hasBias: Bool,
@@ -213,7 +219,84 @@ nonisolated open class RotateQuantizedLinear: QuantizedLinear {
         )[0]
     }
 
+    /// Pre-rotate weights at load time to eliminate per-token rotation kernel dispatches.
+    ///
+    /// Transforms: `y = quantizedMM(rotate(x), W)` → `y = quantizedMM(x, W_pre)`
+    /// where `W_pre` incorporates both channel_scales and the Givens rotation.
+    ///
+    /// The rotation matrix is block-diagonal (independent per group), so we build it
+    /// group-by-group to keep memory usage at O(group_size²) per group.
+    public func preRotateWeights() {
+        let c = ensureCached()
+        let dim = c.dim
+        let gs = groupSize
+        let numGroups = c.numGroups
+
+        // 1. Dequantize current weights to float
+        let wFloat = dequantized(
+            weight, scales: scales, biases: biases,
+            groupSize: gs, bits: bits
+        ).asType(.float32)
+        // wFloat is [outputDims, inputDims]
+
+        // 2. Build rotation matrix group-by-group and pre-rotate columns of W
+        //    rotate(I) = diag(s) @ R^T (where R is the rotation matrix)
+        //    W_pre = W @ rotate(I)^T
+        var wPre = wFloat
+
+        for g in 0 ..< numGroups {
+            let colStart = g * gs
+            let colEnd = colStart + gs
+
+            // Create identity vectors for this group embedded in full dim
+            var groupInput = MLXArray.zeros([gs, dim], dtype: .float32)
+            // Set the diagonal block: groupInput[i, colStart+i] = 1
+            for i in 0 ..< gs {
+                groupInput[i, colStart + i] = MLXArray(Float(1.0))
+            }
+            eval(groupInput)
+
+            // Apply the rotation kernel (includes channel_scales)
+            let rotated = rotate(groupInput, cache: c)
+            // rotated[i, :] = rotate(e_{colStart+i}) → only cols colStart..<colEnd are nonzero
+            // Extract the [gs, gs] block
+            let block = rotated[0..., colStart ..< colEnd]
+            eval(block)
+
+            // Pre-rotate the corresponding columns of W
+            // W_pre[:, colStart:colEnd] = wFloat[:, colStart:colEnd] @ block^T
+            let wCols = wFloat[0..., colStart ..< colEnd]  // [outputDims, gs]
+            wPre[0..., colStart ..< colEnd] = matmul(wCols, block.transposed())
+        }
+        eval(wPre)
+
+        // 3. Re-quantize the pre-rotated weights
+        let (wq, sc, bi) = quantized(wPre.asType(.float16), groupSize: gs, bits: bits)
+
+        // 4. Update the QuantizedLinear properties via parameter update
+        let params: [String: MLXArray] = [
+            "weight": wq,
+            "scales": sc,
+            "biases": bi ?? MLXArray.zeros(scales.shape),
+        ]
+        try? self.update(parameters: ModuleParameters.unflattened(params), verify: [])
+
+        preRotated = true
+    }
+
     open override func callAsFunction(_ x: MLXArray) -> MLXArray {
+        if preRotated {
+            // Fast path: weights already include rotation + channel_scales
+            var y = quantizedMM(
+                x, weight,
+                scales: scales, biases: biases,
+                transpose: true, groupSize: groupSize, bits: bits
+            )
+            if let bias { y = y + bias }
+            return y
+        }
+
+        // Standard path: apply rotation kernel then quantized matmul
         let c = ensureCached()
         let shape = x.shape
         let rotated = rotate(x.reshaped(-1, c.dim), cache: c)

@@ -417,7 +417,19 @@ public func loadParoQuantModel(
         return (paroConfig.groupSize, paroConfig.bits, .affine)
     }
 
-    // 12. Materialize
+    // 12. Pre-rotate weights: bake rotation + channel_scales into quantized weights
+    //     Eliminates ~144 rotation kernel dispatches per token (~7% throughput gain)
+    let rotationModules = model.leafModules().flattened()
+        .compactMap { (_, module) in module as? RotateQuantizedLinear }
+    if !rotationModules.isEmpty {
+        logger.info(
+            "Pre-rotating weights for \(rotationModules.count) RotateQuantizedLinear layers")
+        for module in rotationModules {
+            module.preRotateWeights()
+        }
+    }
+
+    // 13. Materialize
     eval(model)
     logger.info("ParoQuant model loaded and evaluated")
 
