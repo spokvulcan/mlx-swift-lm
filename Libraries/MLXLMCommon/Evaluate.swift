@@ -118,7 +118,7 @@ public struct GenerateParameters: Sendable {
         presenceContextSize: Int = 20,
         frequencyPenalty: Float? = nil,
         frequencyContextSize: Int = 20,
-        prefillStepSize: Int = 512
+        prefillStepSize: Int = 1024
     ) {
         self.maxTokens = maxTokens
         self.maxKVSize = maxKVSize

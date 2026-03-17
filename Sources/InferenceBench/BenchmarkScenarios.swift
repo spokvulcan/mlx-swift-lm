@@ -25,7 +25,8 @@ enum BenchmarkScenarios {
             description: "Pure generation throughput with greedy decode",
             parameters: GenerateParameters(
                 maxTokens: maxTokens,
-                temperature: 0
+                temperature: 0,
+                prefillStepSize: prefillStep
             ),
             prompt: "Explain quantum computing."
         )
@@ -38,7 +39,8 @@ enum BenchmarkScenarios {
             description: "Prefill throughput with ~1000 token prompt",
             parameters: GenerateParameters(
                 maxTokens: maxTokens,
-                temperature: 0
+                temperature: 0,
+                prefillStepSize: prefillStep
             ),
             prompt: longPrompt
         )
@@ -52,7 +54,8 @@ enum BenchmarkScenarios {
             parameters: GenerateParameters(
                 maxTokens: maxTokens,
                 temperature: 0.6,
-                topK: 20
+                topK: 20,
+                prefillStepSize: prefillStep
             ),
             prompt: "Write a story about a robot."
         )
@@ -72,7 +75,8 @@ enum BenchmarkScenarios {
                 presencePenalty: 0.5,
                 presenceContextSize: 256,
                 frequencyPenalty: 0.5,
-                frequencyContextSize: 256
+                frequencyContextSize: 256,
+                prefillStepSize: prefillStep
             ),
             prompt: "Describe the process of photosynthesis."
         )
@@ -88,11 +92,15 @@ enum BenchmarkScenarios {
                 temperature: 0.6,
                 topP: 0.9,
                 topK: 20,
-                minP: 0.02
+                minP: 0.02,
+                prefillStepSize: prefillStep
             ),
             prompt: mediumPrompt
         )
     }
+
+    /// Prefill step size — tunable for experiments
+    private static let prefillStep = 1024
 
     // ~200 token prompt for production config scenario
     private static let mediumPrompt = """
