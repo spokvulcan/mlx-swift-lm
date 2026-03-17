@@ -174,8 +174,7 @@ final class Qwen35GatedDeltaNet: Module {
     @ModuleInfo(key: "conv1d") var conv1d: Conv1d
     @ModuleInfo(key: "in_proj_qkv") var inProjQKV: Linear
     @ModuleInfo(key: "in_proj_z") var inProjZ: Linear
-    @ModuleInfo(key: "in_proj_b") var inProjB: Linear
-    @ModuleInfo(key: "in_proj_a") var inProjA: Linear
+    @ModuleInfo(key: "in_proj_ba") var inProjBA: Linear
 
     @ParameterInfo(key: "dt_bias") var dtBias: MLXArray
     @ParameterInfo(key: "A_log") var aLog: MLXArray
@@ -212,8 +211,7 @@ final class Qwen35GatedDeltaNet: Module {
 
         _inProjQKV.wrappedValue = Linear(hiddenSize, keyDim * 2 + valueDim, bias: false)
         _inProjZ.wrappedValue = Linear(hiddenSize, valueDim, bias: false)
-        _inProjB.wrappedValue = Linear(hiddenSize, numVHeads, bias: false)
-        _inProjA.wrappedValue = Linear(hiddenSize, numVHeads, bias: false)
+        _inProjBA.wrappedValue = Linear(hiddenSize, numVHeads * 2, bias: false)
 
         _dtBias.wrappedValue = MLXArray.ones([numVHeads])
         let a = MLXRandom.uniform(low: 0, high: 16, [numVHeads])
@@ -235,8 +233,9 @@ final class Qwen35GatedDeltaNet: Module {
 
         var qkv = inProjQKV(inputs)
         let z = inProjZ(inputs).reshaped(B, S, numVHeads, headVDim)
-        let b = inProjB(inputs)
-        let a = inProjA(inputs)
+        let ba = inProjBA(inputs)
+        let b = ba[0..., 0..., ..<numVHeads]
+        let a = ba[0..., 0..., numVHeads...]
 
         let convState: MLXArray
         if let cacheState = cache?[0] {
@@ -624,6 +623,17 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
             {
                 weights[k] = v + MLXArray(1, dtype: v.dtype)
             }
+        }
+
+        // Fuse in_proj_b + in_proj_a → in_proj_ba (eliminates 1 matmul dispatch per layer)
+        for k in Array(weights.keys) where k.hasSuffix(".in_proj_b.weight") {
+            let prefix = String(k.dropLast(".in_proj_b.weight".count))
+            let aKey = "\(prefix).in_proj_a.weight"
+            guard let bWeight = weights.removeValue(forKey: k),
+                let aWeight = weights.removeValue(forKey: aKey)
+            else { continue }
+            weights["\(prefix).in_proj_ba.weight"] = concatenated(
+                [bWeight, aWeight], axis: 0)
         }
 
         return weights
