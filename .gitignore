@@ -95,3 +95,7 @@ iOSInjectionProject/
 .idea
 .vscode
 
+# Autoresearch
+models/
+experiments/results.jsonl
+
