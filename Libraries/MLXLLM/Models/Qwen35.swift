@@ -591,10 +591,7 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
             if useClustered, let params = parameters {
                 return ClusteredKVCache(
                     numClusters: params.kvClusters,
-                    topClusters: params.kvTopClusters,
-                    recentWindow: params.kvRecentWindow,
-                    prefillClusterThreshold: params.prefillClusterThreshold,
-                    prefillTopClusters: params.prefillTopClusters
+                    recentWindow: params.kvRecentWindow
                 )
             }
             return KVCacheSimple()

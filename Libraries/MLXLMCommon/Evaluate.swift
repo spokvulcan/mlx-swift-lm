@@ -80,17 +80,8 @@ public struct GenerateParameters: Sendable {
     /// Number of K-means clusters for clustered KV cache (default: 256)
     public var kvClusters: Int
 
-    /// Number of top clusters to retrieve per query (default: 32)
-    public var kvTopClusters: Int
-
     /// Recent window size for clustered KV cache (default: 2048)
     public var kvRecentWindow: Int
-
-    /// Minimum sequence length to trigger gather-based clustered prefill (default: 64)
-    public var prefillClusterThreshold: Int
-
-    /// Number of top clusters for prefill attention (default: 48)
-    public var prefillTopClusters: Int
 
     /// sampling temperature
     public var temperature: Float
@@ -130,10 +121,7 @@ public struct GenerateParameters: Sendable {
         quantizedKVStart: Int = 0,
         clusteredKV: Bool = false,
         kvClusters: Int = 256,
-        kvTopClusters: Int = 32,
         kvRecentWindow: Int = 2048,
-        prefillClusterThreshold: Int = 64,
-        prefillTopClusters: Int = 48,
         temperature: Float = 0.6,
         topP: Float = 1.0,
         topK: Int = 0,
@@ -153,10 +141,7 @@ public struct GenerateParameters: Sendable {
         self.quantizedKVStart = quantizedKVStart
         self.clusteredKV = clusteredKV
         self.kvClusters = kvClusters
-        self.kvTopClusters = kvTopClusters
         self.kvRecentWindow = kvRecentWindow
-        self.prefillClusterThreshold = prefillClusterThreshold
-        self.prefillTopClusters = prefillTopClusters
         self.temperature = temperature
         self.topP = topP
         self.topK = topK
