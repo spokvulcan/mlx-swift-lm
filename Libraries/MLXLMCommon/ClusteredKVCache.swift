@@ -71,6 +71,14 @@ public class ClusteredKVCache: BaseKVCache {
     /// Re-cluster every N new tokens
     public let reclusterInterval: Int
 
+    /// Bits for KV quantization (4 or 8). nil disables quantization.
+    /// When set, incoming K/V are quantize→dequantized before storage,
+    /// introducing the same precision loss as true quantized storage.
+    public let kvQuantBits: Int?
+
+    /// Group size for KV quantization (default 64)
+    public let kvQuantGroupSize: Int
+
     /// Optional profiler. When set, inserts eval+sync barriers to measure per-op GPU time.
     public var profiler: ClusteredKVCacheProfiler?
 
@@ -113,13 +121,17 @@ public class ClusteredKVCache: BaseKVCache {
         recentWindow: Int = 2048,
         sinkTokens: Int = 4,
         clusterThreshold: Int = 4096,
-        reclusterInterval: Int = 1024
+        reclusterInterval: Int = 1024,
+        kvQuantBits: Int? = 4,
+        kvQuantGroupSize: Int = 64
     ) {
         self.numClusters = numClusters
         self.recentWindow = recentWindow
         self.sinkTokens = sinkTokens
         self.clusterThreshold = clusterThreshold
         self.reclusterInterval = reclusterInterval
+        self.kvQuantBits = kvQuantBits
+        self.kvQuantGroupSize = kvQuantGroupSize
         super.init()
     }
 
@@ -129,8 +141,24 @@ public class ClusteredKVCache: BaseKVCache {
 
     // MARK: - KVCache Protocol
 
-    public override func update(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
+    public override func update(keys inKeys: MLXArray, values inValues: MLXArray) -> (
+        MLXArray, MLXArray
+    ) {
         let previous = self.offset
+
+        // Quantize→dequantize round-trip: introduces same precision loss as quantized storage
+        let keys: MLXArray
+        let values: MLXArray
+        if let bits = kvQuantBits {
+            let gs = kvQuantGroupSize
+            let (kWq, kS, kB) = quantized(inKeys, groupSize: gs, bits: bits)
+            keys = dequantized(kWq, scales: kS, biases: kB, groupSize: gs, bits: bits)
+            let (vWq, vS, vB) = quantized(inValues, groupSize: gs, bits: bits)
+            values = dequantized(vWq, scales: vS, biases: vB, groupSize: gs, bits: bits)
+        } else {
+            keys = inKeys
+            values = inValues
+        }
 
         // --- KV store section ---
         let kvStoreBlock = {

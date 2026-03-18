@@ -158,6 +158,7 @@ let package = Package(
                 "MLXLLM",
                 "MLXLMCommon",
                 .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXNN", package: "mlx-swift"),
                 .product(name: "Transformers", package: "swift-transformers"),
             ],
             path: "Sources/InferenceBench",
