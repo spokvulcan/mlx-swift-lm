@@ -742,13 +742,15 @@ public struct TokenIterator: Sequence, IteratorProtocol {
             previous[text: .newAxis], cache: cache.isEmpty ? nil : cache, state: state)
         self.state = result.state
 
-        // Apply dynamic cache quantization after each step
-        maybeQuantizeKVCache(
-            cache: &cache,
-            kvBits: kvBits,
-            kvGroupSize: kvGroupSize,
-            quantizedKVStart: quantizedKVStart
-        )
+        // Apply dynamic cache quantization after each step (skip when not configured)
+        if kvBits != nil {
+            maybeQuantizeKVCache(
+                cache: &cache,
+                kvBits: kvBits,
+                kvGroupSize: kvGroupSize,
+                quantizedKVStart: quantizedKVStart
+            )
+        }
 
         return convertToToken(logits: result.logits)
     }
