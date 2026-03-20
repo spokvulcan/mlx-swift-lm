@@ -160,6 +160,12 @@ public struct Qwen35TextConfiguration: Codable, Sendable {
 
 // MARK: - GatedDeltaNet
 
+// Cached norm weights — outside Module to avoid weight-loading detection
+private struct _DeltaNetNormCache {
+    var q: MLXArray?
+    var k: MLXArray?
+}
+
 final class Qwen35GatedDeltaNet: Module {
     let hiddenSize: Int
     let numVHeads: Int
@@ -170,6 +176,9 @@ final class Qwen35GatedDeltaNet: Module {
     let valueDim: Int
     let convKernelSize: Int
     let convDim: Int
+
+    // Lazily materialized norm weights in model dtype — eliminates 6 dispatch ops per call
+    private var _normCache = _DeltaNetNormCache()
 
     @ModuleInfo(key: "conv1d") var conv1d: Conv1d
     @ModuleInfo(key: "in_proj_qkv") var inProjQKV: Linear
@@ -262,14 +271,16 @@ final class Qwen35GatedDeltaNet: Module {
         let v = convSplit[2].reshaped(B, S, numVHeads, headVDim)
 
         var state = cache?[1]
-        let dtype = q.dtype
-        let invScale = pow(Float(headKDim), -0.5)
-        let qNormed =
-            MLXArray(pow(invScale, 2)).asType(dtype)
-            * MLXFast.rmsNorm(q, weight: MLXArray.mlxNone, eps: 1e-6)
-        let kNormed =
-            MLXArray(invScale).asType(dtype)
-            * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
+
+        // Lazily create norm weights in the correct dtype (once, then reused)
+        if _normCache.q == nil {
+            let invScale = pow(Float(headKDim), -0.5)
+            _normCache.q = (MLXArray.ones([headKDim]) * pow(invScale, 2)).asType(q.dtype)
+            _normCache.k = (MLXArray.ones([headKDim]) * invScale).asType(q.dtype)
+            eval(_normCache.q!, _normCache.k!)
+        }
+        let qNormed = MLXFast.rmsNorm(q, weight: _normCache.q!, eps: 1e-6)
+        let kNormed = MLXFast.rmsNorm(k, weight: _normCache.k!, eps: 1e-6)
 
         var out: MLXArray
 
