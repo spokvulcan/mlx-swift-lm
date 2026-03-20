@@ -195,7 +195,7 @@ private func makeFusedConvSiluKernel() -> MLXFast.MLXFastKernel? {
 
     return MLXFast.metalKernel(
         name: "fused_conv_silu",
-        inputNames: ["conv_state", "new_qkv", "weight", "C"],
+        inputNames: ["conv_state", "new_qkv", "weight"],
         outputNames: ["conv_out", "new_cache"],
         source: source
     )
@@ -307,8 +307,8 @@ final class Qwen35GatedDeltaNet: Module {
             let kernel = _fusedConvSiluKernel
         {
             let outputs = kernel(
-                [cacheState, qkv, conv1d.weight, MLXArray(convDim)],
-                template: [("InT", inputs.dtype)],
+                [cacheState, qkv, conv1d.weight],
+                template: [("InT", inputs.dtype), ("C", convDim)],
                 grid: (convDim, B, 1),
                 threadGroup: (min(convDim, 256), 1, 1),
                 outputShapes: [[B, 1, convDim], [B, 3, convDim]],
