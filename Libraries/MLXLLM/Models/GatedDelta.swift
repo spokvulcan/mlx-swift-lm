@@ -16,11 +16,14 @@ func computeGatedDeltaG(_ aLog: MLXArray, _ a: MLXArray, _ dtBias: MLXArray) -> 
     return decay.asType(a.dtype)
 }
 
-// MARK: - Metal Kernel
+// MARK: - Fused Metal Kernel (computes g/beta inline — eliminates ~9 dispatch ops per call)
 
-private func makeGatedDeltaKernel(hasMask: Bool) -> MLXFast.MLXFastKernel? {
+private func makeFusedGatedDeltaKernel(hasMask: Bool) -> MLXFast.MLXFastKernel? {
     let maskSource = hasMask ? "mask[b_idx * T + t]" : "true"
 
+    // Fused kernel: computes decay (g) and sigmoid (beta) inline from raw a, aLog, dtBias, b
+    // instead of reading pre-computed g/beta arrays. Eliminates separate kernel dispatches for
+    // computeGatedDeltaG (exp, softplus, negate, etc.) and sigmoid(b).
     let source = """
             auto n = thread_position_in_grid.z;
             auto b_idx = n / Hv;
@@ -39,9 +42,13 @@ private func makeGatedDeltaKernel(hasMask: Bool) -> MLXFast.MLXFastKernel? {
             auto dk_idx = thread_position_in_threadgroup.x;
             auto dv_idx = thread_position_in_grid.y;
 
-            // g: [B, T, Hv]
-            auto g_ = g + b_idx * T * Hv;
-            auto beta_ = beta + b_idx * T * Hv;
+            // a_raw, b_raw: [B, T, Hv] — raw projections
+            auto a_raw_ = a_raw + b_idx * T * Hv;
+            auto b_raw_ = b_raw + b_idx * T * Hv;
+            // a_log: [Hv], dt_bias: [Hv] — per-head constants
+            float a_log_f = static_cast<float>(a_log[hv_idx]);
+            float exp_a_log = metal::exp(a_log_f);
+            float dt_bias_f = static_cast<float>(dt_bias[hv_idx]);
 
             // state_in, state_out: [B, Hv, Dv, Dk]
             auto i_state = state_in + (n * Dv + dv_idx) * Dk;
@@ -55,15 +62,23 @@ private func makeGatedDeltaKernel(hasMask: Bool) -> MLXFast.MLXFastKernel? {
 
             for (int t = 0; t < T; ++t) {
               if (\(maskSource)) {
+                // Compute g (decay) inline: exp(-exp(aLog) * softplus(a + dtBias))
+                float a_val = static_cast<float>(a_raw_[hv_idx]) + dt_bias_f;
+                float sp = (a_val > 20.0f) ? a_val : metal::log(1.0f + metal::exp(a_val));
+                float g_val = metal::exp(-exp_a_log * sp);
+
+                // Compute beta (sigmoid) inline: 1 / (1 + exp(-b))
+                float beta_val = 1.0f / (1.0f + metal::exp(-static_cast<float>(b_raw_[hv_idx])));
+
                 float kv_mem = 0.0f;
                 for (int i = 0; i < n_per_t; ++i) {
                   auto s_idx = n_per_t * dk_idx + i;
-                  state[i] = state[i] * g_[hv_idx];
+                  state[i] = state[i] * g_val;
                   kv_mem += state[i] * k_[s_idx];
                 }
                 kv_mem = simd_sum(kv_mem);
 
-                auto delta = (v_[dv_idx] - kv_mem) * beta_[hv_idx];
+                auto delta = (v_[dv_idx] - kv_mem) * beta_val;
 
                 float out = 0.0f;
                 for (int i = 0; i < n_per_t; ++i) {
@@ -81,8 +96,8 @@ private func makeGatedDeltaKernel(hasMask: Bool) -> MLXFast.MLXFastKernel? {
               k_ += Hk * Dk;
               v_ += Hv * Dv;
               y += Hv * Dv;
-              g_ += Hv;
-              beta_ += Hv;
+              a_raw_ += Hv;
+              b_raw_ += Hv;
             }
             for (int i = 0; i < n_per_t; ++i) {
               auto s_idx = n_per_t * dk_idx + i;
@@ -90,7 +105,7 @@ private func makeGatedDeltaKernel(hasMask: Bool) -> MLXFast.MLXFastKernel? {
             }
         """
 
-    var inputNames = ["q", "k", "v", "g", "beta", "state_in", "T"]
+    var inputNames = ["q", "k", "v", "a_raw", "b_raw", "a_log", "dt_bias", "state_in", "T"]
     if hasMask {
         inputNames.append("mask")
     }
@@ -98,7 +113,7 @@ private func makeGatedDeltaKernel(hasMask: Bool) -> MLXFast.MLXFastKernel? {
     let suffix = hasMask ? "_mask" : ""
 
     return MLXFast.metalKernel(
-        name: "gated_delta_step\(suffix)",
+        name: "gated_delta_fused\(suffix)",
         inputNames: inputNames,
         outputNames: ["y", "state_out"],
         source: source
@@ -108,23 +123,25 @@ private func makeGatedDeltaKernel(hasMask: Bool) -> MLXFast.MLXFastKernel? {
 private final class GatedDeltaKernelManager: Sendable {
     static let shared = GatedDeltaKernelManager()
 
-    let kernel: MLXFast.MLXFastKernel?
-    let kernelMasked: MLXFast.MLXFastKernel?
+    let fusedKernel: MLXFast.MLXFastKernel?
+    let fusedKernelMasked: MLXFast.MLXFastKernel?
 
     private init() {
-        kernel = makeGatedDeltaKernel(hasMask: false)
-        kernelMasked = makeGatedDeltaKernel(hasMask: true)
+        fusedKernel = makeFusedGatedDeltaKernel(hasMask: false)
+        fusedKernelMasked = makeFusedGatedDeltaKernel(hasMask: true)
     }
 }
 
-// MARK: - Kernel Dispatch
+// MARK: - Fused Kernel Dispatch
 
-func gatedDeltaKernel(
+private func gatedDeltaKernelFused(
     q: MLXArray,
     k: MLXArray,
     v: MLXArray,
-    g: MLXArray,
-    beta: MLXArray,
+    aRaw: MLXArray,
+    bRaw: MLXArray,
+    aLog: MLXArray,
+    dtBias: MLXArray,
     state: MLXArray,
     mask: MLXArray? = nil
 ) -> (MLXArray, MLXArray) {
@@ -137,16 +154,16 @@ func gatedDeltaKernel(
     let inputType = q.dtype
 
     let selectedKernel: MLXFast.MLXFastKernel?
-    var inputs: [MLXArray] = [q, k, v, g, beta, state, MLXArray(T)]
+    var inputs: [MLXArray] = [q, k, v, aRaw, bRaw, aLog, dtBias, state, MLXArray(T)]
     if let mask {
-        selectedKernel = GatedDeltaKernelManager.shared.kernelMasked
+        selectedKernel = GatedDeltaKernelManager.shared.fusedKernelMasked
         inputs.append(mask)
     } else {
-        selectedKernel = GatedDeltaKernelManager.shared.kernel
+        selectedKernel = GatedDeltaKernelManager.shared.fusedKernel
     }
 
     guard let kernel = selectedKernel else {
-        fatalError("Gated delta kernel not available")
+        fatalError("Fused gated delta kernel not available")
     }
 
     let outputs = kernel(
@@ -279,9 +296,6 @@ func gatedDeltaUpdate(
     state: MLXArray? = nil,
     mask: MLXArray? = nil
 ) -> (MLXArray, MLXArray) {
-    let beta = sigmoid(b)
-    let g = computeGatedDeltaG(aLog, a, dtBias)
-
     let B = q.dim(0)
     let Dk = q.dim(3)
     let Hv = v.dim(2)
@@ -289,9 +303,15 @@ func gatedDeltaUpdate(
 
     let state = state ?? MLXArray.zeros([B, Hv, Dv, Dk], dtype: q.dtype)
 
-    if GatedDeltaKernelManager.shared.kernel != nil {
-        return gatedDeltaKernel(q: q, k: k, v: v, g: g, beta: beta, state: state, mask: mask)
+    // Fused kernel: computes g/beta inline, avoiding ~9 separate kernel dispatches
+    if GatedDeltaKernelManager.shared.fusedKernel != nil {
+        return gatedDeltaKernelFused(
+            q: q, k: k, v: v, aRaw: a, bRaw: b,
+            aLog: aLog, dtBias: dtBias, state: state, mask: mask)
     }
 
+    // Fallback: compute g and beta separately, then use ops
+    let beta = sigmoid(b)
+    let g = computeGatedDeltaG(aLog, a, dtBias)
     return gatedDeltaOps(q: q, k: k, v: v, g: g, beta: beta, state: state, mask: mask)
 }
