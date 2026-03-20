@@ -158,6 +158,51 @@ public struct Qwen35TextConfiguration: Codable, Sendable {
     }
 }
 
+// MARK: - Fused Conv1d+SiLU Kernel (single-token fast path)
+
+private func makeFusedConvSiluKernel() -> MLXFast.MLXFastKernel? {
+    // Reads conv_state [B, 3, C] and new_qkv [B, 1, C] directly,
+    // computes depthwise conv with kernel_size=4 + silu,
+    // outputs result [B, 1, C] and updated cache state [B, 3, C].
+    let source = """
+            auto c = thread_position_in_grid.x;
+            auto b = thread_position_in_grid.y;
+
+            // Read 3 cached timesteps + 1 new
+            float s0 = static_cast<float>(conv_state[b * 3 * C + 0 * C + c]);
+            float s1 = static_cast<float>(conv_state[b * 3 * C + 1 * C + c]);
+            float s2 = static_cast<float>(conv_state[b * 3 * C + 2 * C + c]);
+            float s3 = static_cast<float>(new_qkv[b * C + c]);
+
+            // Depthwise conv: weight is [C, 4, 1] stored contiguously
+            float w0 = static_cast<float>(weight[c * 4 + 0]);
+            float w1 = static_cast<float>(weight[c * 4 + 1]);
+            float w2 = static_cast<float>(weight[c * 4 + 2]);
+            float w3 = static_cast<float>(weight[c * 4 + 3]);
+
+            float acc = s0 * w0 + s1 * w1 + s2 * w2 + s3 * w3;
+
+            // SiLU activation: x * sigmoid(x)
+            float result = acc / (1.0f + metal::exp(-acc));
+
+            conv_out[b * C + c] = static_cast<InT>(result);
+
+            // Update cache state: shift [s1, s2, s3]
+            new_cache[b * 3 * C + 0 * C + c] = static_cast<InT>(s1);
+            new_cache[b * 3 * C + 1 * C + c] = static_cast<InT>(s2);
+            new_cache[b * 3 * C + 2 * C + c] = static_cast<InT>(s3);
+        """
+
+    return MLXFast.metalKernel(
+        name: "fused_conv_silu",
+        inputNames: ["conv_state", "new_qkv", "weight", "C"],
+        outputNames: ["conv_out", "new_cache"],
+        source: source
+    )
+}
+
+private let _fusedConvSiluKernel: MLXFast.MLXFastKernel? = makeFusedConvSiluKernel()
+
 // MARK: - GatedDeltaNet
 
 // Cached derived arrays — outside Module to avoid weight-loading detection
@@ -255,23 +300,43 @@ final class Qwen35GatedDeltaNet: Module {
         let b = ba[0..., 0..., ..<numVHeads]
         let a = ba[0..., 0..., numVHeads...]
 
-        let convState: MLXArray
-        if let cacheState = cache?[0] {
-            convState = cacheState
+        let convOut: MLXArray
+
+        // Fast path: fused conv+silu kernel for single-token generation with cache
+        if S == 1, mask == nil, let cacheState = cache?[0],
+            let kernel = _fusedConvSiluKernel
+        {
+            let outputs = kernel(
+                [cacheState, qkv, conv1d.weight, MLXArray(convDim)],
+                template: [("InT", inputs.dtype)],
+                grid: (convDim, B, 1),
+                threadGroup: (min(convDim, 256), 1, 1),
+                outputShapes: [[B, 1, convDim], [B, 3, convDim]],
+                outputDTypes: [inputs.dtype, inputs.dtype]
+            )
+            convOut = outputs[0]
+            cache![0] = outputs[1]
         } else {
-            convState = MLXArray.zeros([B, convKernelSize - 1, convDim], dtype: inputs.dtype)
-        }
+            // Standard path for prefill (T > 1) or masked input
+            let convState: MLXArray
+            if let cacheState = cache?[0] {
+                convState = cacheState
+            } else {
+                convState = MLXArray.zeros(
+                    [B, convKernelSize - 1, convDim], dtype: inputs.dtype)
+            }
 
-        if let mask {
-            qkv = MLX.where(mask[.ellipsis, .newAxis], qkv, 0)
-        }
+            if let mask {
+                qkv = MLX.where(mask[.ellipsis, .newAxis], qkv, 0)
+            }
 
-        let convInput = concatenated([convState, qkv], axis: 1)
-        if let cache {
-            cache[0] = convInput[0..., (-(convKernelSize - 1))...]
-        }
+            let convInput = concatenated([convState, qkv], axis: 1)
+            if let cache {
+                cache[0] = convInput[0..., (-(convKernelSize - 1))...]
+            }
 
-        let convOut = silu(conv1d(convInput))
+            convOut = silu(conv1d(convInput))
+        }
 
         let convSplit = MLX.split(convOut, indices: [keyDim, 2 * keyDim], axis: -1)
         let q = convSplit[0].reshaped(B, S, numKHeads, headKDim)
