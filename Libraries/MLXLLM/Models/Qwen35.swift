@@ -160,10 +160,11 @@ public struct Qwen35TextConfiguration: Codable, Sendable {
 
 // MARK: - GatedDeltaNet
 
-// Cached norm weights — outside Module to avoid weight-loading detection
-private struct _DeltaNetNormCache {
-    var q: MLXArray?
-    var k: MLXArray?
+// Cached derived arrays — outside Module to avoid weight-loading detection
+private struct _DeltaNetCache {
+    var normQ: MLXArray?
+    var normK: MLXArray?
+    var fusedBA: MLXArray?  // Fused [in_proj_b; in_proj_a] weight for single matmul
 }
 
 final class Qwen35GatedDeltaNet: Module {
@@ -177,8 +178,8 @@ final class Qwen35GatedDeltaNet: Module {
     let convKernelSize: Int
     let convDim: Int
 
-    // Lazily materialized norm weights in model dtype — eliminates 6 dispatch ops per call
-    private var _normCache = _DeltaNetNormCache()
+    // Lazily materialized caches — eliminates dispatch ops per call
+    private var _cache = _DeltaNetCache()
 
     @ModuleInfo(key: "conv1d") var conv1d: Conv1d
     @ModuleInfo(key: "in_proj_qkv") var inProjQKV: Linear
@@ -244,8 +245,15 @@ final class Qwen35GatedDeltaNet: Module {
 
         var qkv = inProjQKV(inputs)
         let z = inProjZ(inputs).reshaped(B, S, numVHeads, headVDim)
-        let b = inProjB(inputs)
-        let a = inProjA(inputs)
+
+        // Fuse inProjB + inProjA into single matmul (both are non-quantized [hidden, numVHeads])
+        if _cache.fusedBA == nil {
+            _cache.fusedBA = concatenated([inProjB.weight, inProjA.weight], axis: 0)
+            eval(_cache.fusedBA!)
+        }
+        let ba = MLX.matmul(inputs, _cache.fusedBA!.T)
+        let b = ba[0..., 0..., ..<numVHeads]
+        let a = ba[0..., 0..., numVHeads...]
 
         let convState: MLXArray
         if let cacheState = cache?[0] {
@@ -273,14 +281,14 @@ final class Qwen35GatedDeltaNet: Module {
         var state = cache?[1]
 
         // Lazily create norm weights in the correct dtype (once, then reused)
-        if _normCache.q == nil {
+        if _cache.normQ == nil {
             let invScale = pow(Float(headKDim), -0.5)
-            _normCache.q = (MLXArray.ones([headKDim]) * pow(invScale, 2)).asType(q.dtype)
-            _normCache.k = (MLXArray.ones([headKDim]) * invScale).asType(q.dtype)
-            eval(_normCache.q!, _normCache.k!)
+            _cache.normQ = (MLXArray.ones([headKDim]) * pow(invScale, 2)).asType(q.dtype)
+            _cache.normK = (MLXArray.ones([headKDim]) * invScale).asType(q.dtype)
+            eval(_cache.normQ!, _cache.normK!)
         }
-        let qNormed = MLXFast.rmsNorm(q, weight: _normCache.q!, eps: 1e-6)
-        let kNormed = MLXFast.rmsNorm(k, weight: _normCache.k!, eps: 1e-6)
+        let qNormed = MLXFast.rmsNorm(q, weight: _cache.normQ!, eps: 1e-6)
+        let kNormed = MLXFast.rmsNorm(k, weight: _cache.normK!, eps: 1e-6)
 
         var out: MLXArray
 
