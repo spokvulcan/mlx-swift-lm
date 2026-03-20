@@ -602,9 +602,6 @@ public struct TokenIterator: Sequence, IteratorProtocol {
     // Cache quantization parameters
     let kvBits: Int?
     let kvGroupSize: Int
-
-    // Compiled model forward pass for reduced Metal command encoding overhead
-    private var compiledForward: (([MLXArray]) -> [MLXArray])?
     let quantizedKVStart: Int
 
     // Internal metrics
@@ -741,34 +738,9 @@ public struct TokenIterator: Sequence, IteratorProtocol {
 
     /// Evaluate the next token and return the new token (y), updating cache state
     mutating func step(previous: LMInput.Text) -> MLXArray {
-        // Lazily compile the model forward pass on first generation step.
-        // compile() reduces Metal command encoding overhead by tracing the graph once
-        // and replaying the compiled commands on subsequent calls.
-        if compiledForward == nil, !cache.isEmpty {
-            let modelRef = model
-            let cacheRef = cache
-            let stateRef = state
-            let updatables: [any Updatable] =
-                [modelRef as! any Updatable] + cacheRef.map { $0 as! any Updatable }
-            compiledForward = compile(
-                inputs: updatables, outputs: updatables, shapeless: true
-            ) { (inputs: [MLXArray]) -> [MLXArray] in
-                let result = modelRef(
-                    LMInput.Text(tokens: inputs[0]),
-                    cache: cacheRef.isEmpty ? nil : cacheRef, state: stateRef)
-                return [result.logits]
-            }
-        }
-
-        let logits: MLXArray
-        if let compiled = compiledForward {
-            logits = compiled([previous[text: .newAxis].tokens])[0]
-        } else {
-            let result = model(
-                previous[text: .newAxis], cache: cache.isEmpty ? nil : cache, state: state)
-            self.state = result.state
-            logits = result.logits
-        }
+        let result = model(
+            previous[text: .newAxis], cache: cache.isEmpty ? nil : cache, state: state)
+        self.state = result.state
 
         // Apply dynamic cache quantization after each step
         maybeQuantizeKVCache(
@@ -778,7 +750,7 @@ public struct TokenIterator: Sequence, IteratorProtocol {
             quantizedKVStart: quantizedKVStart
         )
 
-        return convertToToken(logits: logits)
+        return convertToToken(logits: result.logits)
     }
 
     mutating public func next() -> Int? {
