@@ -122,61 +122,19 @@ public final class Qwen3NextAttention: Module {
     }
 }
 
-// Cached fused gate+up quantized weight — outside Module to avoid weight-loading detection
-private struct _FusedGateUpCache {
-    var weight: MLXArray?
-    var scales: MLXArray?
-    var biases: MLXArray?
-    var groupSize: Int = 0
-    var bits: Int = 0
-    var hiddenDimensions: Int = 0
-}
-
 final class Qwen3NextMLP: Module, UnaryLayer {
     @ModuleInfo(key: "gate_proj") var gateProj: Linear
     @ModuleInfo(key: "down_proj") var downProj: Linear
     @ModuleInfo(key: "up_proj") var upProj: Linear
 
-    private let hiddenDimensions: Int
-    private var _fusedGateUp = _FusedGateUpCache()
-
     init(dimensions: Int, hiddenDimensions: Int) {
-        self.hiddenDimensions = hiddenDimensions
         _gateProj.wrappedValue = Linear(dimensions, hiddenDimensions, bias: false)
         _downProj.wrappedValue = Linear(hiddenDimensions, dimensions, bias: false)
         _upProj.wrappedValue = Linear(dimensions, hiddenDimensions, bias: false)
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        // Try fused gate+up path for quantized layers (saves 1 matmul dispatch per call)
-        if _fusedGateUp.weight == nil, let gq = gateProj as? QuantizedLinear,
-            let uq = upProj as? QuantizedLinear, gq.groupSize == uq.groupSize,
-            gq.bits == uq.bits, let gBiases = gq.biases, let uBiases = uq.biases
-        {
-            _fusedGateUp.weight = concatenated([gq.weight, uq.weight], axis: 0)
-            _fusedGateUp.scales = concatenated([gq.scales, uq.scales], axis: 0)
-            _fusedGateUp.biases = concatenated([gBiases, uBiases], axis: 0)
-            _fusedGateUp.groupSize = gq.groupSize
-            _fusedGateUp.bits = gq.bits
-            _fusedGateUp.hiddenDimensions = hiddenDimensions
-            eval(_fusedGateUp.weight!, _fusedGateUp.scales!, _fusedGateUp.biases!)
-        }
-
-        if let fw = _fusedGateUp.weight, let fs = _fusedGateUp.scales,
-            let fb = _fusedGateUp.biases
-        {
-            let gu = quantizedMM(
-                x, fw, scales: fs, biases: fb,
-                transpose: true, groupSize: _fusedGateUp.groupSize,
-                bits: _fusedGateUp.bits
-            )
-            let g = gu[0..., 0..., ..<hiddenDimensions]
-            let u = gu[0..., 0..., hiddenDimensions...]
-            return downProj(silu(g) * u)
-        }
-
-        // Fallback: separate matmuls (non-quantized or incompatible)
-        return downProj(silu(gateProj(x)) * upProj(x))
+        downProj(silu(gateProj(x)) * upProj(x))
     }
 }
 
