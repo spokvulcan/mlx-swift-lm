@@ -176,7 +176,7 @@ private func gatedDeltaKernelFused(
             ("Hv", Hv),
         ],
         grid: (32, Dv, B * Hv),
-        threadGroup: (32, 8, 1),
+        threadGroup: (32, 4, 1),
         outputShapes: [[B, T, Hv, Dv], state.shape],
         outputDTypes: [inputType, inputType]
     )
