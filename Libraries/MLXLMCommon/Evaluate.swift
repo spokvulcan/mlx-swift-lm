@@ -280,16 +280,14 @@ public struct TopPSampler: LogitSampler {
     }
 
     /// Keep only the top-k highest-probability tokens.
-    /// Matches `apply_top_k` from `mlx_lm/sample_utils.py`.
+    /// Mirrors `apply_top_k` from `mlx_lm/sample_utils.py`.
     private func applyTopK(_ logprobs: MLXArray, topK: Int) -> MLXArray {
         let vocabularySize = logprobs.dim(-1)
         guard topK < vocabularySize else { return logprobs }
-        // O(V) partition: the element at position kth is the top-K boundary.
-        let kth = vocabularySize - topK
-        let partitioned = argPartition(logprobs, kth: kth, axis: -1)
-        let thresholdIdx = partitioned[0..., kth ..< (kth + 1)]
-        let threshold = takeAlong(logprobs, thresholdIdx, axis: -1)
-        return MLX.where(logprobs .>= threshold, logprobs, negInf)
+        // O(V) partition on negated logprobs so top-k land at [0, topK).
+        // Indices at [topK, V) are the tokens to mask out.
+        let maskIndices = argPartition(-logprobs, kth: topK - 1, axis: -1)[0..., topK...]
+        return putAlong(logprobs, maskIndices, values: negInf, axis: -1)
     }
 }
 
