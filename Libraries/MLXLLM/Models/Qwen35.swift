@@ -553,8 +553,8 @@ public class Qwen35TextModelInner: Module {
                     ssmMask: nil,
                     cache: cacheArray?[i]
                 )
-                // Pipeline: kick off GPU evaluation every 4 layers while CPU builds next batch
-                if (i & 3) == 3 {
+                // Pipeline: kick off GPU evaluation every 8 layers while CPU builds next batch
+                if (i & 7) == 7 {
                     asyncEval(hiddenStates)
                 }
             }
