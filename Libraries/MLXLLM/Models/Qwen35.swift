@@ -177,10 +177,6 @@ final class Qwen35GatedDeltaNet: Module {
     /// Split sizes for the fused projection: [qkv, z, b, a]
     let fusedSplitIndices: [Int]
 
-    /// Precomputed QK normalization scalars (avoid per-forward scalar alloc + cast)
-    let qScale: Float
-    let kScale: Float
-
     @ParameterInfo(key: "dt_bias") var dtBias: MLXArray
     @ParameterInfo(key: "A_log") var aLog: MLXArray
 
@@ -203,10 +199,6 @@ final class Qwen35GatedDeltaNet: Module {
         let bSize = numVHeads
         let aSize = numVHeads
         self.fusedSplitIndices = [qkvSize, qkvSize + zSize, qkvSize + zSize + bSize]
-
-        let invScale = pow(Float(args.linearKeyHeadDim), -0.5)
-        self.qScale = invScale * invScale  // = 1/headKDim
-        self.kScale = invScale
 
         precondition(
             numVHeads % numKHeads == 0,
@@ -276,8 +268,14 @@ final class Qwen35GatedDeltaNet: Module {
         let v = convSplit[2].reshaped(B, S, numVHeads, headVDim)
 
         var state = cache?[1]
-        let qNormed = qScale * MLXFast.rmsNorm(q, weight: MLXArray.mlxNone, eps: 1e-6)
-        let kNormed = kScale * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
+        let dtype = q.dtype
+        let invScale = pow(Float(headKDim), -0.5)
+        let qNormed =
+            MLXArray(pow(invScale, 2)).asType(dtype)
+            * MLXFast.rmsNorm(q, weight: MLXArray.mlxNone, eps: 1e-6)
+        let kNormed =
+            MLXArray(invScale).asType(dtype)
+            * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
 
         var out: MLXArray
 
