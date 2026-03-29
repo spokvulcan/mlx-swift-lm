@@ -553,6 +553,10 @@ public class Qwen35TextModelInner: Module {
                     ssmMask: nil,
                     cache: cacheArray?[i]
                 )
+                // Pipeline: kick off GPU evaluation every 8 layers while CPU builds next batch
+                if (i & 7) == 7 {
+                    asyncEval(hiddenStates)
+                }
             }
         } else {
             let faMask = createAttentionMask(h: hiddenStates, cache: cacheArray?[faIdx])
