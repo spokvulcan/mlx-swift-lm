@@ -442,6 +442,27 @@ final class Qwen35SparseMoeBlock: Module, UnaryLayer {
     }
 }
 
+// MARK: - Fused MLP (gate_proj + up_proj → single matmul)
+
+private final class Qwen35FusedMLP: Module, UnaryLayer {
+    @ModuleInfo(key: "gate_up_proj") var gateUpProj: Linear
+    @ModuleInfo(key: "down_proj") var downProj: Linear
+
+    let hiddenDimensions: Int
+
+    init(dimensions: Int, hiddenDimensions: Int) {
+        self.hiddenDimensions = hiddenDimensions
+        _gateUpProj.wrappedValue = Linear(dimensions, hiddenDimensions * 2, bias: false)
+        _downProj.wrappedValue = Linear(hiddenDimensions, dimensions, bias: false)
+    }
+
+    func callAsFunction(_ x: MLXArray) -> MLXArray {
+        let gateUp = gateUpProj(x)
+        let splits = MLX.split(gateUp, parts: 2, axis: -1)
+        return downProj(silu(splits[0]) * splits[1])
+    }
+}
+
 // MARK: - Decoder Layer
 
 final class Qwen35DecoderLayer: Module {
@@ -467,7 +488,7 @@ final class Qwen35DecoderLayer: Module {
         if args.numExperts > 0 {
             _mlp.wrappedValue = Qwen35SparseMoeBlock(args)
         } else {
-            _mlp.wrappedValue = Qwen3NextMLP(
+            _mlp.wrappedValue = Qwen35FusedMLP(
                 dimensions: args.hiddenSize,
                 hiddenDimensions: args.intermediateSize
             )
@@ -629,6 +650,27 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
                 && v.ndim == 1
             {
                 weights[k] = v + MLXArray(1, dtype: v.dtype)
+            }
+        }
+
+        // Fuse MLP gate_proj + up_proj → gate_up_proj
+        let gateSuffix = ".mlp.gate_proj.weight"
+        let mlpKeysToFuse = weights.keys.filter { $0.hasSuffix(gateSuffix) }
+        for gateKey in mlpKeysToFuse {
+            let prefix = String(gateKey.dropLast(gateSuffix.count))
+            let projNames = ["gate_proj", "up_proj"]
+
+            for ext in ["weight", "scales", "biases"] {
+                let parts = projNames.compactMap {
+                    weights["\(prefix).mlp.\($0).\(ext)"]
+                }
+                if parts.count == projNames.count {
+                    weights["\(prefix).mlp.gate_up_proj.\(ext)"] = concatenated(
+                        parts, axis: 0)
+                    for name in projNames {
+                        weights["\(prefix).mlp.\(name).\(ext)"] = nil
+                    }
+                }
             }
         }
 
