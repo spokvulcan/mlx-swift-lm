@@ -172,10 +172,10 @@ final class Qwen35GatedDeltaNet: Module {
     let convDim: Int
 
     @ModuleInfo(key: "conv1d") var conv1d: Conv1d
-    @ModuleInfo(key: "in_proj_qkv") var inProjQKV: Linear
-    @ModuleInfo(key: "in_proj_z") var inProjZ: Linear
-    @ModuleInfo(key: "in_proj_b") var inProjB: Linear
-    @ModuleInfo(key: "in_proj_a") var inProjA: Linear
+    @ModuleInfo(key: "in_proj_fused") var inProjFused: Linear
+
+    /// Split sizes for the fused projection: [qkv, z, b, a]
+    let fusedSplitIndices: [Int]
 
     @ParameterInfo(key: "dt_bias") var dtBias: MLXArray
     @ParameterInfo(key: "A_log") var aLog: MLXArray
@@ -194,6 +194,12 @@ final class Qwen35GatedDeltaNet: Module {
         self.convKernelSize = args.linearConvKernelDim
         self.convDim = keyDim * 2 + valueDim
 
+        let qkvSize = keyDim * 2 + valueDim
+        let zSize = valueDim
+        let bSize = numVHeads
+        let aSize = numVHeads
+        self.fusedSplitIndices = [qkvSize, qkvSize + zSize, qkvSize + zSize + bSize]
+
         precondition(
             numVHeads % numKHeads == 0,
             "num_v_heads (\(numVHeads)) must be divisible by num_k_heads (\(numKHeads))"
@@ -210,10 +216,8 @@ final class Qwen35GatedDeltaNet: Module {
             bias: false
         )
 
-        _inProjQKV.wrappedValue = Linear(hiddenSize, keyDim * 2 + valueDim, bias: false)
-        _inProjZ.wrappedValue = Linear(hiddenSize, valueDim, bias: false)
-        _inProjB.wrappedValue = Linear(hiddenSize, numVHeads, bias: false)
-        _inProjA.wrappedValue = Linear(hiddenSize, numVHeads, bias: false)
+        _inProjFused.wrappedValue = Linear(
+            hiddenSize, qkvSize + zSize + bSize + aSize, bias: false)
 
         _dtBias.wrappedValue = MLXArray.ones([numVHeads])
         let a = MLXRandom.uniform(low: 0, high: 16, [numVHeads])
@@ -233,10 +237,12 @@ final class Qwen35GatedDeltaNet: Module {
         let B = inputs.dim(0)
         let S = inputs.dim(1)
 
-        var qkv = inProjQKV(inputs)
-        let z = inProjZ(inputs).reshaped(B, S, numVHeads, headVDim)
-        let b = inProjB(inputs)
-        let a = inProjA(inputs)
+        let fusedOut = inProjFused(inputs)
+        let splits = MLX.split(fusedOut, indices: fusedSplitIndices, axis: -1)
+        var qkv = splits[0]
+        let z = splits[1].reshaped(B, S, numVHeads, headVDim)
+        let b = splits[2]
+        let a = splits[3]
 
         let convState: MLXArray
         if let cacheState = cache?[0] {
@@ -623,6 +629,30 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
                 && v.ndim == 1
             {
                 weights[k] = v + MLXArray(1, dtype: v.dtype)
+            }
+        }
+
+        // Fuse linear_attn input projections: qkv + z + b + a → in_proj_fused
+        let layerPrefix = "model.layers."
+        let numLayers = configuration.hiddenLayers
+        for i in 0 ..< numLayers {
+            let prefix = "\(layerPrefix)\(i).linear_attn."
+            let qkvKey = "\(prefix)in_proj_qkv.weight"
+            let zKey = "\(prefix)in_proj_z.weight"
+            let bKey = "\(prefix)in_proj_b.weight"
+            let aKey = "\(prefix)in_proj_a.weight"
+            let fusedKey = "\(prefix)in_proj_fused.weight"
+
+            if let qkvW = weights[qkvKey],
+                let zW = weights[zKey],
+                let bW = weights[bKey],
+                let aW = weights[aKey]
+            {
+                weights[fusedKey] = concatenated([qkvW, zW, bW, aW], axis: 0)
+                weights[qkvKey] = nil
+                weights[zKey] = nil
+                weights[bKey] = nil
+                weights[aKey] = nil
             }
         }
 
