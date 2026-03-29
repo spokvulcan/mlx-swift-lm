@@ -306,10 +306,10 @@ final class Qwen35Attention: Module {
     let attentionHeads: Int
     let kvHeads: Int
     let scale: Float
+    let qDim: Int
+    let kvDim: Int
 
-    @ModuleInfo(key: "q_proj") var qProj: Linear
-    @ModuleInfo(key: "k_proj") var kProj: Linear
-    @ModuleInfo(key: "v_proj") var vProj: Linear
+    @ModuleInfo(key: "qkv_proj") var qkvProj: Linear
     @ModuleInfo(key: "o_proj") var oProj: Linear
 
     @ModuleInfo(key: "q_norm") var qNorm: RMSNorm
@@ -322,13 +322,11 @@ final class Qwen35Attention: Module {
         self.attentionHeads = args.attentionHeads
         self.kvHeads = args.kvHeads
         self.scale = pow(Float(headDim), -0.5)
+        self.qDim = args.attentionHeads * headDim * 2
+        self.kvDim = args.kvHeads * headDim
 
-        _qProj.wrappedValue = Linear(
-            args.hiddenSize, args.attentionHeads * headDim * 2, bias: args.attentionBias)
-        _kProj.wrappedValue = Linear(
-            args.hiddenSize, args.kvHeads * headDim, bias: args.attentionBias)
-        _vProj.wrappedValue = Linear(
-            args.hiddenSize, args.kvHeads * headDim, bias: args.attentionBias)
+        _qkvProj.wrappedValue = Linear(
+            args.hiddenSize, qDim + kvDim * 2, bias: args.attentionBias)
         _oProj.wrappedValue = Linear(
             args.attentionHeads * headDim, args.hiddenSize, bias: args.attentionBias)
 
@@ -353,13 +351,15 @@ final class Qwen35Attention: Module {
         let B = x.dim(0)
         let L = x.dim(1)
 
-        let qProjOutput = qProj(x)
-        let qSplit = qProjOutput.reshaped(B, L, attentionHeads, -1).split(parts: 2, axis: -1)
+        let qkvOut = qkvProj(x)
+        let splits = MLX.split(qkvOut, indices: [qDim, qDim + kvDim], axis: -1)
+
+        let qSplit = splits[0].reshaped(B, L, attentionHeads, -1).split(parts: 2, axis: -1)
         var queries = qSplit[0]
         let gate = qSplit[1].reshaped(B, L, -1)
 
-        var keys = kProj(x)
-        var values = vProj(x)
+        var keys = splits[1]
+        var values = splits[2]
 
         queries = qNorm(queries).transposed(0, 2, 1, 3)
         keys = kNorm(keys.reshaped(B, L, kvHeads, -1)).transposed(0, 2, 1, 3)
@@ -629,6 +629,27 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
                 && v.ndim == 1
             {
                 weights[k] = v + MLXArray(1, dtype: v.dtype)
+            }
+        }
+
+        // Fuse self_attn Q+K+V projections into qkv_proj
+        let qSuffix = ".self_attn.q_proj.weight"
+        let attnKeysToFuse = weights.keys.filter { $0.hasSuffix(qSuffix) }
+        for qKey in attnKeysToFuse {
+            let prefix = String(qKey.dropLast(qSuffix.count))
+            let projNames = ["q_proj", "k_proj", "v_proj"]
+
+            for ext in ["weight", "scales", "biases"] {
+                let parts = projNames.compactMap {
+                    weights["\(prefix).self_attn.\($0).\(ext)"]
+                }
+                if parts.count == projNames.count {
+                    weights["\(prefix).self_attn.qkv_proj.\(ext)"] = concatenated(
+                        parts, axis: 0)
+                    for name in projNames {
+                        weights["\(prefix).self_attn.\(name).\(ext)"] = nil
+                    }
+                }
             }
         }
 
