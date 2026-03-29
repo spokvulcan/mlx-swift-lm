@@ -542,16 +542,31 @@ public class Qwen35TextModelInner: Module {
             cacheArray = Array(repeating: nil as KVCache?, count: layers.count)
         }
 
-        let faMask = createAttentionMask(h: hiddenStates, cache: cacheArray?[faIdx])
-        let ssmMask = createSSMMask(h: hiddenStates, cache: cacheArray?[ssmIdx] as? MambaCache)
+        let T = inputs.dim(1)
 
-        for (i, layer) in layers.enumerated() {
-            let mask = layer.isLinear ? ssmMask : nil
-            let attnMask =
-                layer.isLinear
-                ? MLXFast.ScaledDotProductAttentionMaskMode.none : faMask
-            hiddenStates = layer(
-                hiddenStates, attentionMask: attnMask, ssmMask: mask, cache: cacheArray?[i])
+        if T == 1 {
+            // Fast path for single-token decode: masks are always .none/nil
+            for (i, layer) in layers.enumerated() {
+                hiddenStates = layer(
+                    hiddenStates,
+                    attentionMask: .none,
+                    ssmMask: nil,
+                    cache: cacheArray?[i]
+                )
+            }
+        } else {
+            let faMask = createAttentionMask(h: hiddenStates, cache: cacheArray?[faIdx])
+            let ssmMask = createSSMMask(
+                h: hiddenStates, cache: cacheArray?[ssmIdx] as? MambaCache)
+
+            for (i, layer) in layers.enumerated() {
+                let mask = layer.isLinear ? ssmMask : nil
+                let attnMask =
+                    layer.isLinear
+                    ? MLXFast.ScaledDotProductAttentionMaskMode.none : faMask
+                hiddenStates = layer(
+                    hiddenStates, attentionMask: attnMask, ssmMask: mask, cache: cacheArray?[i])
+            }
         }
 
         return norm(hiddenStates)
