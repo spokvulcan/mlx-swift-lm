@@ -633,15 +633,14 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
         }
 
         // Fuse linear_attn input projections: qkv + z + b + a → in_proj_fused
-        let layerPrefix = "model.layers."
-        let numLayers = configuration.hiddenLayers
-        for i in 0 ..< numLayers {
-            let prefix = "\(layerPrefix)\(i).linear_attn."
-            let qkvKey = "\(prefix)in_proj_qkv.weight"
-            let zKey = "\(prefix)in_proj_z.weight"
-            let bKey = "\(prefix)in_proj_b.weight"
-            let aKey = "\(prefix)in_proj_a.weight"
-            let fusedKey = "\(prefix)in_proj_fused.weight"
+        let qkvSuffix = ".linear_attn.in_proj_qkv.weight"
+        let keysToFuse = weights.keys.filter { $0.hasSuffix(qkvSuffix) }
+        for qkvKey in keysToFuse {
+            let prefix = String(qkvKey.dropLast(qkvSuffix.count))
+            let zKey = "\(prefix).linear_attn.in_proj_z.weight"
+            let bKey = "\(prefix).linear_attn.in_proj_b.weight"
+            let aKey = "\(prefix).linear_attn.in_proj_a.weight"
+            let fusedKey = "\(prefix).linear_attn.in_proj_fused.weight"
 
             if let qkvW = weights[qkvKey],
                 let zW = weights[zKey],
