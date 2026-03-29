@@ -633,25 +633,24 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
         }
 
         // Fuse linear_attn input projections: qkv + z + b + a → in_proj_fused
+        // Must fuse weight, scales, and biases for quantized models
         let qkvSuffix = ".linear_attn.in_proj_qkv.weight"
         let keysToFuse = weights.keys.filter { $0.hasSuffix(qkvSuffix) }
         for qkvKey in keysToFuse {
             let prefix = String(qkvKey.dropLast(qkvSuffix.count))
-            let zKey = "\(prefix).linear_attn.in_proj_z.weight"
-            let bKey = "\(prefix).linear_attn.in_proj_b.weight"
-            let aKey = "\(prefix).linear_attn.in_proj_a.weight"
-            let fusedKey = "\(prefix).linear_attn.in_proj_fused.weight"
+            let projNames = ["in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a"]
 
-            if let qkvW = weights[qkvKey],
-                let zW = weights[zKey],
-                let bW = weights[bKey],
-                let aW = weights[aKey]
-            {
-                weights[fusedKey] = concatenated([qkvW, zW, bW, aW], axis: 0)
-                weights[qkvKey] = nil
-                weights[zKey] = nil
-                weights[bKey] = nil
-                weights[aKey] = nil
+            for ext in ["weight", "scales", "biases"] {
+                let parts = projNames.compactMap {
+                    weights["\(prefix).linear_attn.\($0).\(ext)"]
+                }
+                if parts.count == projNames.count {
+                    weights["\(prefix).linear_attn.in_proj_fused.\(ext)"] = concatenated(
+                        parts, axis: 0)
+                    for name in projNames {
+                        weights["\(prefix).linear_attn.\(name).\(ext)"] = nil
+                    }
+                }
             }
         }
 
