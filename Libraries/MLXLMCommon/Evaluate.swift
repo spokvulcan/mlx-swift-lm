@@ -1146,6 +1146,62 @@ public func generateTask(
     )
 }
 
+/// Handle for retrieving the finalized KV cache after a generation task completes.
+///
+/// Await the accompanying task before calling ``takeFinalCache()`` to ensure the
+/// iterator has finished mutating the cache.
+public final class FinalizedKVCacheHandle: @unchecked Sendable {
+    private let finalCache = SerialAccessContainer<[KVCache]?>(nil)
+
+    public init() {}
+
+    func storeFinalCache(_ cache: consuming [KVCache]) async {
+        let cache = SendableBox(cache)
+        await finalCache.update { finalCache in
+            finalCache = cache.consume()
+        }
+    }
+
+    /// Returns the finalized KV cache exactly once.
+    ///
+    /// Subsequent calls return `nil`.
+    public func takeFinalCache() async -> sending [KVCache]? {
+        await finalCache.update { finalCache in
+            let cache = finalCache
+            finalCache = nil
+            return cache
+        }
+    }
+}
+
+/// Low-level token generation using a ``TokenIterator``, returning an
+/// `AsyncStream<Generation>`, a completion task, and a handle for the finalized KV cache.
+///
+/// The cache handle captures the iterator-owned cache array after generation completes,
+/// including any in-loop cache replacement (for example dynamic KV quantization).
+public func generateTaskWithFinalCache(
+    promptTokenCount: Int,
+    modelConfiguration: ModelConfiguration,
+    tokenizer: Tokenizer,
+    iterator: consuming TokenIterator,
+    wiredMemoryTicket: WiredMemoryTicket? = nil
+) -> (AsyncStream<Generation>, Task<Void, Never>, FinalizedKVCacheHandle) {
+    let finalCacheHandle = FinalizedKVCacheHandle()
+    let (stream, task) = generateLoopTask(
+        promptTokenCount: promptTokenCount,
+        modelConfiguration: modelConfiguration,
+        tokenizer: tokenizer,
+        iterator: iterator,
+        wiredMemoryTicket: wiredMemoryTicket,
+        finalCacheHandle: finalCacheHandle,
+        handler: TextToolTokenLoopHandler(
+            tokenizer: tokenizer,
+            format: modelConfiguration.toolCallFormat ?? .json
+        )
+    )
+    return (stream, task, finalCacheHandle)
+}
+
 /// Generates raw token IDs asynchronously using the provided language model input, parameters, and context.
 ///
 /// This is similar to `generate(input:cache:parameters:context:)`, but yields raw token IDs instead of decoded text/tool calls.
@@ -1259,6 +1315,7 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
     tokenizer: Tokenizer,
     iterator: consuming TokenIterator,
     wiredMemoryTicket: WiredMemoryTicket? = nil,
+    finalCacheHandle: FinalizedKVCacheHandle? = nil,
     includeStopToken: Bool = false,
     handler: consuming Handler
 ) -> (AsyncStream<Handler.Output>, Task<Void, Never>) {
@@ -1270,8 +1327,8 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
 
     // Launch a Task to perform iteration asynchronously.
     let task = Task {
-        let performIteration = {
-            let iterator = iterator.consume()
+        let performIteration = { () async -> [KVCache] in
+            var iterator = iterator.consume()
             var handler = handler.consume()
 
             var start = Date.timeIntervalSinceReferenceDate
@@ -1346,14 +1403,20 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
 
             // Finalize the stream
             continuation.finish()
+            return iterator.cache
         }
 
+        let finalCache: [KVCache]
         if let ticket = wiredMemoryTicket {
-            await WiredMemoryTicket.withWiredLimit(ticket) {
-                performIteration()
+            finalCache = await WiredMemoryTicket.withWiredLimit(ticket) {
+                await performIteration()
             }
         } else {
-            performIteration()
+            finalCache = await performIteration()
+        }
+
+        if let finalCacheHandle {
+            await finalCacheHandle.storeFinalCache(finalCache)
         }
     }
 
