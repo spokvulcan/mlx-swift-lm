@@ -417,12 +417,13 @@ public final class ChatSession {
                             input: input, model: model, cache: kvCache,
                             parameters: generateParameters)
 
-                        let (stream, task) = MLXLMCommon.generateTask(
-                            promptTokenCount: input.text.tokens.size,
-                            modelConfiguration: modelConfiguration,
-                            tokenizer: tokenizer,
-                            iterator: iterator
-                        )
+                        let (stream, task, finalCacheHandle) =
+                            MLXLMCommon.generateTaskWithFinalCache(
+                                promptTokenCount: input.text.tokens.size,
+                                modelConfiguration: modelConfiguration,
+                                tokenizer: tokenizer,
+                                iterator: iterator
+                            )
 
                         var pendingToolCalls: [ToolCall] = []
 
@@ -443,6 +444,10 @@ public final class ChatSession {
                         // the case where we broke the loop early as the generation
                         // work may continue (briefly) and use the KVCache
                         await task.value
+                        if let finalCache = await finalCacheHandle.takeFinalCache() {
+                            kvCache = finalCache
+                            cache = .kvcache(kvCache)
+                        }
 
                         // dispatch all tool calls from this generation pass
                         if let toolDispatch, !pendingToolCalls.isEmpty,
