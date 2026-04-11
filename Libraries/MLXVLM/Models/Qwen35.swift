@@ -1104,9 +1104,10 @@ public class Qwen35: Module, VLMModel {
     public func prepare(
         _ input: LMInput,
         cache: [any KVCache],
-        windowSize _: Int?
+        windowSize: Int?
     ) throws -> PrepareResult {
         let inputIds = input.text.tokens
+        let prefillStepSize = windowSize ?? 512
 
         var pixelValues: MLXArray?
         var imageFrames: [THW]?
@@ -1127,41 +1128,144 @@ public class Qwen35: Module, VLMModel {
             pixelValues = concatenated(pixelParts)
         }
 
-        var inputEmbeddings: MLXArray?
+        let typedCache = castCache(cache)
 
         if let pixelValues,
             let frames = combinedFrames(imageFrames: imageFrames, videoFrames: videoFrames)
                 .nilIfEmpty
         {
-            let textEmbeds = languageModel.model.embedTokens(inputIds)
+            // Vision path: run vision encoder once, then split embed/chunk
             let (visionHidden, _) = visionModel(pixelValues, gridTHW: frames)
-            let visionFeatures = visionHidden.asType(textEmbeds.dtype)
 
-            let (mergedEmbeds, _) = try mergeInputIdsWithImageFeatures(
-                imageFeatures: visionFeatures,
-                inputEmbeds: textEmbeds,
-                inputIds: inputIds,
-                imageTokenIndex: config.imageTokenIndex,
-                videoTokenIndex: config.videoTokenIndex
+            // Find boundary after last vision token BEFORE embedding
+            let lastVisionIdx = Self.lastVisionTokenOffset(
+                inputIds, imageTokenId: config.imageTokenIndex, videoTokenId: config.videoTokenIndex
             )
-            inputEmbeddings = mergedEmbeds
+            let visionPrefixLen = (lastVisionIdx ?? 0) + 1
+            let textSuffixLen = inputIds.dim(-1) - visionPrefixLen
+
+            if textSuffixLen > prefillStepSize {
+                // Chunked path: embed only the vision prefix to avoid
+                // full-prompt embedding tensors living across the suffix loop
+                let prefixIds = inputIds[0..., ..<visionPrefixLen]
+                let prefixEmbeds = languageModel.model.embedTokens(prefixIds)
+                let visionFeatures = visionHidden.asType(prefixEmbeds.dtype)
+
+                let (mergedPrefixEmbeds, _) = try mergeInputIdsWithImageFeatures(
+                    imageFeatures: visionFeatures,
+                    inputEmbeds: prefixEmbeds,
+                    inputIds: prefixIds,
+                    imageTokenIndex: config.imageTokenIndex,
+                    videoTokenIndex: config.videoTokenIndex
+                )
+
+                // Process vision prefix in one shot (correct rope for image positions)
+                _ = languageModel(
+                    prefixIds,
+                    inputsEmbeds: mergedPrefixEmbeds,
+                    cache: typedCache,
+                    mask: nil,
+                    positionIds: nil,
+                    pixelValues: pixelValues,
+                    imageGridTHW: imageFrames,
+                    videoGridTHW: videoFrames
+                )
+                eval(cache)
+                Memory.clearCache()
+
+                // Chunk the text-only suffix (token IDs only, no pre-computed embeddings)
+                var textTokens = inputIds[0..., visionPrefixLen...]
+                while textTokens.dim(-1) > prefillStepSize {
+                    let chunk = textTokens[0..., ..<prefillStepSize]
+                    _ = self(chunk, cache: cache)
+                    eval(cache)
+                    Memory.clearCache()
+                    textTokens = textTokens[0..., prefillStepSize...]
+                }
+
+                let output = languageModel(
+                    textTokens,
+                    inputsEmbeds: nil,
+                    cache: typedCache,
+                    mask: nil,
+                    positionIds: nil,
+                    pixelValues: nil,
+                    imageGridTHW: nil,
+                    videoGridTHW: nil
+                )
+                return .logits(output)
+            } else {
+                // Short enough for single-shot — full embeddings are fine here
+                let textEmbeds = languageModel.model.embedTokens(inputIds)
+                let visionFeatures = visionHidden.asType(textEmbeds.dtype)
+
+                let (mergedEmbeds, _) = try mergeInputIdsWithImageFeatures(
+                    imageFeatures: visionFeatures,
+                    inputEmbeds: textEmbeds,
+                    inputIds: inputIds,
+                    imageTokenIndex: config.imageTokenIndex,
+                    videoTokenIndex: config.videoTokenIndex
+                )
+
+                let output = languageModel(
+                    inputIds,
+                    inputsEmbeds: mergedEmbeds,
+                    cache: typedCache,
+                    mask: input.text.mask,
+                    positionIds: nil,
+                    pixelValues: pixelValues,
+                    imageGridTHW: imageFrames,
+                    videoGridTHW: videoFrames
+                )
+                return .logits(output)
+            }
         } else {
+            // Non-vision path: chunk like LLMModel
             languageModel.resetPositionState()
+            var y = input.text
+
+            while y.tokens.dim(-1) > prefillStepSize {
+                let chunk = y[0..., ..<prefillStepSize]
+                _ = self(chunk.tokens, cache: cache)
+                eval(cache)
+                Memory.clearCache()
+                y = y[0..., prefillStepSize...]
+            }
+
+            // Final chunk — get logits
+            let output = languageModel(
+                y.tokens,
+                inputsEmbeds: nil,
+                cache: typedCache,
+                mask: y.mask,
+                positionIds: nil,
+                pixelValues: nil,
+                imageGridTHW: nil,
+                videoGridTHW: nil
+            )
+            return .logits(output)
         }
+    }
 
-        let typedCache = castCache(cache)
-        let output = languageModel(
-            inputIds,
-            inputsEmbeds: inputEmbeddings,
-            cache: typedCache,
-            mask: input.text.mask,
-            positionIds: nil,
-            pixelValues: pixelValues,
-            imageGridTHW: imageFrames,
-            videoGridTHW: videoFrames
-        )
-
-        return .logits(output)
+    /// Find the offset of the last image or video token in the input sequence.
+    private static func lastVisionTokenOffset(
+        _ inputIds: MLXArray,
+        imageTokenId: Int,
+        videoTokenId: Int
+    ) -> Int? {
+        let flat: [Int32]
+        if inputIds.ndim >= 2 {
+            flat = inputIds[0].asArray(Int32.self)
+        } else {
+            flat = inputIds.asArray(Int32.self)
+        }
+        var lastIdx: Int?
+        for (i, id) in flat.enumerated() {
+            if Int(id) == imageTokenId || Int(id) == videoTokenId {
+                lastIdx = i
+            }
+        }
+        return lastIdx
     }
 
     public func callAsFunction(_ inputs: MLXArray, cache: [any KVCache]?) -> MLXArray {

@@ -29,6 +29,7 @@ extension LLMModel {
             let input = y[.newAxis, ..<prefillStepSize]
             _ = self(input, cache: cache.isEmpty ? nil : cache, state: nil)
             eval(cache)
+            Memory.clearCache()
             y = y[prefillStepSize...]
         }
 

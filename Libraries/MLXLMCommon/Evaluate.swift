@@ -645,7 +645,10 @@ public struct TokenIterator: TokenIteratorProtocol {
     mutating func prepare(input: LMInput, windowSize: Int? = nil) throws {
         processor?.prompt(input.text.tokens)
 
-        switch try model.prepare(input, cache: cache, windowSize: windowSize) {
+        let prepareResult = try model.prepare(input, cache: cache, windowSize: windowSize)
+        Memory.clearCache()
+
+        switch prepareResult {
         case .tokens(let tokens):
             y = tokens
 
@@ -657,8 +660,6 @@ public struct TokenIterator: TokenIteratorProtocol {
         case .logits(let result):
             y = .init(tokens: convertToToken(logits: result.logits))
             asyncEval(y.tokens)
-
-            break
         }
     }
 
