@@ -102,6 +102,14 @@ public struct GenerateParameters: Sendable {
     /// number of tokens to consider for frequency penalty
     public var frequencyContextSize: Int
 
+    /// Token offsets (absolute, in full-prompt coordinates) at which to capture
+    /// HybridCacheSnapshot during prefill. Empty means no checkpoint capture.
+    public var checkpointAtOffsets: Set<Int>
+
+    /// Absolute offset of the first token in the suffix being prefilled.
+    /// Set to the restored snapshot's tokenOffset on a cache hit, 0 on a miss.
+    public var checkpointBaseOffset: Int
+
     public init(
         maxTokens: Int? = nil,
         maxKVSize: Int? = nil,
@@ -118,7 +126,9 @@ public struct GenerateParameters: Sendable {
         presenceContextSize: Int = 20,
         frequencyPenalty: Float? = nil,
         frequencyContextSize: Int = 20,
-        prefillStepSize: Int = 512
+        prefillStepSize: Int = 512,
+        checkpointAtOffsets: Set<Int> = [],
+        checkpointBaseOffset: Int = 0
     ) {
         self.maxTokens = maxTokens
         self.maxKVSize = maxKVSize
@@ -136,6 +146,8 @@ public struct GenerateParameters: Sendable {
         self.frequencyPenalty = frequencyPenalty
         self.frequencyContextSize = frequencyContextSize
         self.prefillStepSize = prefillStepSize
+        self.checkpointAtOffsets = checkpointAtOffsets
+        self.checkpointBaseOffset = checkpointBaseOffset
     }
 
     public func sampler() -> LogitSampler {
@@ -543,6 +555,14 @@ public struct TokenIterator: TokenIteratorProtocol {
     let kvGroupSize: Int
     let quantizedKVStart: Int
 
+    // Checkpoint capture parameters
+    let checkpointAtOffsets: Set<Int>
+    let checkpointBaseOffset: Int
+
+    /// Snapshots captured during prefill at the requested checkpoint offsets.
+    /// Populated after init completes. Read before consuming the iterator.
+    public private(set) var capturedSnapshots: [HybridCacheSnapshot] = []
+
     // Internal metrics
     var promptPrefillTime: TimeInterval = 0.0
 
@@ -570,6 +590,8 @@ public struct TokenIterator: TokenIteratorProtocol {
         self.kvBits = parameters.kvBits
         self.kvGroupSize = parameters.kvGroupSize
         self.quantizedKVStart = parameters.quantizedKVStart
+        self.checkpointAtOffsets = parameters.checkpointAtOffsets
+        self.checkpointBaseOffset = parameters.checkpointBaseOffset
 
         self.promptPrefillTime = try measure {
             try prepare(input: .init(text: y), windowSize: parameters.prefillStepSize)
@@ -603,6 +625,8 @@ public struct TokenIterator: TokenIteratorProtocol {
         self.kvBits = parameters.kvBits
         self.kvGroupSize = parameters.kvGroupSize
         self.quantizedKVStart = parameters.quantizedKVStart
+        self.checkpointAtOffsets = parameters.checkpointAtOffsets
+        self.checkpointBaseOffset = parameters.checkpointBaseOffset
 
         self.promptPrefillTime = try measure {
             try prepare(input: input, windowSize: parameters.prefillStepSize)
@@ -636,6 +660,8 @@ public struct TokenIterator: TokenIteratorProtocol {
         self.kvBits = nil
         self.kvGroupSize = 64
         self.quantizedKVStart = 0
+        self.checkpointAtOffsets = []
+        self.checkpointBaseOffset = 0
 
         self.promptPrefillTime = try measure {
             try prepare(input: input, windowSize: prefillStepSize)
@@ -645,7 +671,12 @@ public struct TokenIterator: TokenIteratorProtocol {
     mutating func prepare(input: LMInput, windowSize: Int? = nil) throws {
         processor?.prompt(input.text.tokens)
 
-        let prepareResult = try model.prepare(input, cache: cache, windowSize: windowSize)
+        let (prepareResult, snapshots) = try model.prepareWithCheckpoints(
+            input, cache: cache, windowSize: windowSize,
+            checkpointAtOffsets: checkpointAtOffsets,
+            checkpointBaseOffset: checkpointBaseOffset
+        )
+        self.capturedSnapshots = snapshots
         Memory.clearCache()
 
         switch prepareResult {

@@ -39,4 +39,32 @@ extension LLMModel {
     public func messageGenerator(tokenizer: Tokenizer) -> MessageGenerator {
         DefaultMessageGenerator()
     }
+
+    public func prepareWithCheckpoints(
+        _ input: LMInput, cache: [KVCache], windowSize: Int?,
+        checkpointAtOffsets: Set<Int>, checkpointBaseOffset: Int
+    ) throws -> (PrepareResult, [HybridCacheSnapshot]) {
+        guard !checkpointAtOffsets.isEmpty else {
+            let result = try prepare(input, cache: cache, windowSize: windowSize)
+            return (result, [])
+        }
+
+        let prefillStepSize = windowSize ?? 512
+        var y = input.text
+
+        let (_, snapshots) = try HybridCacheSnapshot.chunkedPrefill(
+            totalTokens: y.tokens.size,
+            prefillStepSize: prefillStepSize,
+            checkpointAtOffsets: checkpointAtOffsets,
+            checkpointBaseOffset: checkpointBaseOffset,
+            cache: cache
+        ) { chunkSize in
+            let chunk = y[.newAxis, ..<chunkSize]
+            _ = self(chunk, cache: cache.isEmpty ? nil : cache, state: nil)
+            eval(cache)
+            y = y[chunkSize...]
+        }
+
+        return (.tokens(y), snapshots)
+    }
 }

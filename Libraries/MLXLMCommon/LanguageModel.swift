@@ -159,6 +159,13 @@ public protocol LanguageModel: Module {
     /// - ``PrepareResult/logits(_:)`` to produce the next token from the prompt
     func prepare(_ input: LMInput, cache: [KVCache], windowSize: Int?) throws -> PrepareResult
 
+    /// Extended prepare with checkpoint capture support.
+    /// Default implementation delegates to the base prepare() and returns no snapshots.
+    func prepareWithCheckpoints(
+        _ input: LMInput, cache: [KVCache], windowSize: Int?,
+        checkpointAtOffsets: Set<Int>, checkpointBaseOffset: Int
+    ) throws -> (PrepareResult, [HybridCacheSnapshot])
+
     /// Primary entry point to produce a step (single token) from the model
     func callAsFunction(_ input: LMInput.Text, cache: [KVCache]?, state: LMOutput.State?)
         -> LMOutput
@@ -203,6 +210,18 @@ extension LanguageModel {
         MLXArray]
     {
         sanitize(weights: weights)
+    }
+}
+
+extension LanguageModel {
+    /// Default: delegates to prepare() and returns no snapshots.
+    /// LLMModel and Qwen35 VLM override this with checkpoint-aware chunking.
+    public func prepareWithCheckpoints(
+        _ input: LMInput, cache: [KVCache], windowSize: Int?,
+        checkpointAtOffsets: Set<Int>, checkpointBaseOffset: Int
+    ) throws -> (PrepareResult, [HybridCacheSnapshot]) {
+        let result = try prepare(input, cache: cache, windowSize: windowSize)
+        return (result, [])
     }
 }
 

@@ -1247,6 +1247,140 @@ public class Qwen35: Module, VLMModel {
         }
     }
 
+    public func prepareWithCheckpoints(
+        _ input: LMInput, cache: [KVCache], windowSize: Int?,
+        checkpointAtOffsets: Set<Int>, checkpointBaseOffset: Int
+    ) throws -> (PrepareResult, [HybridCacheSnapshot]) {
+        guard !checkpointAtOffsets.isEmpty else {
+            let result = try prepare(input, cache: cache, windowSize: windowSize)
+            return (result, [])
+        }
+
+        let inputIds = input.text.tokens
+        let prefillStepSize = windowSize ?? 512
+
+        var pixelValues: MLXArray?
+        var imageFrames: [THW]?
+        var videoFrames: [THW]?
+
+        let visionDType = visionModel.patchEmbed.proj.weight.dtype
+        var pixelParts: [MLXArray] = []
+        if let image = input.image {
+            pixelParts.append(image.pixels.asType(visionDType))
+            imageFrames = image.frames
+        }
+        if let video = input.video {
+            pixelParts.append(video.pixels.asType(visionDType))
+            videoFrames = video.frames
+        }
+        if !pixelParts.isEmpty {
+            pixelValues = concatenated(pixelParts)
+        }
+
+        let typedCache = castCache(cache)
+
+        if let pixelValues,
+           let frames = combinedFrames(imageFrames: imageFrames, videoFrames: videoFrames).nilIfEmpty
+        {
+            let (visionHidden, _) = visionModel(pixelValues, gridTHW: frames)
+            let lastVisionIdx = Self.lastVisionTokenOffset(
+                inputIds, imageTokenId: config.imageTokenIndex, videoTokenId: config.videoTokenIndex
+            )
+            let visionPrefixLen = (lastVisionIdx ?? 0) + 1
+            let textSuffixLen = inputIds.dim(-1) - visionPrefixLen
+
+            // Route through chunked path when checkpoints exist in the text suffix,
+            // even for short prompts — tail drain handles sub-prefillStepSize captures.
+            let hasCheckpointsInSuffix = checkpointAtOffsets.contains(where: { offset in
+                let rel = offset - checkpointBaseOffset
+                return rel >= visionPrefixLen && rel < inputIds.dim(-1)
+            })
+
+            if textSuffixLen > prefillStepSize || hasCheckpointsInSuffix {
+                let prefixIds = inputIds[0..., ..<visionPrefixLen]
+                let prefixEmbeds = languageModel.model.embedTokens(prefixIds)
+                let visionFeatures = visionHidden.asType(prefixEmbeds.dtype)
+
+                let (mergedPrefixEmbeds, _) = try mergeInputIdsWithImageFeatures(
+                    imageFeatures: visionFeatures,
+                    inputEmbeds: prefixEmbeds,
+                    inputIds: prefixIds,
+                    imageTokenIndex: config.imageTokenIndex,
+                    videoTokenIndex: config.videoTokenIndex
+                )
+
+                _ = languageModel(
+                    prefixIds, inputsEmbeds: mergedPrefixEmbeds,
+                    cache: typedCache, mask: nil, positionIds: nil,
+                    pixelValues: pixelValues, imageGridTHW: imageFrames, videoGridTHW: videoFrames
+                )
+                eval(cache)
+                Memory.clearCache()
+
+                var textTokens = inputIds[0..., visionPrefixLen...]
+                let (_, snapshots) = try HybridCacheSnapshot.chunkedPrefill(
+                    totalTokens: textTokens.dim(-1),
+                    prefillStepSize: prefillStepSize,
+                    checkpointAtOffsets: checkpointAtOffsets,
+                    checkpointBaseOffset: checkpointBaseOffset,
+                    initialOffset: visionPrefixLen,
+                    cache: cache
+                ) { chunkSize in
+                    let chunk = textTokens[0..., ..<chunkSize]
+                    _ = self(chunk, cache: cache)
+                    eval(cache)
+                    textTokens = textTokens[0..., chunkSize...]
+                }
+
+                let output = languageModel(
+                    textTokens, inputsEmbeds: nil,
+                    cache: typedCache, mask: nil, positionIds: nil,
+                    pixelValues: nil, imageGridTHW: nil, videoGridTHW: nil
+                )
+                return (.logits(output), snapshots)
+            } else {
+                let textEmbeds = languageModel.model.embedTokens(inputIds)
+                let visionFeatures = visionHidden.asType(textEmbeds.dtype)
+                let (mergedEmbeds, _) = try mergeInputIdsWithImageFeatures(
+                    imageFeatures: visionFeatures,
+                    inputEmbeds: textEmbeds,
+                    inputIds: inputIds,
+                    imageTokenIndex: config.imageTokenIndex,
+                    videoTokenIndex: config.videoTokenIndex
+                )
+                let output = languageModel(
+                    inputIds, inputsEmbeds: mergedEmbeds,
+                    cache: typedCache, mask: input.text.mask, positionIds: nil,
+                    pixelValues: pixelValues, imageGridTHW: imageFrames, videoGridTHW: videoFrames
+                )
+                return (.logits(output), [])
+            }
+        } else {
+            languageModel.resetPositionState()
+            var y = input.text
+
+            let (_, snapshots) = try HybridCacheSnapshot.chunkedPrefill(
+                totalTokens: y.tokens.dim(-1),
+                prefillStepSize: prefillStepSize,
+                checkpointAtOffsets: checkpointAtOffsets,
+                checkpointBaseOffset: checkpointBaseOffset,
+                cache: cache
+            ) { chunkSize in
+                let chunk = y[0..., ..<chunkSize]
+                _ = self(chunk.tokens, cache: cache)
+                eval(cache)
+                y = y[0..., chunkSize...]
+            }
+
+            let output = languageModel(
+                y.tokens, inputsEmbeds: nil,
+                cache: typedCache, mask: y.mask, positionIds: nil,
+                pixelValues: nil, imageGridTHW: nil, videoGridTHW: nil
+            )
+            return (.logits(output), snapshots)
+        }
+    }
+
     /// Find the offset of the last image or video token in the input sequence.
     private static func lastVisionTokenOffset(
         _ inputIds: MLXArray,
