@@ -163,7 +163,8 @@ public protocol LanguageModel: Module {
     /// Default implementation delegates to the base prepare() and returns no snapshots.
     func prepareWithCheckpoints(
         _ input: LMInput, cache: [KVCache], windowSize: Int?,
-        checkpointAtOffsets: Set<Int>, checkpointBaseOffset: Int
+        checkpoints: [Int: HybridCacheSnapshot.CheckpointType],
+        checkpointBaseOffset: Int
     ) throws -> (PrepareResult, [HybridCacheSnapshot])
 
     /// Primary entry point to produce a step (single token) from the model
@@ -218,7 +219,8 @@ extension LanguageModel {
     /// LLMModel and Qwen35 VLM override this with checkpoint-aware chunking.
     public func prepareWithCheckpoints(
         _ input: LMInput, cache: [KVCache], windowSize: Int?,
-        checkpointAtOffsets: Set<Int>, checkpointBaseOffset: Int
+        checkpoints: [Int: HybridCacheSnapshot.CheckpointType],
+        checkpointBaseOffset: Int
     ) throws -> (PrepareResult, [HybridCacheSnapshot]) {
         let result = try prepare(input, cache: cache, windowSize: windowSize)
         return (result, [])

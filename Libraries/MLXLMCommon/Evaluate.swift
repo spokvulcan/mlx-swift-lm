@@ -103,8 +103,9 @@ public struct GenerateParameters: Sendable {
     public var frequencyContextSize: Int
 
     /// Token offsets (absolute, in full-prompt coordinates) at which to capture
-    /// HybridCacheSnapshot during prefill. Empty means no checkpoint capture.
-    public var checkpointAtOffsets: Set<Int>
+    /// `HybridCacheSnapshot`s during prefill, paired with the type tag to apply.
+    /// Empty means no checkpoint capture.
+    public var checkpoints: [Int: HybridCacheSnapshot.CheckpointType]
 
     /// Absolute offset of the first token in the suffix being prefilled.
     /// Set to the restored snapshot's tokenOffset on a cache hit, 0 on a miss.
@@ -127,7 +128,7 @@ public struct GenerateParameters: Sendable {
         frequencyPenalty: Float? = nil,
         frequencyContextSize: Int = 20,
         prefillStepSize: Int = 512,
-        checkpointAtOffsets: Set<Int> = [],
+        checkpoints: [Int: HybridCacheSnapshot.CheckpointType] = [:],
         checkpointBaseOffset: Int = 0
     ) {
         self.maxTokens = maxTokens
@@ -146,7 +147,7 @@ public struct GenerateParameters: Sendable {
         self.frequencyPenalty = frequencyPenalty
         self.frequencyContextSize = frequencyContextSize
         self.prefillStepSize = prefillStepSize
-        self.checkpointAtOffsets = checkpointAtOffsets
+        self.checkpoints = checkpoints
         self.checkpointBaseOffset = checkpointBaseOffset
     }
 
@@ -556,7 +557,7 @@ public struct TokenIterator: TokenIteratorProtocol {
     let quantizedKVStart: Int
 
     // Checkpoint capture parameters
-    let checkpointAtOffsets: Set<Int>
+    let checkpoints: [Int: HybridCacheSnapshot.CheckpointType]
     let checkpointBaseOffset: Int
 
     /// Snapshots captured during prefill at the requested checkpoint offsets.
@@ -590,7 +591,7 @@ public struct TokenIterator: TokenIteratorProtocol {
         self.kvBits = parameters.kvBits
         self.kvGroupSize = parameters.kvGroupSize
         self.quantizedKVStart = parameters.quantizedKVStart
-        self.checkpointAtOffsets = parameters.checkpointAtOffsets
+        self.checkpoints = parameters.checkpoints
         self.checkpointBaseOffset = parameters.checkpointBaseOffset
 
         self.promptPrefillTime = try measure {
@@ -625,7 +626,7 @@ public struct TokenIterator: TokenIteratorProtocol {
         self.kvBits = parameters.kvBits
         self.kvGroupSize = parameters.kvGroupSize
         self.quantizedKVStart = parameters.quantizedKVStart
-        self.checkpointAtOffsets = parameters.checkpointAtOffsets
+        self.checkpoints = parameters.checkpoints
         self.checkpointBaseOffset = parameters.checkpointBaseOffset
 
         self.promptPrefillTime = try measure {
@@ -660,7 +661,7 @@ public struct TokenIterator: TokenIteratorProtocol {
         self.kvBits = nil
         self.kvGroupSize = 64
         self.quantizedKVStart = 0
-        self.checkpointAtOffsets = []
+        self.checkpoints = [:]
         self.checkpointBaseOffset = 0
 
         self.promptPrefillTime = try measure {
@@ -673,7 +674,7 @@ public struct TokenIterator: TokenIteratorProtocol {
 
         let (prepareResult, snapshots) = try model.prepareWithCheckpoints(
             input, cache: cache, windowSize: windowSize,
-            checkpointAtOffsets: checkpointAtOffsets,
+            checkpoints: checkpoints,
             checkpointBaseOffset: checkpointBaseOffset
         )
         self.capturedSnapshots = snapshots

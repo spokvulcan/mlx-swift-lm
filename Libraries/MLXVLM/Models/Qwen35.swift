@@ -1249,9 +1249,10 @@ public class Qwen35: Module, VLMModel {
 
     public func prepareWithCheckpoints(
         _ input: LMInput, cache: [KVCache], windowSize: Int?,
-        checkpointAtOffsets: Set<Int>, checkpointBaseOffset: Int
+        checkpoints: [Int: HybridCacheSnapshot.CheckpointType],
+        checkpointBaseOffset: Int
     ) throws -> (PrepareResult, [HybridCacheSnapshot]) {
-        guard !checkpointAtOffsets.isEmpty else {
+        guard !checkpoints.isEmpty else {
             let result = try prepare(input, cache: cache, windowSize: windowSize)
             return (result, [])
         }
@@ -1291,7 +1292,7 @@ public class Qwen35: Module, VLMModel {
 
             // Route through chunked path when checkpoints exist in the text suffix,
             // even for short prompts — tail drain handles sub-prefillStepSize captures.
-            let hasCheckpointsInSuffix = checkpointAtOffsets.contains(where: { offset in
+            let hasCheckpointsInSuffix = checkpoints.keys.contains(where: { offset in
                 let rel = offset - checkpointBaseOffset
                 return rel >= visionPrefixLen && rel < inputIds.dim(-1)
             })
@@ -1321,7 +1322,7 @@ public class Qwen35: Module, VLMModel {
                 let (_, snapshots) = try HybridCacheSnapshot.chunkedPrefill(
                     totalTokens: textTokens.dim(-1),
                     prefillStepSize: prefillStepSize,
-                    checkpointAtOffsets: checkpointAtOffsets,
+                    checkpoints: checkpoints,
                     checkpointBaseOffset: checkpointBaseOffset,
                     initialOffset: visionPrefixLen,
                     cache: cache
@@ -1362,7 +1363,7 @@ public class Qwen35: Module, VLMModel {
             let (_, snapshots) = try HybridCacheSnapshot.chunkedPrefill(
                 totalTokens: y.tokens.dim(-1),
                 prefillStepSize: prefillStepSize,
-                checkpointAtOffsets: checkpointAtOffsets,
+                checkpoints: checkpoints,
                 checkpointBaseOffset: checkpointBaseOffset,
                 cache: cache
             ) { chunkSize in

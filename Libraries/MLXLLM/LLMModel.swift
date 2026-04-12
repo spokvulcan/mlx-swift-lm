@@ -42,9 +42,10 @@ extension LLMModel {
 
     public func prepareWithCheckpoints(
         _ input: LMInput, cache: [KVCache], windowSize: Int?,
-        checkpointAtOffsets: Set<Int>, checkpointBaseOffset: Int
+        checkpoints: [Int: HybridCacheSnapshot.CheckpointType],
+        checkpointBaseOffset: Int
     ) throws -> (PrepareResult, [HybridCacheSnapshot]) {
-        guard !checkpointAtOffsets.isEmpty else {
+        guard !checkpoints.isEmpty else {
             let result = try prepare(input, cache: cache, windowSize: windowSize)
             return (result, [])
         }
@@ -55,7 +56,7 @@ extension LLMModel {
         let (_, snapshots) = try HybridCacheSnapshot.chunkedPrefill(
             totalTokens: y.tokens.size,
             prefillStepSize: prefillStepSize,
-            checkpointAtOffsets: checkpointAtOffsets,
+            checkpoints: checkpoints,
             checkpointBaseOffset: checkpointBaseOffset,
             cache: cache
         ) { chunkSize in

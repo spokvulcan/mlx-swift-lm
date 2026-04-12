@@ -129,13 +129,13 @@ public struct HybridCacheSnapshot: @unchecked Sendable {
     public static func chunkedPrefill(
         totalTokens: Int,
         prefillStepSize: Int,
-        checkpointAtOffsets: Set<Int>,
+        checkpoints: [Int: CheckpointType],
         checkpointBaseOffset: Int,
         initialOffset: Int = 0,
         cache: [KVCache],
         processChunk: (_ chunkSize: Int) throws -> Void
     ) rethrows -> (consumed: Int, snapshots: [HybridCacheSnapshot]) {
-        let relativeCheckpoints = checkpointAtOffsets
+        let relativeCheckpoints = checkpoints.keys
             .map { $0 - checkpointBaseOffset }
             .filter { $0 > 0 }
             .sorted()
@@ -144,13 +144,19 @@ public struct HybridCacheSnapshot: @unchecked Sendable {
         var remaining = totalTokens
         var snapshots: [HybridCacheSnapshot] = []
 
-        // Capture at initialOffset if it's a checkpoint (e.g. after vision prefix)
-        if relativeCheckpoints.contains(currentOffset) {
-            if let snap = capture(
-                cache: cache, offset: checkpointBaseOffset + currentOffset, type: .system
-            ) {
+        func captureAt(_ relativeOffset: Int) {
+            let absoluteOffset = checkpointBaseOffset + relativeOffset
+            // Invariant: relativeCheckpoints derives from checkpoints.keys, so the
+            // map always has an entry for any offset we capture at.
+            let type = checkpoints[absoluteOffset]!
+            if let snap = capture(cache: cache, offset: absoluteOffset, type: type) {
                 snapshots.append(snap)
             }
+        }
+
+        // Capture at initialOffset if it's a checkpoint (e.g. after vision prefix)
+        if relativeCheckpoints.contains(currentOffset) {
+            captureAt(currentOffset)
         }
 
         // Main loop — processes chunks up to prefillStepSize, adjusting to land on checkpoints
@@ -167,11 +173,7 @@ public struct HybridCacheSnapshot: @unchecked Sendable {
             remaining -= chunkSize
 
             if relativeCheckpoints.contains(currentOffset) {
-                if let snap = capture(
-                    cache: cache, offset: checkpointBaseOffset + currentOffset, type: .system
-                ) {
-                    snapshots.append(snap)
-                }
+                captureAt(currentOffset)
             }
             Memory.clearCache()
         }
@@ -187,11 +189,7 @@ public struct HybridCacheSnapshot: @unchecked Sendable {
             currentOffset += chunkSize
             remaining -= chunkSize
 
-            if let snap = capture(
-                cache: cache, offset: checkpointBaseOffset + currentOffset, type: .system
-            ) {
-                snapshots.append(snap)
-            }
+            captureAt(currentOffset)
             Memory.clearCache()
         }
 
