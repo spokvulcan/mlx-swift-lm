@@ -256,3 +256,369 @@ public struct HybridCacheSnapshot: @unchecked Sendable {
         return RotatingKVCache(maxSize: maxSize)
     }
 }
+
+// MARK: - Checkpoint-type wire format
+
+extension HybridCacheSnapshot.CheckpointType {
+    /// Stable wire-format string used in both the safetensors-header
+    /// `tesse.hybrid_cache.checkpoint_type` field written by
+    /// ``HybridCacheSnapshot/serialize(to:metadata:)`` and in
+    /// `PersistedSnapshotDescriptor.checkpointType` in the downstream
+    /// SSD persistence tier. Case names match the enum verbatim so
+    /// `.wireString` round-trips through ``init(wireString:)`` without
+    /// a lookup table.
+    public var wireString: String {
+        switch self {
+        case .system: return "system"
+        case .lastMessageBoundary: return "lastMessageBoundary"
+        case .leaf: return "leaf"
+        case .branchPoint: return "branchPoint"
+        }
+    }
+
+    /// Inverse of ``wireString``. Returns `nil` for any unrecognized
+    /// input so warm-start paths can treat it as "drop this descriptor"
+    /// without crashing on unknown data (e.g. a file written by a
+    /// future build with a new case).
+    public init?(wireString: String) {
+        switch wireString {
+        case "system": self = .system
+        case "lastMessageBoundary": self = .lastMessageBoundary
+        case "leaf": self = .leaf
+        case "branchPoint": self = .branchPoint
+        default: return nil
+        }
+    }
+}
+
+// MARK: - Safetensors persistence
+
+extension HybridCacheSnapshot {
+
+    /// Reserved metadata keys written by ``serialize(to:metadata:)`` and
+    /// consumed by ``deserialize(from:expectedFingerprint:)``. Caller-supplied
+    /// metadata values under the `tesse.hybrid_cache.` namespace are
+    /// overwritten by the serializer; everything else is persisted verbatim.
+    public enum MetadataKey {
+        /// Model fingerprint (see `ModelFingerprint.computeFingerprint(modelDir:)`
+        /// in the tesseract target). The caller must include this key in the
+        /// metadata passed to `serialize`, so that `deserialize` can reject
+        /// stale files after a weight swap under a stable `modelID`.
+        public static let fingerprint = "tesse.hybrid_cache.fingerprint"
+
+        /// Wire-format `HybridCacheSnapshot.CheckpointType`. Overwritten by
+        /// the serializer.
+        public static let checkpointType = "tesse.hybrid_cache.checkpoint_type"
+
+        /// Absolute `HybridCacheSnapshot.tokenOffset`. Overwritten by the
+        /// serializer.
+        public static let tokenOffset = "tesse.hybrid_cache.token_offset"
+
+        /// Prefix for per-layer absolute offsets (`{prefix}{layerIndex}`).
+        /// Required to survive round-trips for `ChunkedKVCache`, whose
+        /// `state` setter derives `offset = keys.dim(2)` — which is the
+        /// truncated chunk count, not the caller's absolute prompt
+        /// position. Overwritten by the serializer.
+        public static let layerOffsetPrefix = "tesse.hybrid_cache.layer_offset."
+
+        /// Prefix for per-layer `metaState` entries
+        /// (`{prefix}{layerIndex}.count` plus `{prefix}{layerIndex}.{j}`
+        /// for each string). Required because `loadPromptCache`'s
+        /// type-specific `metaState` setters are lossy — e.g.
+        /// `QuantizedKVCache.metaState =` only restores offset and
+        /// silently drops the stored `groupSize` / `bits` back to
+        /// constructor defaults (`QuantizedKVCache()` → 64/8). Our
+        /// deserialize reads metaState from these reserved keys and
+        /// bypasses the live-cache round-trip entirely, keeping the
+        /// snapshot's metaState authoritative across serialize/
+        /// deserialize. Overwritten by the serializer.
+        public static let layerMetaPrefix = "tesse.hybrid_cache.layer_meta."
+    }
+
+    /// Errors thrown by ``serialize(to:metadata:)`` /
+    /// ``deserialize(from:expectedFingerprint:)``.
+    public enum SerializationError: LocalizedError {
+        case missingFingerprint
+        case fingerprintMismatch(expected: String, actual: String)
+        case missingCheckpointType
+        case unknownCheckpointType(String)
+        case missingTokenOffset
+        case invalidTokenOffset(String)
+        case unsupportedCacheClass(String)
+
+        public var errorDescription: String? {
+            switch self {
+            case .missingFingerprint:
+                return "Prompt cache file has no '\(MetadataKey.fingerprint)' metadata."
+            case .fingerprintMismatch(let expected, let actual):
+                return "Model fingerprint mismatch: expected \(expected), got \(actual)."
+            case .missingCheckpointType:
+                return "Prompt cache file has no '\(MetadataKey.checkpointType)' metadata."
+            case .unknownCheckpointType(let value):
+                return "Unknown HybridCacheSnapshot.CheckpointType wire value: '\(value)'."
+            case .missingTokenOffset:
+                return "Prompt cache file has no '\(MetadataKey.tokenOffset)' metadata."
+            case .invalidTokenOffset(let value):
+                return "Invalid HybridCacheSnapshot.tokenOffset wire value: '\(value)'."
+            case .unsupportedCacheClass(let name):
+                return "HybridCacheSnapshot cannot represent cache class '\(name)'."
+            }
+        }
+    }
+
+    /// Serialize this snapshot to a safetensors file at `url`.
+    ///
+    /// **Thread-affinity contract: must be called from inside `container.perform`
+    /// on `LLMActor` (or another Metal-affine context).** The safetensors writer
+    /// reads MLX-array bytes, which forces evaluation of any pending lazy
+    /// Metal command-queue work. Calling this outside a Metal-affine context
+    /// risks silent state corruption or a crash. Swift has no runtime
+    /// Metal-context detection, so the contract is enforced by convention
+    /// plus a debug-build smoke check that evaluates the first layer's first
+    /// state array at function entry.
+    ///
+    /// Writes the snapshot's tensors directly from `self.layers` using
+    /// `save(arrays:metadata:url:)` and the same flattened-safetensors wire
+    /// format as `savePromptCache` (`"i.j"` tensors, `"0.i.j"` metaState,
+    /// `"1.{key}"` user metadata, `"2.i"` class names). This avoids both
+    /// constructing throwaway `[KVCache]` instances via `restore()` and
+    /// paying a second copy of the state arrays on the hot path. Output
+    /// files remain fully compatible with `loadPromptCache` as well as
+    /// ``deserialize(from:expectedFingerprint:)``.
+    ///
+    /// The snapshot's `tokenOffset`, `checkpointType`, per-layer absolute
+    /// offsets, and (authoritatively) per-layer `metaState` are written
+    /// into the safetensors metadata under the reserved keys defined by
+    /// ``MetadataKey``. The caller must also place the model fingerprint
+    /// under `MetadataKey.fingerprint` so that
+    /// ``deserialize(from:expectedFingerprint:)`` can reject stale files
+    /// after a weight swap under a stable `modelID`.
+    ///
+    /// - Parameters:
+    ///   - url: destination `.safetensors` file. Atomic rename, parent
+    ///     directory creation, and replacement of existing files are the
+    ///     caller's responsibility (the SSD writer handles these).
+    ///   - metadata: caller-supplied string metadata. Keys under the
+    ///     `tesse.hybrid_cache.` namespace are reserved and overwritten by
+    ///     this function; all other keys are persisted verbatim.
+    public func serialize(to url: URL, metadata: [String: String] = [:]) throws {
+        #if DEBUG
+        Self.debugSmokeCheckMetalAffine(firstArray: layers.first?.state.first)
+        #endif
+
+        // Build the "user metadata" dictionary — the caller's keys plus
+        // our reserved `tesse.hybrid_cache.*` keys. These become
+        // `1.{key}` in the flattened safetensors metadata below.
+        var userMetadata = metadata
+        userMetadata[MetadataKey.checkpointType] = checkpointType.wireString
+        userMetadata[MetadataKey.tokenOffset] = String(tokenOffset)
+        for (layerIndex, layer) in layers.enumerated() {
+            userMetadata[Self.layerOffsetKey(layerIndex)] = String(layer.offset)
+            userMetadata[Self.layerMetaCountKey(layerIndex)] = String(layer.metaState.count)
+            for (j, value) in layer.metaState.enumerated() {
+                userMetadata[Self.layerMetaKey(layerIndex, j)] = value
+            }
+        }
+
+        // Flatten directly from `self.layers`, mirroring the wire format
+        // produced by `savePromptCache` (see `KVCache.swift`). Produces
+        // byte-for-byte equivalent files so any existing reader — our
+        // `deserialize`, the vendor `loadPromptCache`, etc. — can ingest
+        // them without discrimination.
+        var flattenedArrays: [String: MLXArray] = [:]
+        var flattenedMetadata: [String: String] = [:]
+        for (i, layer) in layers.enumerated() {
+            for (j, array) in layer.state.enumerated() {
+                flattenedArrays["\(i).\(j)"] = array
+            }
+            for (j, info) in layer.metaState.enumerated() {
+                flattenedMetadata["0.\(i).\(j)"] = info
+            }
+            flattenedMetadata["2.\(i)"] = layer.className
+        }
+        for (key, value) in userMetadata {
+            flattenedMetadata["1.\(key)"] = value
+        }
+
+        try save(arrays: flattenedArrays, metadata: flattenedMetadata, url: url)
+    }
+
+    /// Deserialize a snapshot previously written by
+    /// ``serialize(to:metadata:)``.
+    ///
+    /// **Thread-affinity contract: must be called from inside `container.perform`
+    /// on `LLMActor` (or another Metal-affine context).** `loadPromptCache`
+    /// creates MLX arrays backed by the safetensors payload; touching those
+    /// arrays outside a Metal-affine context is undefined. The contract is
+    /// enforced by convention plus a debug-build smoke check that evaluates
+    /// the first loaded layer's first state array immediately after load.
+    ///
+    /// - Parameters:
+    ///   - url: source `.safetensors` file previously produced by
+    ///     ``serialize(to:metadata:)``.
+    ///   - expectedFingerprint: fingerprint of the loading model (see
+    ///     `ModelFingerprint.computeFingerprint(modelDir:)` in the tesseract
+    ///     target). The file's persisted fingerprint under
+    ///     `MetadataKey.fingerprint` must match; on mismatch this function
+    ///     throws ``SerializationError/fingerprintMismatch(expected:actual:)``
+    ///     without returning a snapshot.
+    /// - Returns: a fully reconstructed `HybridCacheSnapshot` with a fresh
+    ///   `createdAt` wall-clock timestamp. The captured moment is not
+    ///   persisted because `ContinuousClock.Instant` has no stable wire
+    ///   format across process restarts.
+    public static func deserialize(
+        from url: URL,
+        expectedFingerprint: String
+    ) throws -> HybridCacheSnapshot {
+        let (caches, metadata) = try loadPromptCache(url: url)
+
+        #if DEBUG
+        debugSmokeCheckMetalAffine(firstArray: caches.first?.state.first)
+        #endif
+
+        guard let storedFingerprint = metadata[MetadataKey.fingerprint] else {
+            throw SerializationError.missingFingerprint
+        }
+        guard storedFingerprint == expectedFingerprint else {
+            throw SerializationError.fingerprintMismatch(
+                expected: expectedFingerprint,
+                actual: storedFingerprint
+            )
+        }
+
+        guard let checkpointWire = metadata[MetadataKey.checkpointType] else {
+            throw SerializationError.missingCheckpointType
+        }
+        guard let checkpointType = CheckpointType(wireString: checkpointWire) else {
+            throw SerializationError.unknownCheckpointType(checkpointWire)
+        }
+
+        guard let tokenOffsetRaw = metadata[MetadataKey.tokenOffset] else {
+            throw SerializationError.missingTokenOffset
+        }
+        guard let tokenOffset = Int(tokenOffsetRaw) else {
+            throw SerializationError.invalidTokenOffset(tokenOffsetRaw)
+        }
+
+        var totalBytes = 0
+        var layers: [LayerState] = []
+        layers.reserveCapacity(caches.count)
+        for (layerIndex, cache) in caches.enumerated() {
+            guard let className = classNameForCache(cache) else {
+                throw SerializationError.unsupportedCacheClass(
+                    String(describing: type(of: cache))
+                )
+            }
+            let state = cache.state
+            for array in state {
+                totalBytes += array.nbytes
+            }
+
+            // Restore absolute per-layer offset. Required for ChunkedKVCache,
+            // whose state setter in loadPromptCache resets offset to
+            // `keys.dim(2)` (the truncated chunk count) rather than the
+            // caller's absolute prompt position. For other cache types the
+            // stored value equals `keys.dim(2)` anyway, so the override is
+            // a no-op.
+            let layerOffset: Int
+            if let raw = metadata[Self.layerOffsetKey(layerIndex)],
+               let parsed = Int(raw)
+            {
+                layerOffset = parsed
+            } else {
+                layerOffset = cache.offset
+            }
+
+            // Restore metaState from the reserved-key mirror instead of
+            // the live cache's `metaState` getter. `loadPromptCache`
+            // constructs each cache with the default initializer and
+            // routes the persisted strings through the type-specific
+            // `metaState =` setter. For `QuantizedKVCache` that setter
+            // only restores offset (KVCache.swift:937-944), so the
+            // groupSize / bits fields silently collapse back to the
+            // constructor defaults (64 / 8). Reading from our reserved
+            // mirror keeps non-default quantization settings intact.
+            // Legacy files (absent mirror) fall through to the live
+            // cache — the behavior the previous version shipped.
+            let metaState = Self.layerMetaState(from: metadata, layerIndex: layerIndex)
+                ?? cache.metaState
+
+            layers.append(LayerState(
+                className: className,
+                state: state,
+                metaState: metaState,
+                offset: layerOffset
+            ))
+        }
+
+        return HybridCacheSnapshot(
+            tokenOffset: tokenOffset,
+            layers: layers,
+            checkpointType: checkpointType,
+            memoryBytes: totalBytes,
+            createdAt: .now
+        )
+    }
+
+    // MARK: - Private helpers
+
+    /// Build the reserved metadata key for the per-layer absolute
+    /// offset at `layerIndex`. Single construction point so serialize
+    /// and deserialize cannot drift.
+    private static func layerOffsetKey(_ layerIndex: Int) -> String {
+        "\(MetadataKey.layerOffsetPrefix)\(layerIndex)"
+    }
+
+    /// Build the reserved metadata key for the metaState element at
+    /// `(layerIndex, metaIndex)`. Paired with ``layerMetaCountKey(_:)``.
+    private static func layerMetaKey(_ layerIndex: Int, _ metaIndex: Int) -> String {
+        "\(MetadataKey.layerMetaPrefix)\(layerIndex).\(metaIndex)"
+    }
+
+    /// Build the reserved metadata key that holds the metaState element
+    /// count for `layerIndex`. Needed because each metaState element is
+    /// stored under its own key (see ``layerMetaKey(_:_:)``), so the
+    /// reader needs an authoritative count to stop at.
+    private static func layerMetaCountKey(_ layerIndex: Int) -> String {
+        "\(MetadataKey.layerMetaPrefix)\(layerIndex).count"
+    }
+
+    /// Recover the persisted metaState for `layerIndex` from the
+    /// reserved-key mirror written by ``serialize(to:metadata:)``.
+    /// Returns `nil` if the mirror is absent (legacy file) or
+    /// structurally invalid — callers fall through to the live cache's
+    /// `metaState` in both cases.
+    private static func layerMetaState(
+        from metadata: [String: String],
+        layerIndex: Int
+    ) -> [String]? {
+        guard let countRaw = metadata[layerMetaCountKey(layerIndex)],
+              let count = Int(countRaw),
+              count >= 0
+        else {
+            return nil
+        }
+        var result: [String] = []
+        result.reserveCapacity(count)
+        for metaIndex in 0 ..< count {
+            guard let value = metadata[layerMetaKey(layerIndex, metaIndex)] else {
+                return nil
+            }
+            result.append(value)
+        }
+        return result
+    }
+
+    #if DEBUG
+    /// Smoke check for the thread-affinity contract. Evaluates a single
+    /// MLX array to force any pending lazy Metal work to drain; if the
+    /// caller is outside a Metal-affine context, this will trap or crash
+    /// loudly, which is the desired failure mode per the contract in the
+    /// doc comments on ``serialize(to:metadata:)`` and
+    /// ``deserialize(from:expectedFingerprint:)``.
+    private static func debugSmokeCheckMetalAffine(firstArray: MLXArray?) {
+        guard let firstArray else { return }
+        eval(firstArray)
+    }
+    #endif
+}
