@@ -29,9 +29,10 @@ public struct HybridCacheSnapshot: @unchecked Sendable {
     public let createdAt: ContinuousClock.Instant
 
     public enum CheckpointType: Comparable, Sendable {
-        case system         // stable-prefix reuse; highest priority in Phase 1
-        case leaf           // standard conversation-prefix reuse
-        case branchPoint    // Phase 2: speculative Marconi checkpoint
+        case system               // stable-prefix reuse (system + tools)
+        case lastMessageBoundary  // end-of-last-message reuse across turns
+        case leaf                 // standard conversation-prefix reuse
+        case branchPoint          // Phase 2: speculative Marconi checkpoint
     }
 
     /// Capture from live cache during prefill. Deep-copies all state arrays.
