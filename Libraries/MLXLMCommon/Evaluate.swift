@@ -107,6 +107,11 @@ public struct GenerateParameters: Sendable {
     /// Empty means no checkpoint capture.
     public var checkpoints: [Int: HybridCacheSnapshot.CheckpointType]
 
+    /// Absolute token offsets whose snapshots should be captured during prefill
+    /// for request-local helper flows only. These snapshots never enter the
+    /// radix tree or persistence layer.
+    public var transientCheckpointOffsets: Set<Int>
+
     /// Absolute offset of the first token in the suffix being prefilled.
     /// Set to the restored snapshot's tokenOffset on a cache hit, 0 on a miss.
     public var checkpointBaseOffset: Int
@@ -129,6 +134,7 @@ public struct GenerateParameters: Sendable {
         frequencyContextSize: Int = 20,
         prefillStepSize: Int = 512,
         checkpoints: [Int: HybridCacheSnapshot.CheckpointType] = [:],
+        transientCheckpointOffsets: Set<Int> = [],
         checkpointBaseOffset: Int = 0
     ) {
         self.maxTokens = maxTokens
@@ -148,6 +154,7 @@ public struct GenerateParameters: Sendable {
         self.frequencyContextSize = frequencyContextSize
         self.prefillStepSize = prefillStepSize
         self.checkpoints = checkpoints
+        self.transientCheckpointOffsets = transientCheckpointOffsets
         self.checkpointBaseOffset = checkpointBaseOffset
     }
 
@@ -558,11 +565,13 @@ public struct TokenIterator: TokenIteratorProtocol {
 
     // Checkpoint capture parameters
     let checkpoints: [Int: HybridCacheSnapshot.CheckpointType]
+    let transientCheckpointOffsets: Set<Int>
     let checkpointBaseOffset: Int
 
     /// Snapshots captured during prefill at the requested checkpoint offsets.
     /// Populated after init completes. Read before consuming the iterator.
     public private(set) var capturedSnapshots: [HybridCacheSnapshot] = []
+    public private(set) var transientSnapshots: [Int: HybridCacheSnapshot] = [:]
 
     // Internal metrics
     var promptPrefillTime: TimeInterval = 0.0
@@ -592,6 +601,7 @@ public struct TokenIterator: TokenIteratorProtocol {
         self.kvGroupSize = parameters.kvGroupSize
         self.quantizedKVStart = parameters.quantizedKVStart
         self.checkpoints = parameters.checkpoints
+        self.transientCheckpointOffsets = parameters.transientCheckpointOffsets
         self.checkpointBaseOffset = parameters.checkpointBaseOffset
 
         self.promptPrefillTime = try measure {
@@ -627,6 +637,7 @@ public struct TokenIterator: TokenIteratorProtocol {
         self.kvGroupSize = parameters.kvGroupSize
         self.quantizedKVStart = parameters.quantizedKVStart
         self.checkpoints = parameters.checkpoints
+        self.transientCheckpointOffsets = parameters.transientCheckpointOffsets
         self.checkpointBaseOffset = parameters.checkpointBaseOffset
 
         self.promptPrefillTime = try measure {
@@ -662,6 +673,7 @@ public struct TokenIterator: TokenIteratorProtocol {
         self.kvGroupSize = 64
         self.quantizedKVStart = 0
         self.checkpoints = [:]
+        self.transientCheckpointOffsets = []
         self.checkpointBaseOffset = 0
 
         self.promptPrefillTime = try measure {
@@ -672,12 +684,27 @@ public struct TokenIterator: TokenIteratorProtocol {
     mutating func prepare(input: LMInput, windowSize: Int? = nil) throws {
         processor?.prompt(input.text.tokens)
 
+        let helperCheckpoints = Dictionary(
+            uniqueKeysWithValues: transientCheckpointOffsets.map { ($0, HybridCacheSnapshot.CheckpointType.leaf) }
+        )
+        let allCheckpoints = checkpoints.merging(helperCheckpoints) { existing, _ in existing }
         let (prepareResult, snapshots) = try model.prepareWithCheckpoints(
             input, cache: cache, windowSize: windowSize,
-            checkpoints: checkpoints,
+            checkpoints: allCheckpoints,
             checkpointBaseOffset: checkpointBaseOffset
         )
-        self.capturedSnapshots = snapshots
+        var storedSnapshots: [HybridCacheSnapshot] = []
+        var transientSnapshots: [Int: HybridCacheSnapshot] = [:]
+        storedSnapshots.reserveCapacity(snapshots.count)
+        for snapshot in snapshots {
+            if transientCheckpointOffsets.contains(snapshot.tokenOffset) {
+                transientSnapshots[snapshot.tokenOffset] = snapshot
+            } else {
+                storedSnapshots.append(snapshot)
+            }
+        }
+        self.capturedSnapshots = storedSnapshots
+        self.transientSnapshots = transientSnapshots
         Memory.clearCache()
 
         switch prepareResult {

@@ -61,7 +61,6 @@ public struct HybridCacheSnapshot: @unchecked Sendable {
 
     public enum CheckpointType: Comparable, Sendable {
         case system               // stable-prefix reuse (system + tools)
-        case lastMessageBoundary  // end-of-last-message reuse across turns
         case leaf                 // standard conversation-prefix reuse
         case branchPoint          // Phase 2: speculative Marconi checkpoint
     }
@@ -301,7 +300,6 @@ extension HybridCacheSnapshot.CheckpointType {
     public var wireString: String {
         switch self {
         case .system: return "system"
-        case .lastMessageBoundary: return "lastMessageBoundary"
         case .leaf: return "leaf"
         case .branchPoint: return "branchPoint"
         }
@@ -314,7 +312,6 @@ extension HybridCacheSnapshot.CheckpointType {
     public init?(wireString: String) {
         switch wireString {
         case "system": self = .system
-        case "lastMessageBoundary": self = .lastMessageBoundary
         case "leaf": self = .leaf
         case "branchPoint": self = .branchPoint
         default: return nil
