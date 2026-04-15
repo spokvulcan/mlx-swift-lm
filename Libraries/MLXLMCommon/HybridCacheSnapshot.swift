@@ -20,6 +20,18 @@ public struct HybridCacheSnapshot: @unchecked Sendable {
         /// state setter (inherited from KVCacheSimple) only sets offset = keys.dim(2),
         /// and its metaState setter restores chunkSize/startPosition but not offset.
         public let offset: Int
+
+        public init(
+            className: String,
+            state: [MLXArray],
+            metaState: [String],
+            offset: Int
+        ) {
+            self.className = className
+            self.state = state
+            self.metaState = metaState
+            self.offset = offset
+        }
     }
 
     public let layers: [LayerState]
@@ -27,6 +39,25 @@ public struct HybridCacheSnapshot: @unchecked Sendable {
     /// Pre-computed sum of all state array nbytes, for eviction decisions.
     public let memoryBytes: Int
     public let createdAt: ContinuousClock.Instant
+
+    /// Public memberwise initializer. Required for cross-module
+    /// reconstruction — Task 4.1.9 lazy hydration reads raw payload
+    /// bytes and rebuilds a snapshot from outside this module (in
+    /// `SSDSnapshotStore.loadSync`), which cannot access the
+    /// synthesized internal init.
+    public init(
+        tokenOffset: Int,
+        layers: [LayerState],
+        checkpointType: CheckpointType,
+        memoryBytes: Int,
+        createdAt: ContinuousClock.Instant
+    ) {
+        self.tokenOffset = tokenOffset
+        self.layers = layers
+        self.checkpointType = checkpointType
+        self.memoryBytes = memoryBytes
+        self.createdAt = createdAt
+    }
 
     public enum CheckpointType: Comparable, Sendable {
         case system               // stable-prefix reuse (system + tools)
