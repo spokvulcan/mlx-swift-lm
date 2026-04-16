@@ -188,41 +188,48 @@ public enum TriAttentionQwen35Runtime {
     }
 
     public static func pruneIfNeeded(
-        caches: [TriAttentionSparseKVCache],
+        caches: [KVCache],
         layerIndices: [Int]
     ) {
         guard
             !caches.isEmpty,
-            caches.count == layerIndices.count,
-            let runtimeState = caches.first?.runtimeState
+            caches.count == layerIndices.count
+        else {
+            return
+        }
+        let runtimeCaches = caches.compactMap { $0 as? TriAttentionRuntimeCache }
+        guard
+            runtimeCaches.count == caches.count,
+            let runtimeState = runtimeCaches.first?.runtimeState
         else {
             return
         }
 
-        let threshold = caches[0].configuration.budgetTokens + TriAttentionQwen35RuntimeState.divideLength
-        guard caches[0].retainedTokenCount >= threshold else {
+        let threshold =
+            runtimeCaches[0].configuration.budgetTokens + TriAttentionQwen35RuntimeState.divideLength
+        guard runtimeCaches[0].retainedTokenCount >= threshold else {
             return
         }
 
-        let roundStart = caches[0].offset
+        let roundStart = runtimeCaches[0].offset
         let keepIndices = sharedPerHeadKeepIndices(
-            caches: caches,
+            caches: runtimeCaches,
             layerIndices: layerIndices,
             runtimeState: runtimeState,
-            budget: caches[0].configuration.budgetTokens,
+            budget: runtimeCaches[0].configuration.budgetTokens,
             roundStart: roundStart
         )
         guard let keepIndices else {
             return
         }
 
-        for cache in caches {
+        for cache in runtimeCaches {
             cache.applyKeepIndices(keepIndices)
         }
     }
 
     private static func sharedPerHeadKeepIndices(
-        caches: [TriAttentionSparseKVCache],
+        caches: [TriAttentionRuntimeCache],
         layerIndices: [Int],
         runtimeState: TriAttentionQwen35RuntimeState,
         budget: Int,
@@ -268,7 +275,7 @@ public enum TriAttentionQwen35Runtime {
     }
 
     private static func layerScores(
-        cache: TriAttentionSparseKVCache,
+        cache: TriAttentionRuntimeCache,
         layerIndex: Int,
         runtimeState: TriAttentionQwen35RuntimeState,
         roundStart: Int
@@ -276,7 +283,7 @@ public enum TriAttentionQwen35Runtime {
         guard
             let sampledHeads = runtimeState.sampledHeadsByLayer[layerIndex],
             !sampledHeads.isEmpty,
-            let retainedKeys = cache.retainedKeys,
+            let retainedKeys = cache.dequantizedRetainedKeysForRuntime(),
             let retainedPositions = cache.retainedPositions
         else {
             return nil

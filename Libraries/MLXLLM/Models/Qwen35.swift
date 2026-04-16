@@ -548,12 +548,12 @@ public class Qwen35TextModelInner: Module {
         }
 
         if let cacheArray {
-            let sparseCaches = fullAttentionLayerIndices.compactMap { index in
-                cacheArray[index] as? TriAttentionSparseKVCache
+            let fullAttentionCaches = fullAttentionLayerIndices.compactMap { index in
+                cacheArray[index]
             }
-            if sparseCaches.count == fullAttentionLayerIndices.count {
+            if fullAttentionCaches.count == fullAttentionLayerIndices.count {
                 TriAttentionQwen35Runtime.pruneIfNeeded(
-                    caches: sparseCaches,
+                    caches: fullAttentionCaches,
                     layerIndices: fullAttentionLayerIndices
                 )
             }

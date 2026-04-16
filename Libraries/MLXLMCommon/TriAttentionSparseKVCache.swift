@@ -1,12 +1,151 @@
 import Foundation
 import MLX
 
+internal protocol TriAttentionRuntimeCache: KVCache, AnyObject {
+    var configuration: TriAttentionConfiguration { get }
+    var runtimeState: TriAttentionQwen35RuntimeState? { get }
+    var retainedPositions: MLXArray? { get }
+    var retainedTokenCount: Int { get }
+
+    func dequantizedRetainedKeysForRuntime() -> MLXArray?
+    func applyKeepIndices(_ keepIndices: MLXArray)
+}
+
+internal func triAttentionMaskMode(
+    retainedPositions: MLXArray?,
+    offset: Int,
+    usesSparseMask: Bool,
+    n: Int,
+    windowSize: Int?,
+    returnArray: Bool
+) -> MLXFast.ScaledDotProductAttentionMaskMode {
+    guard let retainedPositions else {
+        if n == 1 {
+            return .none
+        }
+        if returnArray || (windowSize != nil && n > windowSize!) {
+            return .array(createCausalMask(n: n, offset: offset, windowSize: windowSize))
+        }
+        return .causal
+    }
+    guard usesSparseMask else {
+        if n == 1 {
+            return .none
+        }
+        if returnArray || (windowSize != nil && n > windowSize!) {
+            return .array(createCausalMask(n: n, offset: offset, windowSize: windowSize))
+        }
+        return .causal
+    }
+    guard n > 1 else {
+        return .none
+    }
+
+    let queryPositions = triAttentionMakeAbsolutePositions(
+        offset: offset,
+        batchSize: retainedPositions.dim(0),
+        kvHeads: retainedPositions.dim(1),
+        sequenceLength: n
+    )
+    let keyPositions = concatenated([retainedPositions, queryPositions], axis: 2)
+    let queryGrid = expandedDimensions(queryPositions, axis: -1)
+    let keyGrid = expandedDimensions(keyPositions, axis: -2)
+    var mask = queryGrid .>= keyGrid
+
+    if let windowSize {
+        mask = mask & (queryGrid .< (keyGrid + MLXArray(Int32(windowSize))))
+    }
+
+    return .array(mask)
+}
+
+internal func triAttentionMakeAbsolutePositions(
+    offset: Int,
+    batchSize: Int,
+    kvHeads: Int,
+    sequenceLength: Int
+) -> MLXArray {
+    let endOffset = offset + sequenceLength
+    guard let start = Int32(exactly: offset),
+        let end = Int32(exactly: endOffset)
+    else {
+        fatalError("TriAttentionSparseKVCache offset exceeded Int32 position range")
+    }
+
+    let basePositions = MLXArray(start ..< end).expandedDimensions(axes: [0, 1])
+    return broadcast(basePositions, to: [batchSize, kvHeads, sequenceLength])
+}
+
+internal func triAttentionRetainedStateMatchesDensePrefix(
+    positions: MLXArray,
+    offset: Int
+) -> Bool {
+    guard positions.dim(2) == offset else {
+        return false
+    }
+    guard offset > 0 else {
+        return positions.dim(2) == 0
+    }
+
+    let expected = triAttentionDensePrefixPositions(
+        batchSize: positions.dim(0),
+        kvHeads: positions.dim(1),
+        count: positions.dim(2)
+    )
+    return positions.asArray(Int32.self) == expected.asArray(Int32.self)
+}
+
+internal func triAttentionDensePrefixPositions(
+    batchSize: Int,
+    kvHeads: Int,
+    count: Int
+) -> MLXArray {
+    let basePositions = MLXArray(Int32(0) ..< Int32(count)).expandedDimensions(axes: [0, 1])
+    return broadcast(basePositions, to: [batchSize, kvHeads, count])
+}
+
+internal func triAttentionValidateRetainedState(
+    positions: MLXArray,
+    keyValueStates: [MLXArray],
+    keyPrefix: String,
+    valuePrefix: String
+) {
+    guard positions.ndim == 3 else {
+        fatalError(
+            "TriAttentionSparseKVCache retainedPositions must be 3D [batch, kvHeads, retainedCount]"
+        )
+    }
+    guard positions.dtype == .int32 else {
+        fatalError("TriAttentionSparseKVCache retainedPositions must use Int32 dtype")
+    }
+
+    for array in keyValueStates {
+        guard array.ndim == 4 else {
+            fatalError(
+                "TriAttentionSparseKVCache retained \(keyPrefix) and \(valuePrefix) state must be 4D"
+            )
+        }
+        guard positions.dim(0) == array.dim(0),
+            positions.dim(1) == array.dim(1),
+            positions.dim(2) == array.dim(2)
+        else {
+            fatalError(
+                "TriAttentionSparseKVCache retained state must agree on batch, kvHeads, and retainedCount"
+            )
+        }
+    }
+}
+
 /// Sparse KV cache placeholder for TriAttention layers.
 ///
 /// This cache tracks retained positions plus retained keys/values separately
 /// from the logical processed-token offset so later pruning can preserve sparse
 /// state without redefining the cache contract.
-public final class TriAttentionSparseKVCache: BaseKVCache {
+public final class TriAttentionSparseKVCache:
+    BaseKVCache,
+    DecodeTimeQuantizableKVCache,
+    TriAttentionRuntimeCache
+{
     public private(set) var configuration: TriAttentionConfiguration
     public private(set) var retainedPositions: MLXArray?
     public private(set) var retainedKeys: MLXArray?
@@ -37,7 +176,8 @@ public final class TriAttentionSparseKVCache: BaseKVCache {
         validateUpdateInputs(keys: keys, values: values)
 
         let sequenceLength = keys.dim(2)
-        let positions = makeAbsolutePositions(
+        let positions = triAttentionMakeAbsolutePositions(
+            offset: offset,
             batchSize: keys.dim(0),
             kvHeads: keys.dim(1),
             sequenceLength: sequenceLength
@@ -65,31 +205,14 @@ public final class TriAttentionSparseKVCache: BaseKVCache {
         windowSize: Int?,
         returnArray: Bool
     ) -> MLXFast.ScaledDotProductAttentionMaskMode {
-        guard let retainedPositions else {
-            return super.makeMask(n: n, windowSize: windowSize, returnArray: returnArray)
-        }
-        guard usesSparseMask else {
-            return super.makeMask(n: n, windowSize: windowSize, returnArray: returnArray)
-        }
-        guard n > 1 else {
-            return .none
-        }
-
-        let queryPositions = makeAbsolutePositions(
-            batchSize: retainedPositions.dim(0),
-            kvHeads: retainedPositions.dim(1),
-            sequenceLength: n
+        triAttentionMaskMode(
+            retainedPositions: retainedPositions,
+            offset: offset,
+            usesSparseMask: usesSparseMask,
+            n: n,
+            windowSize: windowSize,
+            returnArray: returnArray
         )
-        let keyPositions = concatenated([retainedPositions, queryPositions], axis: 2)
-        let queryGrid = expandedDimensions(queryPositions, axis: -1)
-        let keyGrid = expandedDimensions(keyPositions, axis: -2)
-        var mask = queryGrid .>= keyGrid
-
-        if let windowSize {
-            mask = mask & (queryGrid .< (keyGrid + MLXArray(Int32(windowSize))))
-        }
-
-        return .array(mask)
     }
 
     public override var state: [MLXArray] {
@@ -128,7 +251,10 @@ public final class TriAttentionSparseKVCache: BaseKVCache {
             retainedPositions = positions
             retainedKeys = keys
             retainedValues = values
-            usesSparseMask = !retainedStateMatchesDensePrefix(positions)
+            usesSparseMask = !triAttentionRetainedStateMatchesDensePrefix(
+                positions: positions,
+                offset: offset
+            )
         }
     }
 
@@ -210,6 +336,10 @@ public final class TriAttentionSparseKVCache: BaseKVCache {
         retainedPositions?.dim(2) ?? 0
     }
 
+    internal func dequantizedRetainedKeysForRuntime() -> MLXArray? {
+        retainedKeys
+    }
+
     internal func applyKeepIndices(_ keepIndices: MLXArray) {
         guard
             let retainedPositions,
@@ -239,6 +369,30 @@ public final class TriAttentionSparseKVCache: BaseKVCache {
         self.retainedKeys = takeAlong(retainedKeys, keyIndices, axis: 2)
         self.retainedValues = takeAlong(retainedValues, valueIndices, axis: 2)
         usesSparseMask = true
+    }
+
+    func toDecodeTimeQuantized(groupSize: Int, bits: Int) -> any KVCache {
+        let quantizedCache = QuantizedTriAttentionSparseKVCache(
+            configuration: configuration,
+            groupSize: groupSize,
+            bits: bits,
+            runtimeState: runtimeState
+        )
+        quantizedCache.offset = offset
+
+        if let retainedPositions,
+            let retainedKeys,
+            let retainedValues
+        {
+            quantizedCache.state = [
+                retainedPositions[.ellipsis],
+            ] + QuantizedKVCache(groupSize: groupSize, bits: bits).consumeQuantizedState(
+                keys: retainedKeys,
+                values: retainedValues
+            )
+        }
+
+        return quantizedCache
     }
 
     private func validateUpdateInputs(keys: MLXArray, values: MLXArray) {
@@ -285,11 +439,6 @@ public final class TriAttentionSparseKVCache: BaseKVCache {
     }
 
     private func validateRetainedState(positions: MLXArray, keys: MLXArray, values: MLXArray) {
-        guard positions.ndim == 3 else {
-            fatalError(
-                "TriAttentionSparseKVCache retainedPositions must be 3D [batch, kvHeads, retainedCount]"
-            )
-        }
         guard keys.ndim == 4 else {
             fatalError(
                 "TriAttentionSparseKVCache retainedKeys must be 4D [batch, kvHeads, retainedCount, keyDim]"
@@ -300,60 +449,18 @@ public final class TriAttentionSparseKVCache: BaseKVCache {
                 "TriAttentionSparseKVCache retainedValues must be 4D [batch, kvHeads, retainedCount, valueDim]"
             )
         }
-        guard positions.dtype == .int32 else {
-            fatalError("TriAttentionSparseKVCache retainedPositions must use Int32 dtype")
-        }
-        guard positions.dim(0) == keys.dim(0),
-            positions.dim(0) == values.dim(0),
-            positions.dim(1) == keys.dim(1),
-            positions.dim(1) == values.dim(1),
-            positions.dim(2) == keys.dim(2),
-            positions.dim(2) == values.dim(2)
-        else {
-            fatalError(
-                "TriAttentionSparseKVCache retained state must agree on batch, kvHeads, and retainedCount"
-            )
-        }
-    }
-
-    private func retainedStateMatchesDensePrefix(_ positions: MLXArray) -> Bool {
-        guard positions.dim(2) == offset else {
-            return false
-        }
-        guard offset > 0 else {
-            return positions.dim(2) == 0
-        }
-
-        let expected = densePrefixPositions(
-            batchSize: positions.dim(0),
-            kvHeads: positions.dim(1),
-            count: positions.dim(2)
+        triAttentionValidateRetainedState(
+            positions: positions,
+            keyValueStates: [keys, values],
+            keyPrefix: "keys",
+            valuePrefix: "values"
         )
-        return positions.asArray(Int32.self) == expected.asArray(Int32.self)
     }
+}
 
-    private func makeAbsolutePositions(
-        batchSize: Int,
-        kvHeads: Int,
-        sequenceLength: Int
-    ) -> MLXArray {
-        let endOffset = offset + sequenceLength
-        guard let start = Int32(exactly: offset),
-            let end = Int32(exactly: endOffset)
-        else {
-            fatalError("TriAttentionSparseKVCache offset exceeded Int32 position range")
-        }
-
-        let basePositions = MLXArray(start ..< end).expandedDimensions(axes: [0, 1])
-        return broadcast(basePositions, to: [batchSize, kvHeads, sequenceLength])
-    }
-
-    private func densePrefixPositions(
-        batchSize: Int,
-        kvHeads: Int,
-        count: Int
-    ) -> MLXArray {
-        let basePositions = MLXArray(Int32(0) ..< Int32(count)).expandedDimensions(axes: [0, 1])
-        return broadcast(basePositions, to: [batchSize, kvHeads, count])
+private extension QuantizedKVCache {
+    func consumeQuantizedState(keys: MLXArray, values: MLXArray) -> [MLXArray] {
+        _ = updateQuantized(keys: keys, values: values)
+        return state.map { $0[.ellipsis] }
     }
 }

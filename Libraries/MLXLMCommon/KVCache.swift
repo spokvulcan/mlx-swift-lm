@@ -118,6 +118,12 @@ public protocol QuantizedKVCacheProtocol: KVCache {
     func getQuantizedState() -> ((MLXArray, MLXArray, MLXArray?), (MLXArray, MLXArray, MLXArray?))?
 }
 
+/// Internal seam for caches that can switch into decode-time quantized storage
+/// through `maybeQuantizeKVCache(...)`.
+internal protocol DecodeTimeQuantizableKVCache: KVCache {
+    func toDecodeTimeQuantized(groupSize: Int, bits: Int) -> any KVCache
+}
+
 /// Base cache implementation providing default behaviors
 open class BaseKVCache: KVCache {
     public var offset: Int = 0
@@ -438,6 +444,12 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
 
     public var debugDescription: String {
         "\(String(describing: Self.self)) \(Unmanaged.passUnretained(self).toOpaque()), offset: \(offset), step: \(step), keys: \(keys?.shape.description ?? "-"), values: \(values?.shape.description ?? "-")"
+    }
+}
+
+extension KVCacheSimple: DecodeTimeQuantizableKVCache {
+    func toDecodeTimeQuantized(groupSize: Int, bits: Int) -> any KVCache {
+        toQuantized(groupSize: groupSize, bits: bits)
     }
 }
 
@@ -1642,18 +1654,19 @@ public func maybeQuantizeKVCache(
 ) {
     guard let kvBits = kvBits, !cache.isEmpty else { return }
 
-    // Find the first quantizable (non-Mamba, non-already-quantized) cache entry
-    guard let firstQuantizable = cache.first(where: { $0 is KVCacheSimple }),
-        !(firstQuantizable is QuantizedKVCache),
+    // Find the first decode-quantizable (non-Mamba, non-already-quantized) cache entry.
+    guard let firstQuantizable = cache.first(where: { $0 is DecodeTimeQuantizableKVCache }),
         firstQuantizable.offset > quantizedKVStart
     else {
         return
     }
 
     for i in 0 ..< cache.count {
-        // Handle cache types that support quantization
-        if let simpleCache = cache[i] as? KVCacheSimple {
-            cache[i] = simpleCache.toQuantized(groupSize: kvGroupSize, bits: kvBits)
+        if let decodeQuantizable = cache[i] as? DecodeTimeQuantizableKVCache {
+            cache[i] = decodeQuantizable.toDecodeTimeQuantized(
+                groupSize: kvGroupSize,
+                bits: kvBits
+            )
         }
         // TODO: RotatingKVCache.toQuantized() is not implemented yet, like in Python.
         // When implemented, add: else if let rotatingCache = cache[i] as? RotatingKVCache { ... }
