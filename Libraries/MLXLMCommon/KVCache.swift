@@ -1271,6 +1271,10 @@ public func savePromptCache(
             return "RotatingKVCache"
         case is QuantizedKVCache:
             return "QuantizedKVCache"
+        case is QuantizedTriAttentionSparseKVCache:
+            return "QuantizedTriAttentionSparseKVCache"
+        case is TriAttentionSparseKVCache:
+            return "TriAttentionSparseKVCache"
         case is MambaCache:
             return "MambaCache"  // Must precede ArraysCache because of inheritance
         case is ArraysCache:
@@ -1379,6 +1383,18 @@ public func loadPromptCache(
             // Size doesn't matter here as it's only needed to initialize the `cache` container inside
             // The container will be set as a `state` with correct size before returning a cache
             cache = ArraysCache(size: 0)
+        case "TriAttentionSparseKVCache":
+            // Configuration is overwritten by the metaState setter below;
+            // pass the v1-disabled placeholder so the constructor succeeds
+            // without requiring caller-supplied artifact identity.
+            cache = TriAttentionSparseKVCache(configuration: .v1Disabled)
+        case "QuantizedTriAttentionSparseKVCache":
+            // Same configuration-placeholder rationale as above. groupSize/
+            // bits default to 64/8 here; consumers that need non-default
+            // quantization params should reconstruct via
+            // `HybridCacheSnapshot.deserialize(...)` which threads the
+            // caller's hints into the proper constructor.
+            cache = QuantizedTriAttentionSparseKVCache(configuration: .v1Disabled)
         case "CacheList":
             // Note: CacheList requires special handling as it contains sub-caches
             // For now, create an empty CacheList - this may not work correctly

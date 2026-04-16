@@ -130,8 +130,33 @@ public struct HybridCacheSnapshot: @unchecked Sendable {
             case "ArraysCache":
                 ArraysCache(size: 0)
 
+            case "TriAttentionSparseKVCache":
+                // Configuration tuple is parsed by the cache's own metaState
+                // setter below; constructor placeholder lets us skip a
+                // duplicate parser here.
+                TriAttentionSparseKVCache(configuration: .v1Disabled)
+
+            case "QuantizedTriAttentionSparseKVCache":
+                // groupSize/bits are constructor-only on QuantizedKVCache so
+                // they must come from the caller's hints. Configuration
+                // tuple is overwritten via the metaState setter below.
+                QuantizedTriAttentionSparseKVCache(
+                    configuration: .v1Disabled,
+                    groupSize: kvGroupSizeHint ?? 64,
+                    bits: kvBitsHint ?? 8
+                )
+
             default:
                 fatalError("HybridCacheSnapshot: unsupported cache class '\(layerState.className)'")
+            }
+
+            // Set offset before state so TriAttention caches' state setter,
+            // which reads `offset` to decide whether retained positions form
+            // a dense prefix, sees the authoritative value. Other cache
+            // types' state/metaState setters overwrite offset themselves;
+            // the final offset restore below makes them whole again.
+            if let baseCache = cache as? BaseKVCache {
+                baseCache.offset = layerState.offset
             }
 
             if !layerState.state.isEmpty {
@@ -242,6 +267,10 @@ public struct HybridCacheSnapshot: @unchecked Sendable {
             return "RotatingKVCache"
         case is QuantizedKVCache:
             return "QuantizedKVCache"
+        case is QuantizedTriAttentionSparseKVCache:
+            return "QuantizedTriAttentionSparseKVCache"
+        case is TriAttentionSparseKVCache:
+            return "TriAttentionSparseKVCache"
         case is MambaCache:
             return "MambaCache"
         case is ArraysCache:
