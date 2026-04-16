@@ -498,6 +498,7 @@ public class Qwen35TextModelInner: Module {
     @ModuleInfo(key: "embed_tokens") var embedTokens: Embedding
 
     fileprivate let layers: [Qwen35DecoderLayer]
+    fileprivate let fullAttentionLayerIndices: [Int]
     let norm: RMSNorm
 
     let ssmIdx: Int
@@ -513,6 +514,9 @@ public class Qwen35TextModelInner: Module {
 
         self.layers = (0 ..< args.hiddenLayers).map { layerIdx in
             Qwen35DecoderLayer(args, layerIdx: layerIdx)
+        }
+        self.fullAttentionLayerIndices = self.layers.enumerated().compactMap { index, layer in
+            layer.isLinear ? nil : index
         }
 
         self.norm = RMSNorm(dimensions: args.hiddenSize, eps: args.rmsNormEps)
@@ -541,6 +545,18 @@ public class Qwen35TextModelInner: Module {
                 ? MLXFast.ScaledDotProductAttentionMaskMode.none : faMask
             hiddenStates = layer(
                 hiddenStates, attentionMask: attnMask, ssmMask: mask, cache: cacheArray?[i])
+        }
+
+        if let cacheArray {
+            let sparseCaches = fullAttentionLayerIndices.compactMap { index in
+                cacheArray[index] as? TriAttentionSparseKVCache
+            }
+            if sparseCaches.count == fullAttentionLayerIndices.count {
+                TriAttentionQwen35Runtime.pruneIfNeeded(
+                    caches: sparseCaches,
+                    layerIndices: fullAttentionLayerIndices
+                )
+            }
         }
 
         return norm(hiddenStates)
@@ -578,9 +594,39 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
     }
 
     public func newCache(parameters: GenerateParameters?) -> [KVCache] {
+        let headDim = configuration.headDim ?? (configuration.hiddenSize / configuration.attentionHeads)
+        let ropeType: String? = {
+            guard let ropeScaling = configuration.ropeScaling else { return nil }
+            switch ropeScaling["type"] ?? ropeScaling["rope_type"] {
+            case .string(let value):
+                return value
+            default:
+                return nil
+            }
+        }()
+        let triAttentionRuntime = parameters.flatMap { params in
+            TriAttentionQwen35Runtime.makeState(
+                configuration: params.triAttention,
+                artifact: params.triAttentionCalibrationArtifact,
+                fullAttentionLayerIndices: model.fullAttentionLayerIndices,
+                attentionHeads: configuration.attentionHeads,
+                kvHeads: configuration.kvHeads,
+                headDim: headDim,
+                partialRotaryFactor: configuration.partialRotaryFactor,
+                ropeTheta: configuration.ropeTheta,
+                ropeType: ropeType
+            )
+        }
+
         return model.layers.map { layer in
             if layer.isLinear {
                 return MambaCache()
+            }
+            if let triAttentionRuntime, let parameters {
+                return TriAttentionSparseKVCache(
+                    configuration: parameters.triAttention,
+                    runtimeState: triAttentionRuntime
+                )
             }
             return KVCacheSimple()
         }

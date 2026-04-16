@@ -121,6 +121,7 @@ public class SampleTests: XCTestCase {
         XCTAssertEqual(parameters.triAttention.budgetTokens, 12_000)
         XCTAssertEqual(parameters.triAttention.implementationVersion, .v1)
         XCTAssertNil(parameters.triAttention.calibrationArtifactIdentity)
+        XCTAssertNil(parameters.triAttentionCalibrationArtifact)
     }
 
     func testPresencePenaltyContextPenalizesSeenTokens() {

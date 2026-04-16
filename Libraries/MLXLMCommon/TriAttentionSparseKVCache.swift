@@ -11,8 +11,20 @@ public final class TriAttentionSparseKVCache: BaseKVCache {
     public private(set) var retainedPositions: MLXArray?
     public private(set) var retainedKeys: MLXArray?
     public private(set) var retainedValues: MLXArray?
+    internal let runtimeState: TriAttentionQwen35RuntimeState?
+    private var usesSparseMask = false
 
     public init(configuration: TriAttentionConfiguration) {
+        self.configuration = configuration
+        self.runtimeState = nil
+        super.init()
+    }
+
+    public init(
+        configuration: TriAttentionConfiguration,
+        runtimeState: TriAttentionQwen35RuntimeState?
+    ) {
+        self.runtimeState = runtimeState
         self.configuration = configuration
         super.init()
     }
@@ -48,6 +60,38 @@ public final class TriAttentionSparseKVCache: BaseKVCache {
         return (self.retainedKeys!, self.retainedValues!)
     }
 
+    public override func makeMask(
+        n: Int,
+        windowSize: Int?,
+        returnArray: Bool
+    ) -> MLXFast.ScaledDotProductAttentionMaskMode {
+        guard let retainedPositions else {
+            return super.makeMask(n: n, windowSize: windowSize, returnArray: returnArray)
+        }
+        guard usesSparseMask else {
+            return super.makeMask(n: n, windowSize: windowSize, returnArray: returnArray)
+        }
+        guard n > 1 else {
+            return .none
+        }
+
+        let queryPositions = makeAbsolutePositions(
+            batchSize: retainedPositions.dim(0),
+            kvHeads: retainedPositions.dim(1),
+            sequenceLength: n
+        )
+        let keyPositions = concatenated([retainedPositions, queryPositions], axis: 2)
+        let queryGrid = expandedDimensions(queryPositions, axis: -1)
+        let keyGrid = expandedDimensions(keyPositions, axis: -2)
+        var mask = queryGrid .>= keyGrid
+
+        if let windowSize {
+            mask = mask & (queryGrid .< (keyGrid + MLXArray(Int32(windowSize))))
+        }
+
+        return .array(mask)
+    }
+
     public override var state: [MLXArray] {
         get {
             switch (retainedPositions, retainedKeys, retainedValues) {
@@ -66,6 +110,7 @@ public final class TriAttentionSparseKVCache: BaseKVCache {
                 retainedPositions = nil
                 retainedKeys = nil
                 retainedValues = nil
+                usesSparseMask = false
                 return
             }
 
@@ -83,6 +128,7 @@ public final class TriAttentionSparseKVCache: BaseKVCache {
             retainedPositions = positions
             retainedKeys = keys
             retainedValues = values
+            usesSparseMask = !retainedStateMatchesDensePrefix(positions)
         }
     }
 
@@ -141,8 +187,12 @@ public final class TriAttentionSparseKVCache: BaseKVCache {
     public override func trim(_ n: Int) -> Int { 0 }
 
     public override func copy() -> any KVCache {
-        let new = TriAttentionSparseKVCache(configuration: configuration)
+        let new = TriAttentionSparseKVCache(
+            configuration: configuration,
+            runtimeState: runtimeState
+        )
         new.offset = offset
+        new.usesSparseMask = usesSparseMask
 
         if let retainedPositions,
             let retainedKeys,
@@ -154,6 +204,41 @@ public final class TriAttentionSparseKVCache: BaseKVCache {
         }
 
         return new
+    }
+
+    internal var retainedTokenCount: Int {
+        retainedPositions?.dim(2) ?? 0
+    }
+
+    internal func applyKeepIndices(_ keepIndices: MLXArray) {
+        guard
+            let retainedPositions,
+            let retainedKeys,
+            let retainedValues
+        else {
+            return
+        }
+
+        let batchSize = retainedPositions.dim(0)
+        let kvHeads = retainedPositions.dim(1)
+        let keepCount = keepIndices.dim(1)
+        let batchIndices = broadcast(
+            expandedDimensions(keepIndices, axis: 0),
+            to: [batchSize, kvHeads, keepCount]
+        )
+        let keyIndices = broadcast(
+            expandedDimensions(batchIndices, axis: -1),
+            to: [batchSize, kvHeads, keepCount, retainedKeys.dim(3)]
+        )
+        let valueIndices = broadcast(
+            expandedDimensions(batchIndices, axis: -1),
+            to: [batchSize, kvHeads, keepCount, retainedValues.dim(3)]
+        )
+
+        self.retainedPositions = takeAlong(retainedPositions, batchIndices, axis: 2)
+        self.retainedKeys = takeAlong(retainedKeys, keyIndices, axis: 2)
+        self.retainedValues = takeAlong(retainedValues, valueIndices, axis: 2)
+        usesSparseMask = true
     }
 
     private func validateUpdateInputs(keys: MLXArray, values: MLXArray) {
@@ -231,6 +316,22 @@ public final class TriAttentionSparseKVCache: BaseKVCache {
         }
     }
 
+    private func retainedStateMatchesDensePrefix(_ positions: MLXArray) -> Bool {
+        guard positions.dim(2) == offset else {
+            return false
+        }
+        guard offset > 0 else {
+            return positions.dim(2) == 0
+        }
+
+        let expected = densePrefixPositions(
+            batchSize: positions.dim(0),
+            kvHeads: positions.dim(1),
+            count: positions.dim(2)
+        )
+        return positions.asArray(Int32.self) == expected.asArray(Int32.self)
+    }
+
     private func makeAbsolutePositions(
         batchSize: Int,
         kvHeads: Int,
@@ -245,5 +346,14 @@ public final class TriAttentionSparseKVCache: BaseKVCache {
 
         let basePositions = MLXArray(start ..< end).expandedDimensions(axes: [0, 1])
         return broadcast(basePositions, to: [batchSize, kvHeads, sequenceLength])
+    }
+
+    private func densePrefixPositions(
+        batchSize: Int,
+        kvHeads: Int,
+        count: Int
+    ) -> MLXArray {
+        let basePositions = MLXArray(Int32(0) ..< Int32(count)).expandedDimensions(axes: [0, 1])
+        return broadcast(basePositions, to: [batchSize, kvHeads, count])
     }
 }

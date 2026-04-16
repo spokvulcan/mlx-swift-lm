@@ -144,6 +144,33 @@ final class TriAttentionSparseKVCacheTests: XCTestCase {
         XCTAssertEqual(cache.retainedPositions?.asArray(Int32.self), [0, 1])
     }
 
+    func testMaskStaysSymbolicUntilRetainedStateBecomesSparse() {
+        let cache = TriAttentionSparseKVCache(configuration: .v1Disabled)
+        let keys = MLXArray([1.0 as Float, 2.0, 3.0, 4.0]).reshaped(1, 1, 2, 2)
+        let values = MLXArray([5.0 as Float, 6.0, 7.0, 8.0]).reshaped(1, 1, 2, 2)
+        let (_, _) = cache.update(keys: keys, values: values)
+
+        switch cache.makeMask(n: 2, windowSize: nil, returnArray: false) {
+        case .causal:
+            break
+        default:
+            XCTFail("Expected contiguous retained state to keep the symbolic causal mask")
+        }
+
+        cache.state = [
+            MLXArray([Int32(0), 2]).reshaped(1, 1, 2),
+            keys,
+            values,
+        ]
+
+        switch cache.makeMask(n: 2, windowSize: nil, returnArray: false) {
+        case .array(let mask):
+            XCTAssertEqual(mask.shape, [1, 1, 2, 4])
+        default:
+            XCTFail("Expected sparse retained state to use an explicit array mask")
+        }
+    }
+
     private func XCTAssertAllClose(
         _ lhs: MLXArray?,
         _ rhs: MLXArray?,

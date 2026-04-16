@@ -120,6 +120,10 @@ public struct GenerateParameters: Sendable {
     /// cache partitioning and compatibility checks can rely on one seam.
     public var triAttention: TriAttentionConfiguration
 
+    /// Parsed TriAttention calibration artifact loaded at model-load time.
+    /// `nil` keeps the runtime on the dense path even when TriAttention is enabled.
+    public var triAttentionCalibrationArtifact: TriAttentionCalibrationArtifact?
+
     public init(
         maxTokens: Int? = nil,
         maxKVSize: Int? = nil,
@@ -140,7 +144,8 @@ public struct GenerateParameters: Sendable {
         checkpoints: [Int: HybridCacheSnapshot.CheckpointType] = [:],
         transientCheckpointOffsets: Set<Int> = [],
         checkpointBaseOffset: Int = 0,
-        triAttention: TriAttentionConfiguration = .v1Disabled
+        triAttention: TriAttentionConfiguration = .v1Disabled,
+        triAttentionCalibrationArtifact: TriAttentionCalibrationArtifact? = nil
     ) {
         self.maxTokens = maxTokens
         self.maxKVSize = maxKVSize
@@ -162,6 +167,7 @@ public struct GenerateParameters: Sendable {
         self.transientCheckpointOffsets = transientCheckpointOffsets
         self.checkpointBaseOffset = checkpointBaseOffset
         self.triAttention = triAttention
+        self.triAttentionCalibrationArtifact = triAttentionCalibrationArtifact
     }
 
     public func sampler() -> LogitSampler {
