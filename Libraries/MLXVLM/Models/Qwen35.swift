@@ -1039,6 +1039,9 @@ public class Qwen35: Module, VLMModel {
     }
 
     public func newCache(parameters: GenerateParameters?) -> [KVCache] {
+        // Epic 1 V1 keeps TriAttention text-only. Even when TriAttention
+        // parameters are present, the VLM path must stay on the existing
+        // dense caches until MLXVLM parity work lands in a later epic.
         languageModel.makeCache(maxKVSize: parameters?.maxKVSize)
     }
 
