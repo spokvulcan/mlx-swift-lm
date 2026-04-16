@@ -144,6 +144,88 @@ final class TriAttentionSparseKVCacheTests: XCTestCase {
         XCTAssertEqual(cache.retainedPositions?.asArray(Int32.self), [0, 1])
     }
 
+    func testTrimPromptCacheBlocksMixedDensePlusTriAttention() {
+        let dense = KVCacheSimple()
+        let denseKeys = MLXArray([1.0 as Float, 2.0, 3.0, 4.0, 5.0, 6.0]).reshaped(1, 1, 3, 2)
+        let denseValues = MLXArray([7.0 as Float, 8.0, 9.0, 10.0, 11.0, 12.0]).reshaped(1, 1, 3, 2)
+        let (_, _) = dense.update(keys: denseKeys, values: denseValues)
+        XCTAssertEqual(dense.offset, 3)
+
+        let sparse = TriAttentionSparseKVCache(configuration: .v1Disabled)
+        let sparseKeys = MLXArray([1.0 as Float, 2.0, 3.0, 4.0]).reshaped(1, 1, 2, 2)
+        let sparseValues = MLXArray([5.0 as Float, 6.0, 7.0, 8.0]).reshaped(1, 1, 2, 2)
+        let (_, _) = sparse.update(keys: sparseKeys, values: sparseValues)
+
+        let mixed: [KVCache] = [dense, sparse]
+        XCTAssertFalse(canTrimPromptCache(mixed))
+        XCTAssertEqual(trimPromptCache(mixed, numTokens: 2), 0)
+
+        XCTAssertEqual(dense.offset, 3,
+                       "Dense layer must keep its offset when trim is blocked by a sibling TriAttention layer")
+        XCTAssertEqual(sparse.offset, 2)
+        XCTAssertEqual(sparse.retainedPositions?.asArray(Int32.self), [0, 1])
+    }
+
+    func testContainsTriAttentionStateIdentifiesSparseAndQuantizedLayers() {
+        let denseOnly: [KVCache] = [KVCacheSimple(), KVCacheSimple()]
+        XCTAssertFalse(containsTriAttentionState(denseOnly))
+
+        let sparse = TriAttentionSparseKVCache(configuration: .v1Disabled)
+        XCTAssertTrue(containsTriAttentionState([sparse]))
+        XCTAssertTrue(containsTriAttentionState([KVCacheSimple(), sparse]))
+
+        let quantizedSparse = QuantizedTriAttentionSparseKVCache(
+            configuration: .v1Disabled,
+            groupSize: 32,
+            bits: 4
+        )
+        XCTAssertTrue(containsTriAttentionState([quantizedSparse]))
+        XCTAssertTrue(containsTriAttentionState([KVCacheSimple(), quantizedSparse]))
+
+        XCTAssertFalse(containsTriAttentionState([]))
+    }
+
+    func testTrimPromptCacheStillTrimsPureDenseCaches() {
+        let dense1 = KVCacheSimple()
+        let dense2 = KVCacheSimple()
+        let keys = MLXArray([1.0 as Float, 2.0, 3.0, 4.0, 5.0, 6.0]).reshaped(1, 1, 3, 2)
+        let values = MLXArray([7.0 as Float, 8.0, 9.0, 10.0, 11.0, 12.0]).reshaped(1, 1, 3, 2)
+        let (_, _) = dense1.update(keys: keys, values: values)
+        let (_, _) = dense2.update(keys: keys, values: values)
+
+        let cache: [KVCache] = [dense1, dense2]
+        XCTAssertTrue(canTrimPromptCache(cache))
+        XCTAssertFalse(containsTriAttentionState(cache))
+
+        XCTAssertEqual(trimPromptCache(cache, numTokens: 1), 1)
+        XCTAssertEqual(dense1.offset, 2)
+        XCTAssertEqual(dense2.offset, 2)
+    }
+
+    func testTrimPromptCacheBlocksMixedDensePlusQuantizedTriAttention() {
+        let dense = KVCacheSimple()
+        let denseKeys = MLXArray([1.0 as Float, 2.0, 3.0, 4.0]).reshaped(1, 1, 2, 2)
+        let denseValues = MLXArray([5.0 as Float, 6.0, 7.0, 8.0]).reshaped(1, 1, 2, 2)
+        let (_, _) = dense.update(keys: denseKeys, values: denseValues)
+
+        let quantizedSparse = QuantizedTriAttentionSparseKVCache(
+            configuration: .v1Disabled,
+            groupSize: 32,
+            bits: 4
+        )
+        let quantKeys = MLXArray(Array(repeating: Float(1), count: 1 * 1 * 2 * 32)).reshaped(1, 1, 2, 32)
+        let quantValues = MLXArray(Array(repeating: Float(2), count: 1 * 1 * 2 * 32)).reshaped(1, 1, 2, 32)
+        _ = quantizedSparse.updateQuantized(keys: quantKeys, values: quantValues)
+
+        let mixed: [KVCache] = [dense, quantizedSparse]
+        XCTAssertFalse(canTrimPromptCache(mixed))
+        XCTAssertTrue(containsTriAttentionState(mixed))
+
+        XCTAssertEqual(trimPromptCache(mixed, numTokens: 1), 0)
+        XCTAssertEqual(dense.offset, 2)
+        XCTAssertEqual(quantizedSparse.offset, 2)
+    }
+
     func testMaskStaysSymbolicUntilRetainedStateBecomesSparse() {
         let cache = TriAttentionSparseKVCache(configuration: .v1Disabled)
         let keys = MLXArray([1.0 as Float, 2.0, 3.0, 4.0]).reshaped(1, 1, 2, 2)

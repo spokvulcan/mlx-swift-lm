@@ -390,10 +390,17 @@ extension HybridCacheSnapshot {
         /// snapshot's metaState authoritative across serialize/
         /// deserialize. Overwritten by the serializer.
         public static let layerMetaPrefix = "tesse.hybrid_cache.layer_meta."
+
+        /// Caller-supplied integer schema version for the wire format.
+        /// Optional on write; when present, downstream
+        /// ``deserialize(from:expectedFingerprint:expectedSchemaVersion:)``
+        /// rejects files whose stored value disagrees with the caller's
+        /// `expectedSchemaVersion` before reconstructing the snapshot.
+        public static let schemaVersion = "tesse.hybrid_cache.schema_version"
     }
 
     /// Errors thrown by ``serialize(to:metadata:)`` /
-    /// ``deserialize(from:expectedFingerprint:)``.
+    /// ``deserialize(from:expectedFingerprint:expectedSchemaVersion:)``.
     public enum SerializationError: LocalizedError {
         case missingFingerprint
         case fingerprintMismatch(expected: String, actual: String)
@@ -402,6 +409,9 @@ extension HybridCacheSnapshot {
         case missingTokenOffset
         case invalidTokenOffset(String)
         case unsupportedCacheClass(String)
+        case missingSchemaVersion
+        case invalidSchemaVersion(String)
+        case schemaVersionMismatch(expected: Int, actual: Int)
 
         public var errorDescription: String? {
             switch self {
@@ -419,6 +429,12 @@ extension HybridCacheSnapshot {
                 return "Invalid HybridCacheSnapshot.tokenOffset wire value: '\(value)'."
             case .unsupportedCacheClass(let name):
                 return "HybridCacheSnapshot cannot represent cache class '\(name)'."
+            case .missingSchemaVersion:
+                return "Prompt cache file has no '\(MetadataKey.schemaVersion)' metadata, but the caller required one."
+            case .invalidSchemaVersion(let value):
+                return "Invalid HybridCacheSnapshot schema-version wire value: '\(value)'."
+            case .schemaVersionMismatch(let expected, let actual):
+                return "HybridCacheSnapshot schema-version mismatch: expected \(expected), got \(actual)."
             }
         }
     }
@@ -525,7 +541,8 @@ extension HybridCacheSnapshot {
     ///   format across process restarts.
     public static func deserialize(
         from url: URL,
-        expectedFingerprint: String
+        expectedFingerprint: String,
+        expectedSchemaVersion: Int? = nil
     ) throws -> HybridCacheSnapshot {
         let (caches, metadata) = try loadPromptCache(url: url)
 
@@ -541,6 +558,26 @@ extension HybridCacheSnapshot {
                 expected: expectedFingerprint,
                 actual: storedFingerprint
             )
+        }
+
+        // Optional schema-version gate: a v(N) file cannot be safely
+        // reattached after the persistence schema bumps to v(N+1)
+        // because per-layer metaState may mean something different.
+        // Skip the metadata lookup entirely when the caller didn't pin
+        // a version — keeps the dictionary access off the legacy path.
+        if let expectedSchemaVersion {
+            guard let storedRaw = metadata[MetadataKey.schemaVersion] else {
+                throw SerializationError.missingSchemaVersion
+            }
+            guard let storedVersion = Int(storedRaw) else {
+                throw SerializationError.invalidSchemaVersion(storedRaw)
+            }
+            guard storedVersion == expectedSchemaVersion else {
+                throw SerializationError.schemaVersionMismatch(
+                    expected: expectedSchemaVersion,
+                    actual: storedVersion
+                )
+            }
         }
 
         guard let checkpointWire = metadata[MetadataKey.checkpointType] else {

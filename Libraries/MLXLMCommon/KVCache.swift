@@ -1535,7 +1535,26 @@ public func makePromptCacheWithLayerCount(
     }
 }
 
+/// Whether any layer in `cache` carries TriAttention sparse state.
+///
+/// TriAttention layers cannot be tail-trimmed: their retained-position
+/// indirection makes "drop the last N tokens" undefined once pruning has
+/// rewritten which tokens are kept. Callers can use this to disambiguate
+/// the "untrimmable cache" reason in diagnostics — `canTrimPromptCache`
+/// already returns `false` for both TriAttention and Mamba, but logging
+/// the specific cause is useful in prefix-cache telemetry.
+public func containsTriAttentionState(_ cache: [KVCache]) -> Bool {
+    cache.contains { layer in
+        layer is TriAttentionSparseKVCache || layer is QuantizedTriAttentionSparseKVCache
+    }
+}
+
 /// Check if model's cache can be trimmed.
+///
+/// Returns `false` if any layer is non-trimmable. The two non-trimmable
+/// types currently in tree are `MambaCache` (recurrent state cannot be
+/// unwound) and the TriAttention sparse caches (retained-position
+/// indirection has no tail-trim semantics).
 public func canTrimPromptCache(_ cache: [KVCache]) -> Bool {
     return cache.allSatisfy { $0.isTrimmable }
 }
@@ -1543,7 +1562,8 @@ public func canTrimPromptCache(_ cache: [KVCache]) -> Bool {
 /// Trim the model's cache by the given number of tokens.
 ///
 /// This function will trim the cache if possible (in-place) and return the
-/// number of tokens that were trimmed.
+/// number of tokens that were trimmed. Returns `0` (no trimming) when any
+/// layer is non-trimmable — see `canTrimPromptCache` for the rules.
 @discardableResult
 public func trimPromptCache(_ cache: [KVCache], numTokens: Int) -> Int {
     guard canTrimPromptCache(cache), !cache.isEmpty else { return 0 }
