@@ -115,6 +115,14 @@ public class SampleTests: XCTestCase {
         XCTAssertTrue(GenerateParameters(temperature: 0).sampler() is ArgMaxSampler)
     }
 
+    func testGenerateParametersDefaultsTriAttentionToDisabledV1Config() {
+        let parameters = GenerateParameters()
+        XCTAssertEqual(parameters.triAttention, .v1Disabled)
+        XCTAssertEqual(parameters.triAttention.budgetTokens, 12_000)
+        XCTAssertEqual(parameters.triAttention.implementationVersion, .v1)
+        XCTAssertNil(parameters.triAttention.calibrationArtifactIdentity)
+    }
+
     func testPresencePenaltyContextPenalizesSeenTokens() {
         var processor = PresencePenaltyContext(presencePenalty: 0.5, presenceContextSize: 20)
         processor.prompt(MLXArray([1, 1, 3]))

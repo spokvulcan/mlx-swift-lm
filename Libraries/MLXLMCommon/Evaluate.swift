@@ -116,6 +116,10 @@ public struct GenerateParameters: Sendable {
     /// Set to the restored snapshot's tokenOffset on a cache hit, 0 on a miss.
     public var checkpointBaseOffset: Int
 
+    /// TriAttention runtime configuration. Present even when disabled so later
+    /// cache partitioning and compatibility checks can rely on one seam.
+    public var triAttention: TriAttentionConfiguration
+
     public init(
         maxTokens: Int? = nil,
         maxKVSize: Int? = nil,
@@ -135,7 +139,8 @@ public struct GenerateParameters: Sendable {
         prefillStepSize: Int = 512,
         checkpoints: [Int: HybridCacheSnapshot.CheckpointType] = [:],
         transientCheckpointOffsets: Set<Int> = [],
-        checkpointBaseOffset: Int = 0
+        checkpointBaseOffset: Int = 0,
+        triAttention: TriAttentionConfiguration = .v1Disabled
     ) {
         self.maxTokens = maxTokens
         self.maxKVSize = maxKVSize
@@ -156,6 +161,7 @@ public struct GenerateParameters: Sendable {
         self.checkpoints = checkpoints
         self.transientCheckpointOffsets = transientCheckpointOffsets
         self.checkpointBaseOffset = checkpointBaseOffset
+        self.triAttention = triAttention
     }
 
     public func sampler() -> LogitSampler {
@@ -567,6 +573,7 @@ public struct TokenIterator: TokenIteratorProtocol {
     let checkpoints: [Int: HybridCacheSnapshot.CheckpointType]
     let transientCheckpointOffsets: Set<Int>
     let checkpointBaseOffset: Int
+    let triAttention: TriAttentionConfiguration
 
     /// Snapshots captured during prefill at the requested checkpoint offsets.
     /// Populated after init completes. Read before consuming the iterator.
@@ -603,6 +610,7 @@ public struct TokenIterator: TokenIteratorProtocol {
         self.checkpoints = parameters.checkpoints
         self.transientCheckpointOffsets = parameters.transientCheckpointOffsets
         self.checkpointBaseOffset = parameters.checkpointBaseOffset
+        self.triAttention = parameters.triAttention
 
         self.promptPrefillTime = try measure {
             try prepare(input: .init(text: y), windowSize: parameters.prefillStepSize)
@@ -639,6 +647,7 @@ public struct TokenIterator: TokenIteratorProtocol {
         self.checkpoints = parameters.checkpoints
         self.transientCheckpointOffsets = parameters.transientCheckpointOffsets
         self.checkpointBaseOffset = parameters.checkpointBaseOffset
+        self.triAttention = parameters.triAttention
 
         self.promptPrefillTime = try measure {
             try prepare(input: input, windowSize: parameters.prefillStepSize)
@@ -675,6 +684,7 @@ public struct TokenIterator: TokenIteratorProtocol {
         self.checkpoints = [:]
         self.transientCheckpointOffsets = []
         self.checkpointBaseOffset = 0
+        self.triAttention = .v1Disabled
 
         self.promptPrefillTime = try measure {
             try prepare(input: input, windowSize: prefillStepSize)
