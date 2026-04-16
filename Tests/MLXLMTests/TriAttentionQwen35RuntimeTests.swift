@@ -1,7 +1,7 @@
 import MLX
-import MLXLMCommon
 import MLXLLM
 import XCTest
+@testable import MLXLMCommon
 
 final class TriAttentionQwen35RuntimeTests: XCTestCase {
 
@@ -163,6 +163,110 @@ final class TriAttentionQwen35RuntimeTests: XCTestCase {
         XCTAssertAllClose(copied.retainedValues, firstAttentionCache.retainedValues)
     }
 
+    func testTriAttentionPrunesSharedInterleavedFullAttentionLayerGroup() throws {
+        let model = Qwen35TextModel(try makeConfiguration(fullAttentionInterval: 2))
+        let parameters = GenerateParameters(
+            triAttention: TriAttentionConfiguration(
+                enabled: true,
+                budgetTokens: 8,
+                calibrationArtifactIdentity: TriAttentionCalibrationArtifactIdentity(rawValue: "artifact"),
+                implementationVersion: .v1
+            ),
+            triAttentionCalibrationArtifact: makeArtifact(
+                headDim: 8,
+                sampledHeads: sampledHeads(forLayers: [1, 3])
+            )
+        )
+        let cache = model.newCache(parameters: parameters)
+
+        XCTAssertTrue(cache[0] is MambaCache)
+        XCTAssertTrue(cache[2] is MambaCache)
+        XCTAssertTrue(cache[1] is TriAttentionSparseKVCache)
+        XCTAssertTrue(cache[3] is TriAttentionSparseKVCache)
+
+        let firstAttentionCache = try unwrapSparseCache(cache[1])
+        let secondAttentionCache = try unwrapSparseCache(cache[3])
+        let keys = MLXArray(Array(repeating: Float(1), count: 1 * 2 * 136 * 8)).reshaped(1, 2, 136, 8)
+        let values = MLXArray(Array(repeating: Float(2), count: 1 * 2 * 136 * 8)).reshaped(1, 2, 136, 8)
+        _ = firstAttentionCache.update(keys: keys, values: values)
+        _ = secondAttentionCache.update(keys: keys, values: values)
+
+        TriAttentionQwen35Runtime.pruneIfNeeded(
+            caches: [firstAttentionCache, secondAttentionCache],
+            layerIndices: [1, 3]
+        )
+
+        eval(firstAttentionCache)
+        eval(secondAttentionCache)
+        XCTAssertEqual(firstAttentionCache.retainedPositions?.dim(2), 8)
+        XCTAssertEqual(secondAttentionCache.retainedPositions?.dim(2), 8)
+        XCTAssertAllClose(firstAttentionCache.retainedPositions, secondAttentionCache.retainedPositions)
+    }
+
+    func testTriAttentionProtectsFull128TokenWindowWhenBudgetExceedsWindowClamp() throws {
+        let model = Qwen35TextModel(try makeConfiguration(fullAttentionInterval: 1))
+        let parameters = GenerateParameters(
+            triAttention: TriAttentionConfiguration(
+                enabled: true,
+                budgetTokens: 256,
+                calibrationArtifactIdentity: TriAttentionCalibrationArtifactIdentity(rawValue: "artifact"),
+                implementationVersion: .v1
+            ),
+            triAttentionCalibrationArtifact: makeArtifact(
+                headDim: 8,
+                sampledHeads: sampledHeads(forLayers: [0, 1, 2, 3])
+            )
+        )
+        let cache = model.newCache(parameters: parameters)
+
+        let prompt = MLXArray(Array(0 ..< 383).map(Int32.init)).reshaped(1, 383)
+        _ = model(prompt, cache: cache)
+
+        let nextToken = MLXArray([Int32(383)]).reshaped(1, 1)
+        _ = model(nextToken, cache: cache)
+
+        let attentionCache = try unwrapSparseCache(cache[0])
+        eval(attentionCache)
+        XCTAssertEqual(attentionCache.retainedPositions?.dim(2), 256)
+
+        let protectedWindow = Set(Int32(256)...Int32(383))
+        let head0Positions = Set(attentionCache.retainedPositions?[0, 0].asArray(Int32.self) ?? [])
+        let head1Positions = Set(attentionCache.retainedPositions?[0, 1].asArray(Int32.self) ?? [])
+        XCTAssertTrue(head0Positions.isSuperset(of: protectedWindow))
+        XCTAssertTrue(head1Positions.isSuperset(of: protectedWindow))
+    }
+
+    func testTriAttentionAggregatesGroupedHeadsPerKVHeadUsingMaxReduction() {
+        let configuration = TriAttentionConfiguration(
+            enabled: true,
+            budgetTokens: 8,
+            calibrationArtifactIdentity: TriAttentionCalibrationArtifactIdentity(rawValue: "artifact"),
+            implementationVersion: .v1
+        )
+        let runtimeState = tryMakeRuntimeState(
+            fullAttentionLayerIndices: [1],
+            configuration: configuration
+        )
+        let sampledHeads = sampledHeads(forLayers: [1])
+        let normalizedScores = MLXArray([
+            10 as Float, 0, 0,
+            0, 9, 0,
+            0, 0, 8,
+            0, 0, 7,
+        ]).reshaped(4, 3)
+
+        let perKVHeadScores = TriAttentionQwen35Runtime.aggregatePerKVHeadScores(
+            normalizedScores: normalizedScores,
+            sampledHeads: sampledHeads,
+            runtimeState: runtimeState
+        )
+        eval(perKVHeadScores)
+
+        XCTAssertEqual(perKVHeadScores.shape, [2, 3])
+        XCTAssertEqual(perKVHeadScores[0].asArray(Float.self), [10, 9, 0])
+        XCTAssertEqual(perKVHeadScores[1].asArray(Float.self), [0, 0, 8])
+    }
+
     private func makeConfiguration(fullAttentionInterval: Int = 2) throws -> Qwen35TextConfiguration {
         let json = """
         {
@@ -229,6 +333,30 @@ final class TriAttentionQwen35RuntimeTests: XCTestCase {
             ),
             statsByHead: stats
         )
+    }
+
+    private func tryMakeRuntimeState(
+        fullAttentionLayerIndices: [Int],
+        configuration: TriAttentionConfiguration
+    ) -> TriAttentionQwen35RuntimeState {
+        guard let runtimeState = TriAttentionQwen35Runtime.makeState(
+            configuration: configuration,
+            artifact: makeArtifact(
+                headDim: 8,
+                sampledHeads: sampledHeads(forLayers: fullAttentionLayerIndices)
+            ),
+            fullAttentionLayerIndices: fullAttentionLayerIndices,
+            attentionHeads: 4,
+            kvHeads: 2,
+            headDim: 8,
+            partialRotaryFactor: 1.0,
+            ropeTheta: 100_000,
+            ropeType: "default"
+        ) else {
+            XCTFail("Expected compatible TriAttention runtime state")
+            fatalError("Missing TriAttention runtime state for test")
+        }
+        return runtimeState
     }
 
     private func unwrapSparseCache(_ cache: KVCache) throws -> TriAttentionSparseKVCache {

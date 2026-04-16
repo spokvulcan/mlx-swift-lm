@@ -342,6 +342,18 @@ public enum TriAttentionQwen35Runtime {
         let guardMasks = stacked(guardMasksByHead, axis: 0)
         normalizedScores = MLX.where(guardMasks, MLXArray(Float.infinity), normalizedScores)
 
+        return aggregatePerKVHeadScores(
+            normalizedScores: normalizedScores,
+            sampledHeads: sampledHeads,
+            runtimeState: runtimeState
+        )
+    }
+
+    static func aggregatePerKVHeadScores(
+        normalizedScores: MLXArray,
+        sampledHeads: [TriAttentionCalibrationHeadKey],
+        runtimeState: TriAttentionQwen35RuntimeState
+    ) -> MLXArray {
         var perKVHeadScores: [MLXArray] = []
         let fallback = mean(normalizedScores, axis: 0)
 
