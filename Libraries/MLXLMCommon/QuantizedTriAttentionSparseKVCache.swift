@@ -13,7 +13,8 @@ public final class QuantizedTriAttentionSparseKVCache:
     public let groupSize: Int
     public let bits: Int
     public let mode: QuantizationMode
-    internal let runtimeState: TriAttentionQwen35RuntimeState?
+    internal private(set) var runtimeState: TriAttentionQwen35RuntimeState?
+    internal private(set) var protectedPrefixOffset: Int?
 
     private var quantizedKeyValueCache: QuantizedKVCache
     private var usesSparseMask = false
@@ -32,6 +33,7 @@ public final class QuantizedTriAttentionSparseKVCache:
         self.bits = bits
         self.mode = mode
         self.runtimeState = runtimeState
+        self.protectedPrefixOffset = nil
         self.quantizedKeyValueCache = QuantizedKVCache(groupSize: groupSize, bits: bits, mode: mode)
         super.init()
     }
@@ -89,7 +91,9 @@ public final class QuantizedTriAttentionSparseKVCache:
             usesSparseMask: usesSparseMask,
             n: n,
             windowSize: windowSize,
-            returnArray: returnArray
+            returnArray: returnArray,
+            attentionHeads: runtimeState?.attentionHeads,
+            kvHeads: runtimeState?.kvHeads
         )
     }
 
@@ -117,6 +121,7 @@ public final class QuantizedTriAttentionSparseKVCache:
                 quantizedKeyValueCache.offset = 0
                 keyHeadDimension = nil
                 valueHeadDimension = nil
+                protectedPrefixOffset = nil
                 usesSparseMask = false
                 return
             }
@@ -147,49 +152,12 @@ public final class QuantizedTriAttentionSparseKVCache:
 
     public override var metaState: [String] {
         get {
-            [
-                configuration.implementationVersion.rawValue,
-                String(configuration.enabled),
-                String(configuration.budgetTokens),
-                configuration.calibrationArtifactIdentity?.rawValue ?? "",
-            ]
+            triAttentionConfigurationMetaState(configuration)
         }
         set {
-            guard newValue.count == 4 else {
-                fatalError("QuantizedTriAttentionSparseKVCache metaState must have exactly 4 values")
-            }
-            guard let implementationVersion = TriAttentionImplementationVersion(rawValue: newValue[0]) else {
-                fatalError(
-                    "Unsupported TriAttention implementation version '\(newValue[0])' in metaState"
-                )
-            }
-
-            let enabled: Bool
-            switch newValue[1] {
-            case "true":
-                enabled = true
-            case "false":
-                enabled = false
-            default:
-                fatalError("Failed to parse TriAttention enabled flag from metaState: \(newValue[1])")
-            }
-
-            guard let budgetTokens = Int(newValue[2]) else {
-                fatalError("Failed to parse TriAttention budget from metaState: \(newValue[2])")
-            }
-
-            let calibrationArtifactIdentity: TriAttentionCalibrationArtifactIdentity? =
-                if newValue[3].isEmpty {
-                    nil
-                } else {
-                    TriAttentionCalibrationArtifactIdentity(rawValue: newValue[3])
-                }
-
-            configuration = TriAttentionConfiguration(
-                enabled: enabled,
-                budgetTokens: budgetTokens,
-                calibrationArtifactIdentity: calibrationArtifactIdentity,
-                implementationVersion: implementationVersion
+            configuration = triAttentionConfigurationFromMetaState(
+                newValue,
+                ownerName: "QuantizedTriAttentionSparseKVCache"
             )
         }
     }
@@ -211,6 +179,7 @@ public final class QuantizedTriAttentionSparseKVCache:
         new.usesSparseMask = usesSparseMask
         new.keyHeadDimension = keyHeadDimension
         new.valueHeadDimension = valueHeadDimension
+        new.protectedPrefixOffset = protectedPrefixOffset
 
         if let retainedPositions {
             new.retainedPositions = retainedPositions[.ellipsis]
@@ -266,6 +235,20 @@ public final class QuantizedTriAttentionSparseKVCache:
         ].compactMap { $0 }
         quantizedKeyValueCache.offset = keepCount
         usesSparseMask = true
+    }
+
+    internal func attachRuntimeState(_ restoreContext: TriAttentionSnapshotRestoreContext?) {
+        guard
+            let restoreContext,
+            configuration == restoreContext.expectedConfiguration
+        else {
+            return
+        }
+        runtimeState = restoreContext.runtimeState
+    }
+
+    internal func configureProtectedPrefixOffset(_ protectedPrefixOffset: Int?) {
+        self.protectedPrefixOffset = protectedPrefixOffset
     }
 
     private func validateUpdateInputs(keys: MLXArray, values: MLXArray) {

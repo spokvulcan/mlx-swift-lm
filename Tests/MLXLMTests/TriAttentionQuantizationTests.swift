@@ -64,6 +64,84 @@ final class TriAttentionQuantizationTests: XCTestCase {
         XCTAssertFalse(cache[0] is QuantizedTriAttentionSparseKVCache)
     }
 
+    func testQuantizedTriAttentionSparseCacheRestoresLegacyFourFieldMetaStateAsProtectNone() {
+        let cache = QuantizedTriAttentionSparseKVCache(configuration: .v1Disabled)
+
+        cache.metaState = ["v1", "true", "12000", "artifact-sha256"]
+
+        XCTAssertEqual(
+            cache.configuration,
+            TriAttentionConfiguration(
+                enabled: true,
+                budgetTokens: 12_000,
+                calibrationArtifactIdentity: TriAttentionCalibrationArtifactIdentity(
+                    rawValue: "artifact-sha256"
+                ),
+                implementationVersion: .v1,
+                prefixProtectionMode: .protectNone
+            )
+        )
+    }
+
+    func testMaybeQuantizeKVCachePreservesStablePrefixProtectionBoundary() {
+        let configuration = TriAttentionConfiguration(
+            enabled: true,
+            budgetTokens: 2,
+            calibrationArtifactIdentity: TriAttentionCalibrationArtifactIdentity(rawValue: "artifact"),
+            implementationVersion: .v1,
+            prefixProtectionMode: .protectStablePrefixOnly
+        )
+        let runtimeState = tryMakeRuntimeState(
+            fullAttentionLayerIndices: [1],
+            configuration: configuration
+        )
+        let sparseCache = TriAttentionSparseKVCache(
+            configuration: configuration,
+            runtimeState: runtimeState
+        )
+        var parameters = GenerateParameters(
+            kvBits: 4,
+            kvGroupSize: 32,
+            quantizedKVStart: 1,
+            triAttention: configuration
+        )
+        parameters.triAttentionStablePrefixOffset = 4
+        let tokenCount = configuration.budgetTokens + 129
+        parameters.configureTriAttentionCachesForPrefill([sparseCache], inputTokenCount: tokenCount)
+
+        let keys = MLXArray(Array(repeating: Float(1), count: 1 * 2 * tokenCount * headDim)).reshaped(
+            1,
+            2,
+            tokenCount,
+            headDim
+        )
+        let values = MLXArray(Array(repeating: Float(2), count: 1 * 2 * tokenCount * headDim)).reshaped(
+            1,
+            2,
+            tokenCount,
+            headDim
+        )
+        let (_, _) = sparseCache.update(keys: keys, values: values)
+
+        var cache: [KVCache] = [sparseCache]
+        maybeQuantizeKVCache(
+            cache: &cache,
+            kvBits: parameters.kvBits,
+            kvGroupSize: parameters.kvGroupSize,
+            quantizedKVStart: parameters.quantizedKVStart
+        )
+
+        guard let quantizedCache = cache[0] as? QuantizedTriAttentionSparseKVCache else {
+            return XCTFail("Expected TriAttention cache to switch to QuantizedTriAttentionSparseKVCache")
+        }
+
+        TriAttentionQwen35Runtime.pruneIfNeeded(caches: [quantizedCache], layerIndices: [1])
+
+        let retainedPositions = quantizedCache.retainedPositions?[0, 0].asArray(Int32.self)
+        XCTAssertEqual(retainedPositions?.count, configuration.budgetTokens + 4)
+        XCTAssertTrue(Set(retainedPositions ?? []).isSuperset(of: [0, 1, 2, 3]))
+    }
+
     func testQuantizedTriAttentionSparseCachePrunesAndCopiesWithoutLosingState() {
         let configuration = TriAttentionConfiguration(
             enabled: true,
@@ -101,7 +179,10 @@ final class TriAttentionQuantizationTests: XCTestCase {
 
         switch cache.makeMask(n: 2, windowSize: nil, returnArray: false) {
         case .array(let mask):
-            XCTAssertEqual(mask.shape, [1, 2, 2, 4])
+            // GQA broadcast: mask expanded from `kvH=2` to `n_q_heads=4`
+            // along dim 1 so it broadcasts against MLX's rank-5 attention
+            // scores `(B, kvH, nRepeats, Lq, Lkv)`.
+            XCTAssertEqual(mask.shape, [1, 4, 2, 4])
         default:
             XCTFail("Expected pruned quantized TriAttention cache to use an explicit sparse mask")
         }
@@ -114,6 +195,114 @@ final class TriAttentionQuantizationTests: XCTestCase {
         XCTAssertEqual(copied.groupSize, cache.groupSize)
         XCTAssertEqual(copied.bits, cache.bits)
         XCTAssertEqual(copied.retainedPositions?.asArray(Int32.self), cache.retainedPositions?.asArray(Int32.self))
+    }
+
+    func testRestoredQuantizedTriAttentionSparseCachePrunesAgainWhenRestoreContextIsProvided() throws {
+        let configuration = TriAttentionConfiguration(
+            enabled: true,
+            budgetTokens: 2,
+            calibrationArtifactIdentity: TriAttentionCalibrationArtifactIdentity(rawValue: "artifact"),
+            implementationVersion: .v1
+        )
+        let restoreContext = makeRestoreContext(
+            fullAttentionLayerIndices: [1],
+            configuration: configuration
+        )
+        let cache = QuantizedTriAttentionSparseKVCache(
+            configuration: configuration,
+            groupSize: 32,
+            bits: 4,
+            runtimeState: restoreContext.runtimeState
+        )
+        let initialTokenCount = configuration.budgetTokens + 128
+        let initialKeys = MLXArray(
+            Array(repeating: Float(1), count: 1 * 2 * initialTokenCount * headDim)
+        ).reshaped(1, 2, initialTokenCount, headDim)
+        let initialValues = MLXArray(
+            Array(repeating: Float(2), count: 1 * 2 * initialTokenCount * headDim)
+        ).reshaped(1, 2, initialTokenCount, headDim)
+        _ = cache.updateQuantized(keys: initialKeys, values: initialValues)
+
+        TriAttentionQwen35Runtime.pruneIfNeeded(caches: [cache], layerIndices: [1])
+        XCTAssertEqual(cache.retainedPositions?.dim(2), configuration.budgetTokens)
+
+        let snapshot = try XCTUnwrap(HybridCacheSnapshot.capture(
+            cache: [cache],
+            offset: cache.offset,
+            type: .leaf
+        ))
+        let restored = snapshot.restore(
+            kvBitsHint: 4,
+            kvGroupSizeHint: 32,
+            triAttentionRestoreContext: restoreContext
+        )
+        let restoredCache = try XCTUnwrap(restored[0] as? QuantizedTriAttentionSparseKVCache)
+        XCTAssertEqual(restoredCache.retainedPositions?.dim(2), configuration.budgetTokens)
+
+        let appendedTokenCount = 128
+        let appendedKeys = MLXArray(
+            Array(repeating: Float(3), count: 1 * 2 * appendedTokenCount * headDim)
+        ).reshaped(1, 2, appendedTokenCount, headDim)
+        let appendedValues = MLXArray(
+            Array(repeating: Float(4), count: 1 * 2 * appendedTokenCount * headDim)
+        ).reshaped(1, 2, appendedTokenCount, headDim)
+        _ = restoredCache.updateQuantized(keys: appendedKeys, values: appendedValues)
+
+        TriAttentionQwen35Runtime.pruneIfNeeded(caches: [restoredCache], layerIndices: [1])
+        XCTAssertEqual(restoredCache.retainedPositions?.dim(2), configuration.budgetTokens)
+    }
+
+    func testRestoredQuantizedTriAttentionSparseCacheExpandsGroupedQueryMaskWhenRestoreContextIsProvided() throws {
+        let configuration = TriAttentionConfiguration(
+            enabled: true,
+            budgetTokens: 2,
+            calibrationArtifactIdentity: TriAttentionCalibrationArtifactIdentity(rawValue: "artifact"),
+            implementationVersion: .v1
+        )
+        let restoreContext = makeRestoreContext(
+            fullAttentionLayerIndices: [1],
+            configuration: configuration
+        )
+        let cache = QuantizedTriAttentionSparseKVCache(
+            configuration: configuration,
+            groupSize: 32,
+            bits: 4,
+            runtimeState: restoreContext.runtimeState
+        )
+        let tokenCount = 131
+        let keys = MLXArray(Array(repeating: Float(1), count: 1 * 2 * tokenCount * headDim)).reshaped(
+            1,
+            2,
+            tokenCount,
+            headDim
+        )
+        let values = MLXArray(Array(repeating: Float(2), count: 1 * 2 * tokenCount * headDim)).reshaped(
+            1,
+            2,
+            tokenCount,
+            headDim
+        )
+        _ = cache.updateQuantized(keys: keys, values: values)
+        TriAttentionQwen35Runtime.pruneIfNeeded(caches: [cache], layerIndices: [1])
+
+        let snapshot = try XCTUnwrap(HybridCacheSnapshot.capture(
+            cache: [cache],
+            offset: cache.offset,
+            type: .system
+        ))
+        let restored = snapshot.restore(
+            kvBitsHint: 4,
+            kvGroupSizeHint: 32,
+            triAttentionRestoreContext: restoreContext
+        )
+        let restoredCache = try XCTUnwrap(restored[0] as? QuantizedTriAttentionSparseKVCache)
+
+        switch restoredCache.makeMask(n: 2, windowSize: nil, returnArray: false) {
+        case .array(let mask):
+            XCTAssertEqual(mask.shape, [1, 4, 2, 4])
+        default:
+            XCTFail("Expected restored quantized TriAttention cache to use an explicit sparse mask")
+        }
     }
 
     func testQwen35TextModelRunsWithQuantizedTriAttentionSparseCaches() throws {
@@ -256,5 +445,18 @@ final class TriAttentionQuantizationTests: XCTestCase {
             fatalError("Missing TriAttention runtime state for test")
         }
         return runtimeState
+    }
+
+    private func makeRestoreContext(
+        fullAttentionLayerIndices: [Int],
+        configuration: TriAttentionConfiguration
+    ) -> TriAttentionSnapshotRestoreContext {
+        TriAttentionSnapshotRestoreContext(
+            expectedConfiguration: configuration,
+            runtimeState: tryMakeRuntimeState(
+                fullAttentionLayerIndices: fullAttentionLayerIndices,
+                configuration: configuration
+            )
+        )
     }
 }

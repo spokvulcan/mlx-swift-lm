@@ -362,13 +362,24 @@ final class Qwen35Attention: Module {
         queries = applyRotaryPosition(rope, to: queries, cache: cache)
         keys = applyRotaryPosition(rope, to: keys, cache: cache)
 
+        // Safety net for TriAttention sparse masks on restored caches that
+        // lack runtimeState — the cache-level expansion can't run, so do
+        // it here using the model's known head counts. Idempotent on
+        // already-expanded masks.
+        var adjustedMask = mask
+        if case let .array(arr) = mask {
+            adjustedMask = .array(expandMaskForGroupedQueryHeads(
+                arr, attentionHeads: attentionHeads, kvHeads: kvHeads
+            ))
+        }
+
         let output = attentionWithCacheUpdate(
             queries: queries,
             keys: keys,
             values: values,
             cache: cache,
             scale: scale,
-            mask: mask
+            mask: adjustedMask
         )
         .transposed(0, 2, 1, 3)
         .reshaped(B, L, -1)
@@ -594,29 +605,14 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
     }
 
     public func newCache(parameters: GenerateParameters?) -> [KVCache] {
-        let headDim = configuration.headDim ?? (configuration.hiddenSize / configuration.attentionHeads)
-        let ropeType: String? = {
-            guard let ropeScaling = configuration.ropeScaling else { return nil }
-            switch ropeScaling["type"] ?? ropeScaling["rope_type"] {
-            case .string(let value):
-                return value
-            default:
-                return nil
-            }
-        }()
-        let triAttentionRuntime = parameters.flatMap { params in
-            TriAttentionQwen35Runtime.makeState(
-                configuration: params.triAttention,
-                artifact: params.triAttentionCalibrationArtifact,
-                fullAttentionLayerIndices: model.fullAttentionLayerIndices,
-                attentionHeads: configuration.attentionHeads,
-                kvHeads: configuration.kvHeads,
-                headDim: headDim,
-                partialRotaryFactor: configuration.partialRotaryFactor,
-                ropeTheta: configuration.ropeTheta,
-                ropeType: ropeType
-            )
-        }
+        let triAttentionRuntime = parameters
+            .flatMap { params in
+                triAttentionSnapshotRestoreContext(
+                    configuration: params.triAttention,
+                    artifact: params.triAttentionCalibrationArtifact
+                )
+            }?
+            .runtimeState
 
         return model.layers.map { layer in
             if layer.isLinear {
@@ -691,6 +687,44 @@ extension Qwen35TextModel: LoRAModel {
     }
 }
 
+extension Qwen35TextModel: TriAttentionSnapshotRestoreContextProviding {
+    public func triAttentionSnapshotRestoreContext(
+        configuration: TriAttentionConfiguration,
+        artifact: TriAttentionCalibrationArtifact?
+    ) -> TriAttentionSnapshotRestoreContext? {
+        let headDim = self.configuration.headDim
+            ?? (self.configuration.hiddenSize / self.configuration.attentionHeads)
+        let ropeType: String? = {
+            guard let ropeScaling = self.configuration.ropeScaling else { return nil }
+            switch ropeScaling["type"] ?? ropeScaling["rope_type"] {
+            case .string(let value):
+                return value
+            default:
+                return nil
+            }
+        }()
+
+        guard let runtimeState = TriAttentionQwen35Runtime.makeState(
+            configuration: configuration,
+            artifact: artifact,
+            fullAttentionLayerIndices: model.fullAttentionLayerIndices,
+            attentionHeads: self.configuration.attentionHeads,
+            kvHeads: self.configuration.kvHeads,
+            headDim: headDim,
+            partialRotaryFactor: self.configuration.partialRotaryFactor,
+            ropeTheta: self.configuration.ropeTheta,
+            ropeType: ropeType
+        ) else {
+            return nil
+        }
+
+        return TriAttentionSnapshotRestoreContext(
+            expectedConfiguration: configuration,
+            runtimeState: runtimeState
+        )
+    }
+}
+
 // MARK: - Top-level Model
 
 public class Qwen35Model: Module, LLMModel, KVCacheDimensionProvider {
@@ -732,6 +766,18 @@ public class Qwen35Model: Module, LLMModel, KVCacheDimensionProvider {
         }
 
         return languageModel.sanitize(weights: sanitized)
+    }
+}
+
+extension Qwen35Model: TriAttentionSnapshotRestoreContextProviding {
+    public func triAttentionSnapshotRestoreContext(
+        configuration: TriAttentionConfiguration,
+        artifact: TriAttentionCalibrationArtifact?
+    ) -> TriAttentionSnapshotRestoreContext? {
+        languageModel.triAttentionSnapshotRestoreContext(
+            configuration: configuration,
+            artifact: artifact
+        )
     }
 }
 

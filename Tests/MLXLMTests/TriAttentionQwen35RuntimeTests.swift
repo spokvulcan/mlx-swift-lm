@@ -236,6 +236,51 @@ final class TriAttentionQwen35RuntimeTests: XCTestCase {
         XCTAssertTrue(head1Positions.isSuperset(of: protectedWindow))
     }
 
+    func testScoreHeadForTestingMatchesReferenceWhenPartialRotaryFactorLeavesStaticLanes() throws {
+        let configuration = TriAttentionConfiguration(
+            enabled: true,
+            budgetTokens: 8,
+            calibrationArtifactIdentity: TriAttentionCalibrationArtifactIdentity(rawValue: "artifact"),
+            implementationVersion: .v1
+        )
+        let runtimeState = tryMakeRuntimeState(
+            fullAttentionLayerIndices: [1],
+            configuration: configuration,
+            partialRotaryFactor: 0.25
+        )
+        let headKey = TriAttentionCalibrationHeadKey(layerIndex: 1, headIndex: 0)
+        guard let stats = runtimeState.preparedStats[headKey] else {
+            return XCTFail("Expected prepared stats for sampled head")
+        }
+
+        let rotatedKeys = MLXArray([
+            0.5 as Float, -0.25, 1.0, 0.75, 0.1, -0.2, 0.3, 0.4,
+            -0.6, 0.8, -0.9, 1.1, -0.5, 0.7, -0.3, 0.2,
+            1.2, -1.0, 0.6, -0.4, 0.9, -0.8, 0.5, -0.7,
+        ]).reshaped(3, 8)
+        let keyPositions = MLXArray([Int32(3), 9, 27])
+
+        let actual = TriAttentionQwen35Runtime.scoreHeadForTesting(
+            stats: stats,
+            rotatedKeys: rotatedKeys,
+            keyPositions: keyPositions,
+            roundStart: 33,
+            runtimeState: runtimeState
+        ).asArray(Float.self)
+        let expected = referenceScoreHead(
+            stats: stats,
+            rotatedKeys: rotatedKeys,
+            keyPositions: keyPositions,
+            roundStart: 33,
+            runtimeState: runtimeState
+        )
+
+        XCTAssertEqual(actual.count, expected.count)
+        for (lhs, rhs) in zip(actual, expected) {
+            XCTAssertEqual(lhs, rhs, accuracy: 1e-4)
+        }
+    }
+
     func testTriAttentionAggregatesGroupedHeadsPerKVHeadUsingMaxReduction() {
         let configuration = TriAttentionConfiguration(
             enabled: true,
@@ -267,7 +312,10 @@ final class TriAttentionQwen35RuntimeTests: XCTestCase {
         XCTAssertEqual(perKVHeadScores[1].asArray(Float.self), [0, 0, 8])
     }
 
-    private func makeConfiguration(fullAttentionInterval: Int = 2) throws -> Qwen35TextConfiguration {
+    private func makeConfiguration(
+        fullAttentionInterval: Int = 2,
+        partialRotaryFactor: Float = 1.0
+    ) throws -> Qwen35TextConfiguration {
         let json = """
         {
           "model_type": "qwen35",
@@ -284,7 +332,7 @@ final class TriAttentionQwen35RuntimeTests: XCTestCase {
           "rms_norm_eps": 1e-6,
           "vocab_size": 64,
           "rope_theta": 100000.0,
-          "partial_rotary_factor": 1.0,
+          "partial_rotary_factor": \(partialRotaryFactor),
           "max_position_embeddings": 2048,
           "tie_word_embeddings": false,
           "attention_bias": false,
@@ -292,7 +340,7 @@ final class TriAttentionQwen35RuntimeTests: XCTestCase {
           "rope_scaling": {
             "type": "default",
             "rope_theta": 100000.0,
-            "partial_rotary_factor": 1.0
+            "partial_rotary_factor": \(partialRotaryFactor)
           },
           "full_attention_interval": \(fullAttentionInterval),
           "num_experts": 0,
@@ -337,7 +385,8 @@ final class TriAttentionQwen35RuntimeTests: XCTestCase {
 
     private func tryMakeRuntimeState(
         fullAttentionLayerIndices: [Int],
-        configuration: TriAttentionConfiguration
+        configuration: TriAttentionConfiguration,
+        partialRotaryFactor: Float = 1.0
     ) -> TriAttentionQwen35RuntimeState {
         guard let runtimeState = TriAttentionQwen35Runtime.makeState(
             configuration: configuration,
@@ -349,7 +398,7 @@ final class TriAttentionQwen35RuntimeTests: XCTestCase {
             attentionHeads: 4,
             kvHeads: 2,
             headDim: 8,
-            partialRotaryFactor: 1.0,
+            partialRotaryFactor: partialRotaryFactor,
             ropeTheta: 100_000,
             ropeType: "default"
         ) else {
@@ -373,6 +422,81 @@ final class TriAttentionQwen35RuntimeTests: XCTestCase {
                 TriAttentionCalibrationHeadKey(layerIndex: layerIndex, headIndex: headIndex)
             }
         }
+    }
+
+    private func referenceScoreHead(
+        stats: TriAttentionPreparedHeadStats,
+        rotatedKeys: MLXArray,
+        keyPositions: MLXArray,
+        roundStart: Int,
+        runtimeState: TriAttentionQwen35RuntimeState
+    ) -> [Float] {
+        let positions = keyPositions.asArray(Int32.self).map(Int.init)
+        let rotatedValues = rotatedKeys.asArray(Float.self)
+        let omega = runtimeState.omega.asArray(Float.self)
+        let offsets = runtimeState.offsets.asArray(Float.self)
+        let freqScaleSq = runtimeState.freqScaleSq.asArray(Float.self)
+        let qMeanReal = stats.qMeanReal.asArray(Float.self)
+        let qMeanImag = stats.qMeanImag.asArray(Float.self)
+        let qAbsDelta = stats.qAbsDelta.asArray(Float.self)
+
+        var scores: [Float] = []
+        for tokenIndex in 0..<positions.count {
+            let base = tokenIndex * runtimeState.headDim
+            let rotatedReal = Array(rotatedValues[base ..< (base + runtimeState.freqCount)])
+            let rotatedImag = Array(rotatedValues[(base + runtimeState.freqCount) ..< (base + runtimeState.headDim)])
+
+            var keyReal = [Float](repeating: 0, count: runtimeState.freqCount)
+            var keyImag = [Float](repeating: 0, count: runtimeState.freqCount)
+            var keyAbs = [Float](repeating: 0, count: runtimeState.freqCount)
+            var relativeReal = [Float](repeating: 0, count: runtimeState.freqCount)
+            var relativeImag = [Float](repeating: 0, count: runtimeState.freqCount)
+
+            for freqIndex in 0..<runtimeState.freqCount {
+                let ropePhase = Float(positions[tokenIndex]) * omega[freqIndex]
+                let cosPhase = Float(cos(Double(ropePhase)))
+                let sinPhase = Float(sin(Double(ropePhase)))
+                keyReal[freqIndex] =
+                    rotatedReal[freqIndex] * cosPhase
+                    + rotatedImag[freqIndex] * sinPhase
+                keyImag[freqIndex] =
+                    rotatedImag[freqIndex] * cosPhase
+                    - rotatedReal[freqIndex] * sinPhase
+                keyAbs[freqIndex] = sqrt(
+                    keyReal[freqIndex] * keyReal[freqIndex]
+                    + keyImag[freqIndex] * keyImag[freqIndex]
+                )
+                relativeReal[freqIndex] =
+                    keyReal[freqIndex] * qMeanReal[freqIndex]
+                    + keyImag[freqIndex] * qMeanImag[freqIndex]
+                relativeImag[freqIndex] =
+                    keyReal[freqIndex] * qMeanImag[freqIndex]
+                    - keyImag[freqIndex] * qMeanReal[freqIndex]
+            }
+
+            let additive = zip(zip(qAbsDelta, keyAbs), freqScaleSq).reduce(Float.zero) {
+                partial, element in
+                partial + (element.0.0 * element.0.1 * element.1)
+            }
+
+            let deltaBase = Float(roundStart - positions[tokenIndex])
+            let offsetScores = offsets.map { offset in
+                var score = additive
+                for freqIndex in 0..<runtimeState.freqCount {
+                    let theta = (deltaBase + offset) * omega[freqIndex]
+                    score += (
+                        relativeReal[freqIndex] * Float(cos(Double(theta)))
+                        - relativeImag[freqIndex] * Float(sin(Double(theta)))
+                    ) * freqScaleSq[freqIndex]
+                }
+                return score
+            }
+            scores.append(
+                offsetScores.reduce(Float.zero, +) / Float(max(1, offsetScores.count))
+            )
+        }
+
+        return scores
     }
 
     private func XCTAssertAllClose(

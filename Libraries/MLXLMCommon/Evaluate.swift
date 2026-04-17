@@ -124,6 +124,10 @@ public struct GenerateParameters: Sendable {
     /// `nil` keeps the runtime on the dense path even when TriAttention is enabled.
     public var triAttentionCalibrationArtifact: TriAttentionCalibrationArtifact?
 
+    /// Absolute token offset where Tesseract's stable prefix ends.
+    /// Used only when `triAttention.prefixProtectionMode == .protectStablePrefixOnly`.
+    public var triAttentionStablePrefixOffset: Int?
+
     public init(
         maxTokens: Int? = nil,
         maxKVSize: Int? = nil,
@@ -145,7 +149,8 @@ public struct GenerateParameters: Sendable {
         transientCheckpointOffsets: Set<Int> = [],
         checkpointBaseOffset: Int = 0,
         triAttention: TriAttentionConfiguration = .v1Disabled,
-        triAttentionCalibrationArtifact: TriAttentionCalibrationArtifact? = nil
+        triAttentionCalibrationArtifact: TriAttentionCalibrationArtifact? = nil,
+        triAttentionStablePrefixOffset: Int? = nil
     ) {
         self.maxTokens = maxTokens
         self.maxKVSize = maxKVSize
@@ -168,6 +173,27 @@ public struct GenerateParameters: Sendable {
         self.checkpointBaseOffset = checkpointBaseOffset
         self.triAttention = triAttention
         self.triAttentionCalibrationArtifact = triAttentionCalibrationArtifact
+        self.triAttentionStablePrefixOffset = triAttentionStablePrefixOffset
+    }
+
+    /// Resolve and attach the effective TriAttention protected-prefix boundary
+    /// for the upcoming prefill onto any live TriAttention caches.
+    public func configureTriAttentionCachesForPrefill(
+        _ cache: [any KVCache],
+        inputTokenCount: Int
+    ) {
+        let protectedPrefixOffset: Int? = switch triAttention.prefixProtectionMode {
+        case .protectNone:
+            nil
+        case .protectStablePrefixOnly:
+            triAttentionStablePrefixOffset
+        case .protectAllPrefill:
+            checkpointBaseOffset + inputTokenCount
+        }
+
+        for case let triAttentionCache as TriAttentionRuntimeCache in cache {
+            triAttentionCache.configureProtectedPrefixOffset(protectedPrefixOffset)
+        }
     }
 
     public func sampler() -> LogitSampler {
@@ -618,6 +644,10 @@ public struct TokenIterator: TokenIteratorProtocol {
         self.checkpointBaseOffset = parameters.checkpointBaseOffset
         self.triAttention = parameters.triAttention
 
+        parameters.configureTriAttentionCachesForPrefill(
+            self.cache,
+            inputTokenCount: prompt.dim(-1)
+        )
         self.promptPrefillTime = try measure {
             try prepare(input: .init(text: y), windowSize: parameters.prefillStepSize)
         }
@@ -655,6 +685,10 @@ public struct TokenIterator: TokenIteratorProtocol {
         self.checkpointBaseOffset = parameters.checkpointBaseOffset
         self.triAttention = parameters.triAttention
 
+        parameters.configureTriAttentionCachesForPrefill(
+            self.cache,
+            inputTokenCount: input.text.tokens.dim(-1)
+        )
         self.promptPrefillTime = try measure {
             try prepare(input: input, windowSize: parameters.prefillStepSize)
         }
@@ -889,6 +923,14 @@ public struct SpeculativeTokenIterator: TokenIteratorProtocol {
             )
         }
 
+        parameters.configureTriAttentionCachesForPrefill(
+            self.mainCache,
+            inputTokenCount: input.text.tokens.dim(-1)
+        )
+        parameters.configureTriAttentionCachesForPrefill(
+            self.draftCache,
+            inputTokenCount: input.text.tokens.dim(-1)
+        )
         self.promptPrefillTime = try measure {
             try prepare(input: input, windowSize: parameters.prefillStepSize)
         }

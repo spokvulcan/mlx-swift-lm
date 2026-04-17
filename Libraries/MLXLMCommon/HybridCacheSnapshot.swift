@@ -105,7 +105,11 @@ public struct HybridCacheSnapshot: @unchecked Sendable {
 
     /// Restore into a live cache array. Creates correct class per layer.
     /// Mirrors loadPromptCache() reconstruction logic from KVCache.swift:1340-1378.
-    public func restore(kvBitsHint: Int? = nil, kvGroupSizeHint: Int? = nil) -> [any KVCache] {
+    public func restore(
+        kvBitsHint: Int? = nil,
+        kvGroupSizeHint: Int? = nil,
+        triAttentionRestoreContext: TriAttentionSnapshotRestoreContext? = nil
+    ) -> [any KVCache] {
         layers.map { layerState -> any KVCache in
             var cache: any KVCache = switch layerState.className {
             case "KVCache", "KVCacheSimple":
@@ -170,6 +174,10 @@ public struct HybridCacheSnapshot: @unchecked Sendable {
             // they all inherit from BaseKVCache.
             if let baseCache = cache as? BaseKVCache {
                 baseCache.offset = layerState.offset
+            }
+
+            if let triAttentionCache = cache as? TriAttentionRuntimeCache {
+                triAttentionCache.attachRuntimeState(triAttentionRestoreContext)
             }
 
             return cache

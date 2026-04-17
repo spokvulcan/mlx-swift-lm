@@ -533,7 +533,9 @@ private struct TorchPickleDecoder {
     private enum OpCode {
         static let mark: UInt8 = 0x28
         static let stop: UInt8 = 0x2e
+        static let binInt: UInt8 = 0x4a
         static let binInt1: UInt8 = 0x4b
+        static let binInt2: UInt8 = 0x4d
         static let binPersId: UInt8 = 0x51
         static let reduce: UInt8 = 0x52
         static let binUnicode: UInt8 = 0x58
@@ -589,6 +591,10 @@ private struct TorchPickleDecoder {
                 push(.string(stringValue))
             case OpCode.binInt1:
                 push(.integer(Int(try reader.readByte())))
+            case OpCode.binInt2:
+                push(.integer(Int(try reader.readUInt16())))
+            case OpCode.binInt:
+                push(.integer(Int(try reader.readInt32())))
             case OpCode.newFalse:
                 push(.bool(false))
             case OpCode.binput:
@@ -863,12 +869,22 @@ private struct PickleByteReader {
         return value
     }
 
+    mutating func readUInt16() throws -> UInt16 {
+        let b0 = UInt16(try readByte())
+        let b1 = UInt16(try readByte())
+        return b0 | (b1 << 8)
+    }
+
     mutating func readUInt32() throws -> UInt32 {
         let b0 = UInt32(try readByte())
         let b1 = UInt32(try readByte())
         let b2 = UInt32(try readByte())
         let b3 = UInt32(try readByte())
         return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+    }
+
+    mutating func readInt32() throws -> Int32 {
+        Int32(bitPattern: try readUInt32())
     }
 
     mutating func readString(byteCount: Int) throws -> String {

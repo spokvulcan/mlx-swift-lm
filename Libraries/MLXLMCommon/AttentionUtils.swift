@@ -75,3 +75,32 @@ public func attentionWithCacheUpdate(
         )
     }
 }
+
+/// Expand a per-kv-head mask `(B, kvHeads, Lq, Lkv)` to per-query-head
+/// `(B, attentionHeads, Lq, Lkv)` for Grouped Query Attention.
+///
+/// MLX's fast SDPA internally unflattens queries to rank-5
+/// `(B, kvHeads, nRepeats, Lq, D)` and broadcasts the mask against rank-5
+/// scores `(B, kvHeads, nRepeats, Lq, Lkv)`. A rank-4 mask with `kvHeads`
+/// in dim 1 fails that broadcast when `attentionHeads != kvHeads`. Tiling
+/// each kv-head's mask `nRepeats` times along dim 1 matches the
+/// `query_head = kv_head × nRepeats + repeat` layout.
+///
+/// Idempotent: already-expanded masks (`dim(1) == attentionHeads`) and
+/// non-GQA shapes pass through unchanged.
+public func expandMaskForGroupedQueryHeads(
+    _ mask: MLXArray,
+    attentionHeads: Int,
+    kvHeads: Int
+) -> MLXArray {
+    guard kvHeads > 0,
+        attentionHeads > kvHeads,
+        attentionHeads % kvHeads == 0,
+        mask.ndim == 4,
+        mask.dim(1) == kvHeads
+    else {
+        return mask
+    }
+    let nRepeats = attentionHeads / kvHeads
+    return repeated(mask, count: nRepeats, axis: 1)
+}

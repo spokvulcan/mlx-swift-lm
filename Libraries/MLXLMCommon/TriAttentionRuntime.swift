@@ -4,7 +4,18 @@ import MLX
 internal struct TriAttentionPreparedHeadStats {
     let qMeanReal: MLXArray
     let qMeanImag: MLXArray
-    let qAbsMean: MLXArray
+    let qAbsDelta: MLXArray
+}
+
+internal struct TriAttentionPreparedKVHeadScoreContext {
+    let keyRealRotary: MLXArray
+    let keyImagRotary: MLXArray
+    let keyRealStatic: MLXArray
+    let keyImagStatic: MLXArray
+    let keyAbsRotary: MLXArray
+    let keyAbsStatic: MLXArray
+    let cosPhase: MLXArray
+    let sinPhase: MLXArray
 }
 
 public final class TriAttentionQwen35RuntimeState {
@@ -23,10 +34,15 @@ public final class TriAttentionQwen35RuntimeState {
     let headDim: Int
     let partialRotaryFactor: Float
     let ropeTheta: Float
+    let freqCount: Int
+    let rotaryPairs: Int
     let preparedStats: [TriAttentionCalibrationHeadKey: TriAttentionPreparedHeadStats]
     let sampledHeadsByLayer: [Int: [TriAttentionCalibrationHeadKey]]
+    let rotaryOmega: MLXArray
     let omega: MLXArray
     let freqScaleSq: MLXArray
+    let rotaryFreqScaleSq: MLXArray
+    let staticFreqScaleSq: MLXArray
     let offsets: MLXArray
 
     init(
@@ -36,10 +52,15 @@ public final class TriAttentionQwen35RuntimeState {
         headDim: Int,
         partialRotaryFactor: Float,
         ropeTheta: Float,
+        freqCount: Int,
+        rotaryPairs: Int,
         preparedStats: [TriAttentionCalibrationHeadKey: TriAttentionPreparedHeadStats],
         sampledHeadsByLayer: [Int: [TriAttentionCalibrationHeadKey]],
+        rotaryOmega: MLXArray,
         omega: MLXArray,
         freqScaleSq: MLXArray,
+        rotaryFreqScaleSq: MLXArray,
+        staticFreqScaleSq: MLXArray,
         offsets: MLXArray
     ) {
         self.artifact = artifact
@@ -48,15 +69,24 @@ public final class TriAttentionQwen35RuntimeState {
         self.headDim = headDim
         self.partialRotaryFactor = partialRotaryFactor
         self.ropeTheta = ropeTheta
+        self.freqCount = freqCount
+        self.rotaryPairs = rotaryPairs
         self.preparedStats = preparedStats
         self.sampledHeadsByLayer = sampledHeadsByLayer
+        self.rotaryOmega = rotaryOmega
         self.omega = omega
         self.freqScaleSq = freqScaleSq
+        self.rotaryFreqScaleSq = rotaryFreqScaleSq
+        self.staticFreqScaleSq = staticFreqScaleSq
         self.offsets = offsets
     }
 
     var kvHeadGroupSize: Int {
         max(1, attentionHeads / max(1, kvHeads))
+    }
+
+    var staticPairs: Int {
+        max(0, freqCount - rotaryPairs)
     }
 
 }
@@ -124,12 +154,16 @@ public enum TriAttentionQwen35Runtime {
             else {
                 return nil
             }
+            let qMeanReal = MLXArray(rawStats.qMeanReal)
+            let qMeanImag = MLXArray(rawStats.qMeanImag)
+            let qAbsMean = MLXArray(rawStats.qAbsMean)
+            let qMeanAbs = sqrt(qMeanReal * qMeanReal + qMeanImag * qMeanImag)
             sampledHeadsByLayer[headKey.layerIndex, default: []].append(headKey)
             observedLayerIndices.insert(headKey.layerIndex)
             preparedStats[headKey] = TriAttentionPreparedHeadStats(
-                qMeanReal: MLXArray(rawStats.qMeanReal),
-                qMeanImag: MLXArray(rawStats.qMeanImag),
-                qAbsMean: MLXArray(rawStats.qAbsMean)
+                qMeanReal: qMeanReal,
+                qMeanImag: qMeanImag,
+                qAbsDelta: qAbsMean - qMeanAbs
             )
         }
 
@@ -140,12 +174,23 @@ public enum TriAttentionQwen35Runtime {
             return nil
         }
 
+        let rotaryOmega = makeRotaryOmega(
+            rotaryPairs: rotaryPairs,
+            ropeTheta: ropeTheta
+        )
         let omega = makeOmega(
             headDim: headDim,
             rotaryPairs: rotaryPairs,
             ropeTheta: ropeTheta
         )
         let freqScaleSq = MLXArray.ones([freqCount], dtype: .float32)
+        let rotaryFreqScaleSq = freqScaleSq[..<rotaryPairs]
+        let staticFreqScaleSq =
+            if rotaryPairs < freqCount {
+                freqScaleSq[rotaryPairs...]
+            } else {
+                MLXArray.zeros([0], dtype: .float32)
+            }
         let offsets = makeGeometricOffsets(maxLength: TriAttentionQwen35RuntimeState.offsetMaxLength)
 
         return TriAttentionQwen35RuntimeState(
@@ -155,10 +200,15 @@ public enum TriAttentionQwen35Runtime {
             headDim: headDim,
             partialRotaryFactor: partialRotaryFactor,
             ropeTheta: ropeTheta,
+            freqCount: freqCount,
+            rotaryPairs: rotaryPairs,
             preparedStats: preparedStats,
             sampledHeadsByLayer: sampledHeadsByLayer,
+            rotaryOmega: rotaryOmega,
             omega: omega,
             freqScaleSq: freqScaleSq,
+            rotaryFreqScaleSq: rotaryFreqScaleSq,
+            staticFreqScaleSq: staticFreqScaleSq,
             offsets: offsets
         )
     }
@@ -262,7 +312,10 @@ public enum TriAttentionQwen35Runtime {
         }
 
         let tokenCount = aggregated.dim(1)
-        let keepCount = min(budget, tokenCount)
+        let keepCount = min(
+            tokenCount,
+            budget + protectedPrefixRetainedCount(cache: caches[0])
+        )
         guard keepCount > 0 else {
             return MLXArray.zeros([runtimeState.kvHeads, 0], dtype: .int32)
         }
@@ -292,35 +345,54 @@ public enum TriAttentionQwen35Runtime {
         precondition(retainedKeys.dim(0) == 1, "TriAttention runtime only supports batch size 1")
 
         var rawScoresByHead: [MLXArray] = []
-        var guardMasksByHead: [MLXArray] = []
+        var forcedKeepMasksByHead: [MLXArray] = []
+        var preparedKVHeads: [Int: TriAttentionPreparedKVHeadScoreContext] = [:]
+        var forcedKeepMasksByKVHead: [Int: MLXArray] = [:]
+        let windowStart = roundStart - min(
+            TriAttentionQwen35RuntimeState.windowSize,
+            max(0, cache.configuration.budgetTokens - 1)
+        )
 
         for headKey in sampledHeads {
             guard let stats = runtimeState.preparedStats[headKey] else { continue }
             let kvHead = min(runtimeState.kvHeads - 1, headKey.headIndex / runtimeState.kvHeadGroupSize)
-
-            let positions = retainedPositions[0, kvHead]
-            let rotatedKeys = retainedKeys[0, kvHead]
-            let keyValues = invertHalfRoPE(
-                rotatedKeys: rotatedKeys,
-                positions: positions,
-                headDim: runtimeState.headDim,
-                omega: runtimeState.omega
-            )
+            let preparedKVHead: TriAttentionPreparedKVHeadScoreContext
+            if let cachedPreparedKVHead = preparedKVHeads[kvHead] {
+                preparedKVHead = cachedPreparedKVHead
+            } else {
+                let computedPreparedKVHead = prepareKVHeadScoreContext(
+                    rotatedKeys: retainedKeys[0, kvHead],
+                    keyPositions: retainedPositions[0, kvHead],
+                    roundStart: roundStart,
+                    runtimeState: runtimeState
+                )
+                preparedKVHeads[kvHead] = computedPreparedKVHead
+                preparedKVHead = computedPreparedKVHead
+            }
             let scores = scoreHead(
                 stats: stats,
-                keyValues: keyValues,
-                keyPositions: positions,
-                roundStart: roundStart,
+                preparedKVHead: preparedKVHead,
                 runtimeState: runtimeState
             )
             rawScoresByHead.append(scores)
 
-            let windowStart = roundStart - min(
-                TriAttentionQwen35RuntimeState.windowSize,
-                max(0, cache.configuration.budgetTokens - 1)
-            )
-            let guardMask = positions.asType(.int32) .>= MLXArray(Int32(max(0, windowStart)))
-            guardMasksByHead.append(guardMask)
+            let forcedKeepMask: MLXArray
+            if let cachedForcedKeepMask = forcedKeepMasksByKVHead[kvHead] {
+                forcedKeepMask = cachedForcedKeepMask
+            } else {
+                let positions = retainedPositions[0, kvHead]
+                var computedForcedKeepMask =
+                    positions.asType(.int32) .>= MLXArray(Int32(max(0, windowStart)))
+                if let protectedPrefixOffset = cache.protectedPrefixOffset {
+                    computedForcedKeepMask = computedForcedKeepMask | (
+                        positions.asType(.int32)
+                            .< MLXArray(Int32(clamping: protectedPrefixOffset))
+                    )
+                }
+                forcedKeepMasksByKVHead[kvHead] = computedForcedKeepMask
+                forcedKeepMask = computedForcedKeepMask
+            }
+            forcedKeepMasksByHead.append(forcedKeepMask)
         }
 
         guard !rawScoresByHead.isEmpty else {
@@ -339,8 +411,12 @@ public enum TriAttentionQwen35Runtime {
             normalizedScores = (normalizedScores - means) / deviations
         }
 
-        let guardMasks = stacked(guardMasksByHead, axis: 0)
-        normalizedScores = MLX.where(guardMasks, MLXArray(Float.infinity), normalizedScores)
+        let forcedKeepMasks = stacked(forcedKeepMasksByHead, axis: 0)
+        normalizedScores = MLX.where(
+            forcedKeepMasks,
+            MLXArray(Float.infinity),
+            normalizedScores
+        )
 
         return aggregatePerKVHeadScores(
             normalizedScores: normalizedScores,
@@ -374,54 +450,136 @@ public enum TriAttentionQwen35Runtime {
         return stacked(perKVHeadScores, axis: 0)
     }
 
-    private static func scoreHead(
+    static func scoreHeadForTesting(
         stats: TriAttentionPreparedHeadStats,
-        keyValues: MLXArray,
+        rotatedKeys: MLXArray,
         keyPositions: MLXArray,
         roundStart: Int,
         runtimeState: TriAttentionQwen35RuntimeState
     ) -> MLXArray {
-        let freqCount = runtimeState.headDim / 2
-        let keyReal = keyValues[.ellipsis, ..<freqCount]
-        let keyImag = keyValues[.ellipsis, freqCount...]
-
-        let qMeanAbs = sqrt(stats.qMeanReal * stats.qMeanReal + stats.qMeanImag * stats.qMeanImag)
-        let keyAbs = sqrt(keyReal * keyReal + keyImag * keyImag)
-        let relativeReal = keyReal * stats.qMeanReal + keyImag * stats.qMeanImag
-        let relativeImag = keyReal * stats.qMeanImag - keyImag * stats.qMeanReal
-        let extra = (stats.qAbsMean - qMeanAbs) * keyAbs
-
-        let baseDelta = MLXArray(Float(roundStart), dtype: .float32) - keyPositions.asType(.float32)
-        let deltaGrid = expandedDimensions(baseDelta, axis: -1) + expandedDimensions(runtimeState.offsets, axis: 0)
-        let phase = expandedDimensions(deltaGrid, axis: -1) * runtimeState.omega
-
-        let trigTerm =
-            (
-                expandedDimensions(relativeReal, axis: 1) * cos(phase)
-                - expandedDimensions(relativeImag, axis: 1) * sin(phase)
-            ) * runtimeState.freqScaleSq
-        let baseScores = trigTerm.sum(axis: -1)
-        let additive = (extra * runtimeState.freqScaleSq).sum(axis: -1, keepDims: true)
-        return mean(baseScores + additive, axis: -1)
+        scoreHead(
+            stats: stats,
+            preparedKVHead: prepareKVHeadScoreContext(
+                rotatedKeys: rotatedKeys,
+                keyPositions: keyPositions,
+                roundStart: roundStart,
+                runtimeState: runtimeState
+            ),
+            runtimeState: runtimeState
+        )
     }
 
-    private static func invertHalfRoPE(
-        rotatedKeys: MLXArray,
-        positions: MLXArray,
-        headDim: Int,
-        omega: MLXArray
+    private static func scoreHead(
+        stats: TriAttentionPreparedHeadStats,
+        preparedKVHead: TriAttentionPreparedKVHeadScoreContext,
+        runtimeState: TriAttentionQwen35RuntimeState
     ) -> MLXArray {
-        let freqCount = headDim / 2
-        let phase = expandedDimensions(positions.asType(.float32), axis: -1) * omega
-        let cosPhase = cos(phase)
-        let sinPhase = sin(phase)
+        let rotaryPairs = runtimeState.rotaryPairs
+        let qMeanRealRotary = stats.qMeanReal[ ..<rotaryPairs]
+        let qMeanImagRotary = stats.qMeanImag[ ..<rotaryPairs]
+        let qAbsDeltaRotary = stats.qAbsDelta[ ..<rotaryPairs]
 
-        let rotatedReal = rotatedKeys[.ellipsis, ..<freqCount]
-        let rotatedImag = rotatedKeys[.ellipsis, freqCount...]
+        let rotaryRelativeReal =
+            preparedKVHead.keyRealRotary * qMeanRealRotary
+            + preparedKVHead.keyImagRotary * qMeanImagRotary
+        let rotaryRelativeImag =
+            preparedKVHead.keyRealRotary * qMeanImagRotary
+            - preparedKVHead.keyImagRotary * qMeanRealRotary
 
-        let unrotatedReal = rotatedReal * cosPhase + rotatedImag * sinPhase
-        let unrotatedImag = rotatedImag * cosPhase - rotatedReal * sinPhase
-        return concatenated([unrotatedReal, unrotatedImag], axis: -1)
+        let rotaryTrigTerm =
+            (
+                expandedDimensions(rotaryRelativeReal, axis: 1) * preparedKVHead.cosPhase
+                - expandedDimensions(rotaryRelativeImag, axis: 1) * preparedKVHead.sinPhase
+            ) * runtimeState.rotaryFreqScaleSq
+        var scores = mean(rotaryTrigTerm.sum(axis: -1), axis: -1)
+        var additive = (
+            preparedKVHead.keyAbsRotary * qAbsDeltaRotary * runtimeState.rotaryFreqScaleSq
+        ).sum(axis: -1)
+
+        if runtimeState.staticPairs > 0 {
+            let qMeanRealStatic = stats.qMeanReal[rotaryPairs...]
+            let qMeanImagStatic = stats.qMeanImag[rotaryPairs...]
+            let qAbsDeltaStatic = stats.qAbsDelta[rotaryPairs...]
+            let staticRelativeReal =
+                preparedKVHead.keyRealStatic * qMeanRealStatic
+                + preparedKVHead.keyImagStatic * qMeanImagStatic
+            scores = scores + (staticRelativeReal * runtimeState.staticFreqScaleSq).sum(axis: -1)
+            additive = additive + (
+                preparedKVHead.keyAbsStatic * qAbsDeltaStatic * runtimeState.staticFreqScaleSq
+            ).sum(axis: -1)
+        }
+
+        return scores + additive
+    }
+
+    private static func protectedPrefixRetainedCount(cache: TriAttentionRuntimeCache) -> Int {
+        guard
+            let protectedPrefixOffset = cache.protectedPrefixOffset,
+            let retainedPositions = cache.retainedPositions
+        else {
+            return 0
+        }
+
+        let protectedCounts = sum(
+            (retainedPositions[0].asType(.int32) .< MLXArray(Int32(clamping: protectedPrefixOffset)))
+                .asType(.int32),
+            axis: -1
+        )
+        return Int(protectedCounts.max().item(Int32.self))
+    }
+
+    private static func prepareKVHeadScoreContext(
+        rotatedKeys: MLXArray,
+        keyPositions: MLXArray,
+        roundStart: Int,
+        runtimeState: TriAttentionQwen35RuntimeState
+    ) -> TriAttentionPreparedKVHeadScoreContext {
+        let rotatedReal = rotatedKeys[.ellipsis, ..<runtimeState.freqCount]
+        let rotatedImag = rotatedKeys[.ellipsis, runtimeState.freqCount...]
+
+        let rotaryReal = rotatedReal[.ellipsis, ..<runtimeState.rotaryPairs]
+        let rotaryImag = rotatedImag[.ellipsis, ..<runtimeState.rotaryPairs]
+        let ropePhase = expandedDimensions(keyPositions.asType(.float32), axis: -1)
+            * runtimeState.rotaryOmega
+        let cosRopePhase = cos(ropePhase)
+        let sinRopePhase = sin(ropePhase)
+        let keyRealRotary = rotaryReal * cosRopePhase + rotaryImag * sinRopePhase
+        let keyImagRotary = rotaryImag * cosRopePhase - rotaryReal * sinRopePhase
+        let keyAbsRotary = sqrt(
+            keyRealRotary * keyRealRotary + keyImagRotary * keyImagRotary
+        )
+
+        let keyRealStatic: MLXArray
+        let keyImagStatic: MLXArray
+        let keyAbsStatic: MLXArray
+        if runtimeState.staticPairs > 0 {
+            keyRealStatic = rotatedReal[.ellipsis, runtimeState.rotaryPairs...]
+            keyImagStatic = rotatedImag[.ellipsis, runtimeState.rotaryPairs...]
+            keyAbsStatic = sqrt(
+                keyRealStatic * keyRealStatic + keyImagStatic * keyImagStatic
+            )
+        } else {
+            let tokenCount = keyPositions.dim(0)
+            keyRealStatic = MLXArray.zeros([tokenCount, 0], dtype: rotatedKeys.dtype)
+            keyImagStatic = MLXArray.zeros([tokenCount, 0], dtype: rotatedKeys.dtype)
+            keyAbsStatic = MLXArray.zeros([tokenCount, 0], dtype: rotatedKeys.dtype)
+        }
+
+        let baseDelta = MLXArray(Float(roundStart), dtype: .float32) - keyPositions.asType(.float32)
+        let deltaGrid = expandedDimensions(baseDelta, axis: -1)
+            + expandedDimensions(runtimeState.offsets, axis: 0)
+        let phase = expandedDimensions(deltaGrid, axis: -1) * runtimeState.rotaryOmega
+
+        return TriAttentionPreparedKVHeadScoreContext(
+            keyRealRotary: keyRealRotary,
+            keyImagRotary: keyImagRotary,
+            keyRealStatic: keyRealStatic,
+            keyImagStatic: keyImagStatic,
+            keyAbsRotary: keyAbsRotary,
+            keyAbsStatic: keyAbsStatic,
+            cosPhase: cos(phase),
+            sinPhase: sin(phase)
+        )
     }
 
     private static func makeGeometricOffsets(maxLength: Int) -> MLXArray {
@@ -434,16 +592,26 @@ public enum TriAttentionQwen35Runtime {
         return MLXArray(offsets)
     }
 
+    private static func makeRotaryOmega(
+        rotaryPairs: Int,
+        ropeTheta: Float
+    ) -> MLXArray {
+        MLXArray((0 ..< rotaryPairs).map { pairIndex in
+            pow(ropeTheta, -Float(pairIndex) / Float(max(1, rotaryPairs)))
+        })
+    }
+
     private static func makeOmega(
         headDim: Int,
         rotaryPairs: Int,
         ropeTheta: Float
     ) -> MLXArray {
         let freqCount = headDim / 2
-        let prefix = (0 ..< rotaryPairs).map { pairIndex in
-            pow(ropeTheta, -Float(pairIndex) / Float(max(1, rotaryPairs)))
-        }
-        let padded = prefix + Array(repeating: Float.zero, count: max(0, freqCount - rotaryPairs))
+        let rotaryOmega = makeRotaryOmega(
+            rotaryPairs: rotaryPairs,
+            ropeTheta: ropeTheta
+        ).asArray(Float.self)
+        let padded = rotaryOmega + Array(repeating: Float.zero, count: max(0, freqCount - rotaryPairs))
         return MLXArray(padded)
     }
 }

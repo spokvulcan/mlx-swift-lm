@@ -6,9 +6,77 @@ internal protocol TriAttentionRuntimeCache: KVCache, AnyObject {
     var runtimeState: TriAttentionQwen35RuntimeState? { get }
     var retainedPositions: MLXArray? { get }
     var retainedTokenCount: Int { get }
+    var protectedPrefixOffset: Int? { get }
 
     func dequantizedRetainedKeysForRuntime() -> MLXArray?
     func applyKeepIndices(_ keepIndices: MLXArray)
+    func attachRuntimeState(_ restoreContext: TriAttentionSnapshotRestoreContext?)
+    func configureProtectedPrefixOffset(_ protectedPrefixOffset: Int?)
+}
+
+internal func triAttentionConfigurationMetaState(_ configuration: TriAttentionConfiguration) -> [String] {
+    [
+        configuration.implementationVersion.rawValue,
+        String(configuration.enabled),
+        String(configuration.budgetTokens),
+        configuration.calibrationArtifactIdentity?.rawValue ?? "",
+        configuration.prefixProtectionMode.rawValue,
+    ]
+}
+
+internal func triAttentionConfigurationFromMetaState(
+    _ newValue: [String],
+    ownerName: String
+) -> TriAttentionConfiguration {
+    guard newValue.count == 4 || newValue.count == 5 else {
+        fatalError("\(ownerName) metaState must have exactly 4 or 5 values")
+    }
+    guard let implementationVersion = TriAttentionImplementationVersion(rawValue: newValue[0]) else {
+        fatalError(
+            "Unsupported TriAttention implementation version '\(newValue[0])' in metaState"
+        )
+    }
+
+    let enabled: Bool
+    switch newValue[1] {
+    case "true":
+        enabled = true
+    case "false":
+        enabled = false
+    default:
+        fatalError("Failed to parse TriAttention enabled flag from metaState: \(newValue[1])")
+    }
+
+    guard let budgetTokens = Int(newValue[2]) else {
+        fatalError("Failed to parse TriAttention budget from metaState: \(newValue[2])")
+    }
+
+    let calibrationArtifactIdentity: TriAttentionCalibrationArtifactIdentity? =
+        if newValue[3].isEmpty {
+            nil
+        } else {
+            TriAttentionCalibrationArtifactIdentity(rawValue: newValue[3])
+        }
+
+    let prefixProtectionMode: TriAttentionPrefixProtectionMode
+    if newValue.count == 5 {
+        guard let mode = TriAttentionPrefixProtectionMode(rawValue: newValue[4]) else {
+            fatalError(
+                "Unsupported TriAttention prefix protection mode '\(newValue[4])' in metaState"
+            )
+        }
+        prefixProtectionMode = mode
+    } else {
+        prefixProtectionMode = .protectNone
+    }
+
+    return TriAttentionConfiguration(
+        enabled: enabled,
+        budgetTokens: budgetTokens,
+        calibrationArtifactIdentity: calibrationArtifactIdentity,
+        implementationVersion: implementationVersion,
+        prefixProtectionMode: prefixProtectionMode
+    )
 }
 
 internal func triAttentionMaskMode(
@@ -17,7 +85,9 @@ internal func triAttentionMaskMode(
     usesSparseMask: Bool,
     n: Int,
     windowSize: Int?,
-    returnArray: Bool
+    returnArray: Bool,
+    attentionHeads: Int? = nil,
+    kvHeads: Int? = nil
 ) -> MLXFast.ScaledDotProductAttentionMaskMode {
     guard let retainedPositions else {
         if n == 1 {
@@ -54,6 +124,12 @@ internal func triAttentionMaskMode(
 
     if let windowSize {
         mask = mask & (queryGrid .< (keyGrid + MLXArray(Int32(windowSize))))
+    }
+
+    if let attentionHeads, let kvHeads {
+        mask = expandMaskForGroupedQueryHeads(
+            mask, attentionHeads: attentionHeads, kvHeads: kvHeads
+        )
     }
 
     return .array(mask)
@@ -150,12 +226,14 @@ public final class TriAttentionSparseKVCache:
     public private(set) var retainedPositions: MLXArray?
     public private(set) var retainedKeys: MLXArray?
     public private(set) var retainedValues: MLXArray?
-    internal let runtimeState: TriAttentionQwen35RuntimeState?
+    internal private(set) var runtimeState: TriAttentionQwen35RuntimeState?
+    internal private(set) var protectedPrefixOffset: Int?
     private var usesSparseMask = false
 
     public init(configuration: TriAttentionConfiguration) {
         self.configuration = configuration
         self.runtimeState = nil
+        self.protectedPrefixOffset = nil
         super.init()
     }
 
@@ -165,6 +243,7 @@ public final class TriAttentionSparseKVCache:
     ) {
         self.runtimeState = runtimeState
         self.configuration = configuration
+        self.protectedPrefixOffset = nil
         super.init()
     }
 
@@ -211,7 +290,9 @@ public final class TriAttentionSparseKVCache:
             usesSparseMask: usesSparseMask,
             n: n,
             windowSize: windowSize,
-            returnArray: returnArray
+            returnArray: returnArray,
+            attentionHeads: runtimeState?.attentionHeads,
+            kvHeads: runtimeState?.kvHeads
         )
     }
 
@@ -233,6 +314,7 @@ public final class TriAttentionSparseKVCache:
                 retainedPositions = nil
                 retainedKeys = nil
                 retainedValues = nil
+                protectedPrefixOffset = nil
                 usesSparseMask = false
                 return
             }
@@ -260,49 +342,12 @@ public final class TriAttentionSparseKVCache:
 
     public override var metaState: [String] {
         get {
-            [
-                configuration.implementationVersion.rawValue,
-                String(configuration.enabled),
-                String(configuration.budgetTokens),
-                configuration.calibrationArtifactIdentity?.rawValue ?? "",
-            ]
+            triAttentionConfigurationMetaState(configuration)
         }
         set {
-            guard newValue.count == 4 else {
-                fatalError("TriAttentionSparseKVCache metaState must have exactly 4 values")
-            }
-            guard let implementationVersion = TriAttentionImplementationVersion(rawValue: newValue[0]) else {
-                fatalError(
-                    "Unsupported TriAttention implementation version '\(newValue[0])' in metaState"
-                )
-            }
-
-            let enabled: Bool
-            switch newValue[1] {
-            case "true":
-                enabled = true
-            case "false":
-                enabled = false
-            default:
-                fatalError("Failed to parse TriAttention enabled flag from metaState: \(newValue[1])")
-            }
-
-            guard let budgetTokens = Int(newValue[2]) else {
-                fatalError("Failed to parse TriAttention budget from metaState: \(newValue[2])")
-            }
-
-            let calibrationArtifactIdentity: TriAttentionCalibrationArtifactIdentity? =
-                if newValue[3].isEmpty {
-                    nil
-                } else {
-                    TriAttentionCalibrationArtifactIdentity(rawValue: newValue[3])
-                }
-
-            configuration = TriAttentionConfiguration(
-                enabled: enabled,
-                budgetTokens: budgetTokens,
-                calibrationArtifactIdentity: calibrationArtifactIdentity,
-                implementationVersion: implementationVersion
+            configuration = triAttentionConfigurationFromMetaState(
+                newValue,
+                ownerName: "TriAttentionSparseKVCache"
             )
         }
     }
@@ -319,6 +364,7 @@ public final class TriAttentionSparseKVCache:
         )
         new.offset = offset
         new.usesSparseMask = usesSparseMask
+        new.protectedPrefixOffset = protectedPrefixOffset
 
         if let retainedPositions,
             let retainedKeys,
@@ -371,6 +417,20 @@ public final class TriAttentionSparseKVCache:
         usesSparseMask = true
     }
 
+    internal func attachRuntimeState(_ restoreContext: TriAttentionSnapshotRestoreContext?) {
+        guard
+            let restoreContext,
+            configuration == restoreContext.expectedConfiguration
+        else {
+            return
+        }
+        runtimeState = restoreContext.runtimeState
+    }
+
+    internal func configureProtectedPrefixOffset(_ protectedPrefixOffset: Int?) {
+        self.protectedPrefixOffset = protectedPrefixOffset
+    }
+
     func toDecodeTimeQuantized(groupSize: Int, bits: Int) -> any KVCache {
         let quantizedCache = QuantizedTriAttentionSparseKVCache(
             configuration: configuration,
@@ -379,6 +439,7 @@ public final class TriAttentionSparseKVCache:
             runtimeState: runtimeState
         )
         quantizedCache.offset = offset
+        quantizedCache.configureProtectedPrefixOffset(protectedPrefixOffset)
 
         if let retainedPositions,
             let retainedKeys,
