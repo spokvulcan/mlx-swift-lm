@@ -2055,12 +2055,22 @@ public enum Generation: Sendable {
     /// A tool call from the language model.
     case toolCall(ToolCall)
 
+    /// An append-only delta of text buffered inside an in-flight
+    /// `<tool_call>…</tool_call>` block (before the close tag is emitted).
+    /// The authoritative `.toolCall` event still fires once at close with the
+    /// parsed payload — consumers that only care about the final parse can
+    /// keep ignoring this case. Consumers that want to render arguments live
+    /// (e.g. a UI activity log) can concatenate these deltas to show the
+    /// tool-call body filling in character-by-character.
+    case toolCallBufferDelta(String)
+
     /// Generated text or nil
     public var chunk: String? {
         switch self {
         case .chunk(let string): string
         case .info: nil
         case .toolCall: nil
+        case .toolCallBufferDelta: nil
         }
     }
 
@@ -2070,6 +2080,7 @@ public enum Generation: Sendable {
         case .chunk: nil
         case .info(let info): info
         case .toolCall: nil
+        case .toolCallBufferDelta: nil
         }
     }
 
@@ -2079,6 +2090,7 @@ public enum Generation: Sendable {
         case .chunk: nil
         case .info: nil
         case .toolCall(let toolCall): toolCall
+        case .toolCallBufferDelta: nil
         }
     }
 
@@ -2169,6 +2181,16 @@ private struct TextToolTokenLoopHandler: TokenLoopHandler, @unchecked Sendable {
             // Process chunk through the tool call processor.
             if let textToYield = toolCallProcessor.processChunk(chunk) {
                 if case .terminated = emit(.chunk(textToYield)) {
+                    return false
+                }
+            }
+
+            // Forward any newly-buffered tool-call body text as a progressive
+            // delta so UI consumers can render arguments live before the
+            // close tag arrives. The authoritative `.toolCall` event still
+            // fires below once the buffer is parsed.
+            if let bufferDelta = toolCallProcessor.lastChunkBufferDelta {
+                if case .terminated = emit(.toolCallBufferDelta(bufferDelta)) {
                     return false
                 }
             }

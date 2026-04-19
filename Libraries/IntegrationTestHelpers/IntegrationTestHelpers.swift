@@ -232,6 +232,8 @@ public enum ChatSessionTests {
                 responseText += text
             case .toolCall(let toolCall):
                 toolCalls.append(toolCall)
+            case .toolCallBufferDelta:
+                break
             case .info(let completionInfo):
                 info = completionInfo
             }
@@ -561,6 +563,8 @@ public enum ToolCallTests {
                     text += chunk
                 case .toolCall(let toolCall):
                     toolCalls.append(toolCall)
+                case .toolCallBufferDelta:
+                    break
                 case .info:
                     break
                 }

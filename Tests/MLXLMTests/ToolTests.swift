@@ -86,6 +86,46 @@ struct ToolTests {
         #expect(toolCall.function.arguments["unit"] == .string("celsius"))
     }
 
+    @Test("Test Progressive Tool-Call Buffer Delta Emission")
+    func testProgressiveToolCallBufferDelta() throws {
+        // The vendor exposes `lastChunkBufferDelta` after each `processChunk`
+        // so callers (e.g. a UI activity log) can render tool-call arguments
+        // live before `</tool_call>` closes. Locks the append-only contract
+        // and the reset across consecutive tool calls.
+        let processor = ToolCallProcessor()
+        let chunks: [String] = [
+            "<tool_call>", "{\"name\": ", "\"a\", \"arguments\": {}}", "</tool_call>",
+            "<tool_call>", "{\"name\": \"b\", ", "\"arguments\": {}}</tool_call>",
+        ]
+
+        var accumulatedFirst = ""
+        var accumulatedSecond = ""
+        var seenSecond = false
+
+        for chunk in chunks {
+            _ = processor.processChunk(chunk)
+            if let delta = processor.lastChunkBufferDelta {
+                if processor.toolCalls.count >= 1 && seenSecond {
+                    accumulatedSecond += delta
+                } else {
+                    accumulatedFirst += delta
+                }
+            }
+            if processor.toolCalls.count == 1 && !seenSecond {
+                seenSecond = true
+            }
+        }
+
+        #expect(processor.toolCalls.count == 2)
+        #expect(processor.toolCalls[0].function.name == "a")
+        #expect(processor.toolCalls[1].function.name == "b")
+
+        // Deltas accumulated for each tool call reconstruct the body bytes
+        // between `<tool_call>` and `</tool_call>` (no duplication).
+        #expect(accumulatedFirst == "{\"name\": \"a\", \"arguments\": {}}")
+        #expect(accumulatedSecond == "{\"name\": \"b\", \"arguments\": {}}")
+    }
+
     // MARK: - JSON Format Tests
 
     @Test("Test JSON Tool Call Parser - Default Tags")

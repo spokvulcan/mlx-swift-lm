@@ -34,6 +34,27 @@ public class ToolCallProcessor {
     /// The tool calls extracted during processing.
     public var toolCalls: [ToolCall] = []
 
+    /// Number of characters forwarded to callers as `toolCallBufferDelta` on the
+    /// current in-flight `<tool_call>…</tool_call>` block. Reset to zero after
+    /// each close-tag parse so callers that concatenate deltas (e.g. a UI
+    /// activity log surfacing tool-call arguments live) see a monotonic,
+    /// append-only stream per tool call.
+    private var forwardedBufferChars: Int = 0
+
+    /// Newly-buffered in-flight tool-call body text since the last
+    /// `processChunk` call, or `nil` if the buffer did not grow on that call.
+    /// Callers that need to display tool-call arguments live (without waiting
+    /// for `</tool_call>`) can read this after each `processChunk` and append
+    /// it to a "building" UI span.
+    ///
+    /// The returned text is append-only: successive calls return only the new
+    /// characters added since the last call, not the cumulative buffer.
+    public private(set) var lastChunkBufferDelta: String?
+
+    /// Read-only view of the in-flight tool-call buffer. Non-empty while
+    /// `state == .collectingToolCall`; reset on each `</tool_call>` close.
+    public var currentToolCallBuffer: String { toolCallBuffer }
+
     // MARK: - State Enum
 
     private enum State {
@@ -70,11 +91,41 @@ public class ToolCallProcessor {
     /// Process a generated text chunk and extract any tool call content.
     /// - Parameter chunk: The text chunk to process
     /// - Returns: Regular text that should be displayed (non-tool call content), or `nil` if buffering
+    ///
+    /// Side effect: updates `lastChunkBufferDelta` to non-nil when the
+    /// in-flight `toolCallBuffer` grew on this call (i.e. a tagged-format
+    /// tool call is being collected and the chunk landed inside
+    /// `<tool_call>…</tool_call>`). Callers that want to surface tool-call
+    /// arguments live can read this after each call.
     public func processChunk(_ chunk: String) -> String? {
+        lastChunkBufferDelta = nil
+        let result: String?
         if isInlineFormat {
-            return processInlineChunk(chunk)
+            result = processInlineChunk(chunk)
+        } else {
+            result = processTaggedChunk(chunk)
         }
-        return processTaggedChunk(chunk)
+
+        // Compute any newly-buffered in-flight content and expose it as an
+        // append-only delta. Only meaningful for tagged formats while in
+        // `.collectingToolCall` state — inline formats don't surface a
+        // progressive buffer because they parse as soon as the whole
+        // payload matches.
+        if state == .collectingToolCall && toolCallBuffer.count > forwardedBufferChars {
+            let newChars = toolCallBuffer.dropFirst(forwardedBufferChars)
+            if !newChars.isEmpty {
+                lastChunkBufferDelta = String(newChars)
+                forwardedBufferChars = toolCallBuffer.count
+            }
+        } else if state == .normal {
+            // Buffer was either flushed as regular text (fallthrough from
+            // potentialToolCall → normal) or a tool call closed. Reset
+            // the delta counter so the next `<tool_call>` block starts
+            // from zero.
+            forwardedBufferChars = 0
+        }
+
+        return result
     }
 
     /// Process end-of-sequence, parsing any buffered content as tool call(s).
