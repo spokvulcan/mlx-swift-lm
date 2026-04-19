@@ -268,14 +268,15 @@ public enum TriAttentionQwen35Runtime {
             return
         }
 
-        let threshold =
-            runtimeCaches[0].configuration.budgetTokens + TriAttentionQwen35RuntimeState.divideLength
         let retained = runtimeCaches[0].retainedTokenCount
         let offset = runtimeCaches[0].offset
         let budget = runtimeCaches[0].configuration.budgetTokens
         let protectedOffset = runtimeCaches[0].protectedPrefixOffset ?? -1
+        let protectedCount = max(0, min(retained, protectedOffset))
+        let threshold =
+            budget + TriAttentionQwen35RuntimeState.divideLength + protectedCount
         guard retained >= threshold else {
-            triLog.debug("prune skip=below-threshold retained=\(retained, privacy: .public) threshold=\(threshold, privacy: .public) offset=\(offset, privacy: .public)")
+            triLog.debug("prune skip=below-threshold retained=\(retained, privacy: .public) threshold=\(threshold, privacy: .public) protectedCount=\(protectedCount, privacy: .public) offset=\(offset, privacy: .public)")
             return
         }
 
@@ -353,11 +354,15 @@ public enum TriAttentionQwen35Runtime {
         }
 
         let tokenCount = aggregated.dim(1)
-        let protectedCount = protectedPrefixRetainedCount(cache: caches[0])
+        let protectedCount = max(0, min(tokenCount, caches[0].protectedPrefixOffset ?? 0))
         let unclampedKeep = budget + protectedCount
         let keepCount = min(tokenCount, unclampedKeep)
         let isNoOp = keepCount >= tokenCount
         triLog.info("keep-compute tokenCount=\(tokenCount, privacy: .public) protected=\(protectedCount, privacy: .public) budget=\(budget, privacy: .public) unclampedKeep=\(unclampedKeep, privacy: .public) keepCount=\(keepCount, privacy: .public) noop=\(isNoOp, privacy: .public) scoredLayers=\(perLayerScores.count, privacy: .public) scoringMs=\(String(format: "%.2f", scoringMs), privacy: .public)")
+
+        if isNoOp {
+            return nil
+        }
 
         guard keepCount > 0 else {
             return MLXArray.zeros([runtimeState.kvHeads, 0], dtype: .int32)
@@ -553,22 +558,6 @@ public enum TriAttentionQwen35Runtime {
         }
 
         return scores + additive
-    }
-
-    private static func protectedPrefixRetainedCount(cache: TriAttentionRuntimeCache) -> Int {
-        guard
-            let protectedPrefixOffset = cache.protectedPrefixOffset,
-            let retainedPositions = cache.retainedPositions
-        else {
-            return 0
-        }
-
-        let protectedCounts = sum(
-            (retainedPositions[0].asType(.int32) .< MLXArray(Int32(clamping: protectedPrefixOffset)))
-                .asType(.int32),
-            axis: -1
-        )
-        return Int(protectedCounts.max().item(Int32.self))
     }
 
     private static func prepareKVHeadScoreContext(

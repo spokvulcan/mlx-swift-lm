@@ -475,7 +475,7 @@ final class TriAttentionSparseKVCacheTests: XCTestCase {
         )
         var parameters = GenerateParameters(triAttention: configuration)
         parameters.triAttentionStablePrefixOffset = stablePrefixOffset
-        let tokenCount = configuration.budgetTokens + 129
+        let tokenCount = configuration.budgetTokens + stablePrefixOffset + 129
         parameters.configureTriAttentionCachesForPrefill([cache], inputTokenCount: tokenCount)
 
         let keys = MLXArray(
@@ -496,7 +496,7 @@ final class TriAttentionSparseKVCacheTests: XCTestCase {
 
     func testProtectAllPrefillRetainsWholePrefillThenPrunesDecodeTail() throws {
         let prefillTokenCount = 129
-        let decodeTokenCount = 3
+        let decodeTokenCount = prefillTokenCount + 1
         let (configuration, restoreContext) = try makeRestoreContext(
             budgetTokens: 2,
             headDim: 8,

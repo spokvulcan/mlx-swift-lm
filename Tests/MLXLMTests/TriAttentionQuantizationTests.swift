@@ -106,7 +106,7 @@ final class TriAttentionQuantizationTests: XCTestCase {
             triAttention: configuration
         )
         parameters.triAttentionStablePrefixOffset = 4
-        let tokenCount = configuration.budgetTokens + 129
+        let tokenCount = configuration.budgetTokens + 4 + 129
         parameters.configureTriAttentionCachesForPrefill([sparseCache], inputTokenCount: tokenCount)
 
         let keys = MLXArray(Array(repeating: Float(1), count: 1 * 2 * tokenCount * headDim)).reshaped(
