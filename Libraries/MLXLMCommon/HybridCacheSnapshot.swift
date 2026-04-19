@@ -1,5 +1,8 @@
 import Foundation
 import MLX
+import os
+
+private let snapLog = Logger(subsystem: "app.tesseract.agent", category: "triattention-snapshot")
 
 /// Full snapshot of all per-layer cache state at a specific token offset.
 /// Mirrors the savePromptCache/loadPromptCache serialization contract.
@@ -110,7 +113,14 @@ public struct HybridCacheSnapshot: @unchecked Sendable {
         kvGroupSizeHint: Int? = nil,
         triAttentionRestoreContext: TriAttentionSnapshotRestoreContext? = nil
     ) -> [any KVCache] {
-        layers.map { layerState -> any KVCache in
+        let classBreakdown = Dictionary(grouping: layers, by: { $0.className })
+            .mapValues { $0.count }
+            .map { "\($0.key):\($0.value)" }
+            .sorted()
+            .joined(separator: ",")
+        let maxOffset = layers.map { $0.offset }.max() ?? 0
+        snapLog.info("restore-begin tokenOffset=\(self.tokenOffset, privacy: .public) layers=\(self.layers.count, privacy: .public) maxLayerOffset=\(maxOffset, privacy: .public) classBreakdown=\(classBreakdown, privacy: .public) hasTriCtx=\(triAttentionRestoreContext != nil, privacy: .public)")
+        return layers.map { layerState -> any KVCache in
             var cache: any KVCache = switch layerState.className {
             case "KVCache", "KVCacheSimple":
                 KVCacheSimple()

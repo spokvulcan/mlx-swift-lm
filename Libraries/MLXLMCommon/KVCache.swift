@@ -3,6 +3,7 @@
 import Foundation
 import MLX
 import MLXNN
+import os
 
 /// Implementation of KV cache functionality for MLX Swift
 ///
@@ -1697,15 +1698,24 @@ public func maybeQuantizeKVCache(
         return
     }
 
+    let t0 = CFAbsoluteTimeGetCurrent()
+    var converted = 0
     for i in 0 ..< cache.count {
         if let decodeQuantizable = cache[i] as? DecodeTimeQuantizableKVCache {
             cache[i] = decodeQuantizable.toDecodeTimeQuantized(
                 groupSize: kvGroupSize,
                 bits: kvBits
             )
+            converted += 1
         }
         // TODO: RotatingKVCache.toQuantized() is not implemented yet, like in Python.
         // When implemented, add: else if let rotatingCache = cache[i] as? RotatingKVCache { ... }
         // MambaCache and CacheList don't use traditional KV quantization
     }
+    let ms = (CFAbsoluteTimeGetCurrent() - t0) * 1000.0
+    let totalCaches = cache.count
+    let firstOffset = firstQuantizable.offset
+    Logger(subsystem: "app.tesseract.agent", category: "triattention-runtime").info(
+        "maybe-quantize fired converted=\(converted, privacy: .public) totalCaches=\(totalCaches, privacy: .public) kvBits=\(kvBits, privacy: .public) groupSize=\(kvGroupSize, privacy: .public) firstOffset=\(firstOffset, privacy: .public) tookMs=\(String(format: "%.2f", ms), privacy: .public)"
+    )
 }

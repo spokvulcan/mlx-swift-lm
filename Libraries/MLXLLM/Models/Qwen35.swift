@@ -11,6 +11,9 @@ import Foundation
 import MLX
 import MLXLMCommon
 import MLXNN
+import os
+
+private let qwen35Log = Logger(subsystem: "app.tesseract.agent", category: "qwen35")
 
 // MARK: - Configuration
 
@@ -539,12 +542,19 @@ public class Qwen35TextModelInner: Module {
     }
 
     func callAsFunction(_ inputs: MLXArray, cache: [KVCache?]? = nil) -> MLXArray {
+        let seqLen = inputs.dim(-1)
+        let fwdStart = CFAbsoluteTimeGetCurrent()
         var hiddenStates = embedTokens(inputs)
 
         var cacheArray = cache
         if cacheArray == nil {
             cacheArray = Array(repeating: nil as KVCache?, count: layers.count)
         }
+
+        let firstFA = cacheArray?[faIdx]
+        let preOffset = (firstFA as? BaseKVCache)?.offset ?? -1
+        let cacheClass = firstFA.map { "\(type(of: $0))" } ?? "nil"
+        qwen35Log.debug("fwd-start seqLen=\(seqLen, privacy: .public) offset=\(preOffset, privacy: .public) cacheClass=\(cacheClass, privacy: .public)")
 
         let faMask = createAttentionMask(h: hiddenStates, cache: cacheArray?[faIdx])
         let ssmMask = createSSMMask(h: hiddenStates, cache: cacheArray?[ssmIdx] as? MambaCache)
@@ -563,10 +573,14 @@ public class Qwen35TextModelInner: Module {
                 cacheArray[index]
             }
             if fullAttentionCaches.count == fullAttentionLayerIndices.count {
+                let pruneStart = CFAbsoluteTimeGetCurrent()
                 TriAttentionQwen35Runtime.pruneIfNeeded(
                     caches: fullAttentionCaches,
                     layerIndices: fullAttentionLayerIndices
                 )
+                let pruneMs = (CFAbsoluteTimeGetCurrent() - pruneStart) * 1000.0
+                let fwdMs = (CFAbsoluteTimeGetCurrent() - fwdStart) * 1000.0
+                qwen35Log.debug("fwd-done seqLen=\(seqLen, privacy: .public) totalMs=\(String(format: "%.2f", fwdMs), privacy: .public) pruneMs=\(String(format: "%.2f", pruneMs), privacy: .public)")
             }
         }
 

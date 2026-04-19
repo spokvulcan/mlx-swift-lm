@@ -1,5 +1,8 @@
 import Foundation
 import MLX
+import os
+
+private let triCacheLog = Logger(subsystem: "app.tesseract.agent", category: "triattention-cache-q")
 
 /// Quantized TriAttention sparse cache used after the decode-time KV
 /// quantization threshold is crossed.
@@ -143,10 +146,12 @@ public final class QuantizedTriAttentionSparseKVCache:
             let (keyDim, valueDim) = deriveHeadDimensions(from: quantizedState)
             keyHeadDimension = keyDim
             valueHeadDimension = valueDim
-            usesSparseMask = !triAttentionRetainedStateMatchesDensePrefix(
+            let matchesDense = triAttentionRetainedStateMatchesDensePrefix(
                 positions: positions,
                 offset: offset
             )
+            usesSparseMask = !matchesDense
+            triCacheLog.info("state-restore retainedCount=\(positions.dim(2), privacy: .public) offset=\(self.offset, privacy: .public) matchesDense=\(matchesDense, privacy: .public) sparseMask=\(self.usesSparseMask, privacy: .public) keyDim=\(keyDim, privacy: .public) valueDim=\(valueDim, privacy: .public)")
         }
     }
 
@@ -214,8 +219,13 @@ public final class QuantizedTriAttentionSparseKVCache:
             let retainedPositions,
             let quantizedState = quantizedKeyValueCache.getQuantizedState()
         else {
+            triCacheLog.info("apply-keep skip=no-state")
             return
         }
+
+        let retainedBefore = retainedPositions.dim(2)
+        let sparseBefore = usesSparseMask
+        let t0 = CFAbsoluteTimeGetCurrent()
 
         let batchSize = retainedPositions.dim(0)
         let kvHeads = retainedPositions.dim(1)
@@ -235,6 +245,10 @@ public final class QuantizedTriAttentionSparseKVCache:
         ].compactMap { $0 }
         quantizedKeyValueCache.offset = keepCount
         usesSparseMask = true
+
+        eval(self.retainedPositions!)
+        let ms = (CFAbsoluteTimeGetCurrent() - t0) * 1000.0
+        triCacheLog.info("apply-keep retainedBefore=\(retainedBefore, privacy: .public) keepCount=\(keepCount, privacy: .public) retainedAfter=\(self.retainedPositions!.dim(2), privacy: .public) sparseMaskBefore=\(sparseBefore, privacy: .public) sparseMaskAfter=true tookMs=\(String(format: "%.2f", ms), privacy: .public) offset=\(self.offset, privacy: .public)")
     }
 
     internal func attachRuntimeState(_ restoreContext: TriAttentionSnapshotRestoreContext?) {
@@ -242,9 +256,13 @@ public final class QuantizedTriAttentionSparseKVCache:
             let restoreContext,
             configuration == restoreContext.expectedConfiguration
         else {
+            let hasCtx = restoreContext != nil
+            let configMatches = restoreContext.map { configuration == $0.expectedConfiguration } ?? false
+            triCacheLog.info("attach-runtime skip hasCtx=\(hasCtx, privacy: .public) configMatches=\(configMatches, privacy: .public) wasNil=\(self.runtimeState == nil, privacy: .public)")
             return
         }
         runtimeState = restoreContext.runtimeState
+        triCacheLog.debug("attach-runtime done attentionHeads=\(restoreContext.runtimeState.attentionHeads, privacy: .public) kvHeads=\(restoreContext.runtimeState.kvHeads, privacy: .public)")
     }
 
     internal func configureProtectedPrefixOffset(_ protectedPrefixOffset: Int?) {

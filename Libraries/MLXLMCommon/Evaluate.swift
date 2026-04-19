@@ -3,6 +3,7 @@
 import Foundation
 import MLX
 import MLXNN
+import os
 
 /// A `LogitSampler` is responsible for sampling `logits` produced by
 /// a ``LanguageModel`` to produce a token.
@@ -191,9 +192,14 @@ public struct GenerateParameters: Sendable {
             checkpointBaseOffset + inputTokenCount
         }
 
+        var triCacheCount = 0
         for case let triAttentionCache as TriAttentionRuntimeCache in cache {
             triAttentionCache.configureProtectedPrefixOffset(protectedPrefixOffset)
+            triCacheCount += 1
         }
+        Logger(subsystem: "app.tesseract.agent", category: "triattention-runtime").info(
+            "configure-for-prefill mode=\(self.triAttention.prefixProtectionMode.rawValue, privacy: .public) stablePrefixOffset=\(self.triAttentionStablePrefixOffset ?? -1, privacy: .public) checkpointBaseOffset=\(self.checkpointBaseOffset, privacy: .public) inputTokenCount=\(inputTokenCount, privacy: .public) protectedPrefixOffset=\(protectedPrefixOffset ?? -1, privacy: .public) budget=\(self.triAttention.budgetTokens, privacy: .public) triCaches=\(triCacheCount, privacy: .public) totalCaches=\(cache.count, privacy: .public)"
+        )
     }
 
     public func sampler() -> LogitSampler {

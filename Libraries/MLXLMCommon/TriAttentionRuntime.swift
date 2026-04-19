@@ -1,5 +1,8 @@
 import Foundation
 import MLX
+import os
+
+private let triLog = Logger(subsystem: "app.tesseract.agent", category: "triattention-runtime")
 
 internal struct TriAttentionPreparedHeadStats {
     let qMeanReal: MLXArray
@@ -193,6 +196,12 @@ public enum TriAttentionQwen35Runtime {
             }
         let offsets = makeGeometricOffsets(maxLength: TriAttentionQwen35RuntimeState.offsetMaxLength)
 
+        let headsPerLayer = sampledHeadsByLayer
+            .keys.sorted()
+            .map { "\($0):\(sampledHeadsByLayer[$0]!.count)" }
+            .joined(separator: ",")
+        triLog.info("runtime-state-created attnHeads=\(attentionHeads, privacy: .public) kvHeads=\(kvHeads, privacy: .public) headDim=\(headDim, privacy: .public) freqCount=\(freqCount, privacy: .public) rotaryPairs=\(rotaryPairs, privacy: .public) ropeTheta=\(ropeTheta, privacy: .public) fullAttnLayers=\(fullAttentionLayerIndices.count, privacy: .public) sampledHeadTotal=\(preparedStats.count, privacy: .public) headsPerLayer=\(headsPerLayer, privacy: .public) budget=\(configuration.budgetTokens, privacy: .public) prefixProtection=\(configuration.prefixProtectionMode.rawValue, privacy: .public)")
+
         return TriAttentionQwen35RuntimeState(
             artifact: artifact,
             attentionHeads: attentionHeads,
@@ -245,6 +254,7 @@ public enum TriAttentionQwen35Runtime {
             !caches.isEmpty,
             caches.count == layerIndices.count
         else {
+            triLog.info("prune skip=empty-or-mismatch caches=\(caches.count, privacy: .public) layerIndices=\(layerIndices.count, privacy: .public)")
             return
         }
         let runtimeCaches = caches.compactMap { $0 as? TriAttentionRuntimeCache }
@@ -252,30 +262,52 @@ public enum TriAttentionQwen35Runtime {
             runtimeCaches.count == caches.count,
             let runtimeState = runtimeCaches.first?.runtimeState
         else {
+            let nonRuntime = caches.count - runtimeCaches.count
+            let hasRuntimeState = runtimeCaches.first?.runtimeState != nil
+            triLog.info("prune skip=no-runtime-cache nonRuntime=\(nonRuntime, privacy: .public) hasRuntimeState=\(hasRuntimeState, privacy: .public)")
             return
         }
 
         let threshold =
             runtimeCaches[0].configuration.budgetTokens + TriAttentionQwen35RuntimeState.divideLength
-        guard runtimeCaches[0].retainedTokenCount >= threshold else {
+        let retained = runtimeCaches[0].retainedTokenCount
+        let offset = runtimeCaches[0].offset
+        let budget = runtimeCaches[0].configuration.budgetTokens
+        let protectedOffset = runtimeCaches[0].protectedPrefixOffset ?? -1
+        guard retained >= threshold else {
+            triLog.debug("prune skip=below-threshold retained=\(retained, privacy: .public) threshold=\(threshold, privacy: .public) offset=\(offset, privacy: .public)")
             return
         }
 
+        triLog.info("prune enter retained=\(retained, privacy: .public) threshold=\(threshold, privacy: .public) budget=\(budget, privacy: .public) offset=\(offset, privacy: .public) protectedOffset=\(protectedOffset, privacy: .public) fullAttnLayers=\(runtimeCaches.count, privacy: .public)")
+
+        let t0 = CFAbsoluteTimeGetCurrent()
         let roundStart = runtimeCaches[0].offset
         let keepIndices = sharedPerHeadKeepIndices(
             caches: runtimeCaches,
             layerIndices: layerIndices,
             runtimeState: runtimeState,
-            budget: runtimeCaches[0].configuration.budgetTokens,
+            budget: budget,
             roundStart: roundStart
         )
+        let scoringMs = (CFAbsoluteTimeGetCurrent() - t0) * 1000.0
+
         guard let keepIndices else {
+            triLog.info("prune done result=no-indices scoringMs=\(String(format: "%.2f", scoringMs), privacy: .public)")
             return
         }
 
+        let t1 = CFAbsoluteTimeGetCurrent()
+        let keepCount = keepIndices.dim(-1)
         for cache in runtimeCaches {
             cache.applyKeepIndices(keepIndices)
         }
+        let applyMs = (CFAbsoluteTimeGetCurrent() - t1) * 1000.0
+        let totalMs = scoringMs + applyMs
+        let retainedAfter = runtimeCaches[0].retainedTokenCount
+        let dropped = retained - retainedAfter
+        let isNoOp = dropped == 0
+        triLog.info("prune done keepCount=\(keepCount, privacy: .public) retainedBefore=\(retained, privacy: .public) retainedAfter=\(retainedAfter, privacy: .public) dropped=\(dropped, privacy: .public) noop=\(isNoOp, privacy: .public) scoringMs=\(String(format: "%.2f", scoringMs), privacy: .public) applyMs=\(String(format: "%.2f", applyMs), privacy: .public) totalMs=\(String(format: "%.2f", totalMs), privacy: .public)")
     }
 
     private static func sharedPerHeadKeepIndices(
@@ -286,20 +318,29 @@ public enum TriAttentionQwen35Runtime {
         roundStart: Int
     ) -> MLXArray? {
         var perLayerScores: [MLXArray] = []
+        let scoreStart = CFAbsoluteTimeGetCurrent()
 
         for (cache, layerIndex) in zip(caches, layerIndices) {
+            let layerStart = CFAbsoluteTimeGetCurrent()
             guard let layerScores = layerScores(
                 cache: cache,
                 layerIndex: layerIndex,
                 runtimeState: runtimeState,
                 roundStart: roundStart
             ) else {
+                triLog.debug("layerScores skip layer=\(layerIndex, privacy: .public) retained=\(cache.retainedTokenCount, privacy: .public)")
                 continue
             }
             perLayerScores.append(layerScores)
+            let layerMs = (CFAbsoluteTimeGetCurrent() - layerStart) * 1000.0
+            let headCount = runtimeState.sampledHeadsByLayer[layerIndex]?.count ?? 0
+            triLog.debug("layerScores done layer=\(layerIndex, privacy: .public) retained=\(cache.retainedTokenCount, privacy: .public) heads=\(headCount, privacy: .public) tookMs=\(String(format: "%.2f", layerMs), privacy: .public)")
         }
 
+        let scoringMs = (CFAbsoluteTimeGetCurrent() - scoreStart) * 1000.0
+
         guard let firstLayerScores = perLayerScores.first else {
+            triLog.info("keep-compute no-scores perLayerScoresEmpty=true scoringMs=\(String(format: "%.2f", scoringMs), privacy: .public)")
             return nil
         }
 
@@ -312,10 +353,12 @@ public enum TriAttentionQwen35Runtime {
         }
 
         let tokenCount = aggregated.dim(1)
-        let keepCount = min(
-            tokenCount,
-            budget + protectedPrefixRetainedCount(cache: caches[0])
-        )
+        let protectedCount = protectedPrefixRetainedCount(cache: caches[0])
+        let unclampedKeep = budget + protectedCount
+        let keepCount = min(tokenCount, unclampedKeep)
+        let isNoOp = keepCount >= tokenCount
+        triLog.info("keep-compute tokenCount=\(tokenCount, privacy: .public) protected=\(protectedCount, privacy: .public) budget=\(budget, privacy: .public) unclampedKeep=\(unclampedKeep, privacy: .public) keepCount=\(keepCount, privacy: .public) noop=\(isNoOp, privacy: .public) scoredLayers=\(perLayerScores.count, privacy: .public) scoringMs=\(String(format: "%.2f", scoringMs), privacy: .public)")
+
         guard keepCount > 0 else {
             return MLXArray.zeros([runtimeState.kvHeads, 0], dtype: .int32)
         }
