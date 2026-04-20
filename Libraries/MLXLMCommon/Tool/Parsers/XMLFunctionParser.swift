@@ -33,6 +33,13 @@ public struct XMLFunctionParser: ToolCallParser, Sendable {
 
         var arguments: [String: any Sendable] = [:]
 
+        // Resolve the parameter config for this function once so we can look up
+        // full per-parameter schema (type / anyOf / oneOf / enum / ...) below.
+        // When `tools` is `nil` the config is empty, `extractTypesFromSchema`
+        // falls back to `["string"]`, and values pass through as strings —
+        // matching the Python reference's behavior when no schema is supplied.
+        let paramConfig = getParameterConfig(funcName: funcName, tools: tools)
+
         // Find all parameter tags
         var searchRange = paramSection.startIndex ..< paramSection.endIndex
         while let paramStart = paramSection.range(of: "<parameter=", range: searchRange) {
@@ -60,9 +67,15 @@ public struct XMLFunctionParser: ToolCallParser, Sendable {
                 paramValue = String(paramValue.dropLast())
             }
 
-            // Convert value based on schema type
-            arguments[paramName] = convertParameterValue(
-                paramValue, paramName: paramName, funcName: funcName, tools: tools)
+            // Schema-aware multi-type conversion. Handles `type: [...]`,
+            // `anyOf`/`oneOf`/`allOf`, enum-inferred types, and the
+            // `null`/`none`/`nil` sentinel — mirrors the MiniMax-M2 parser's
+            // contract. Without a schema (`paramSchema == nil`),
+            // `extractTypesFromSchema` returns `["string"]` so values are
+            // preserved verbatim.
+            let paramSchema = paramConfig[paramName] as? [String: any Sendable]
+            let paramTypes = extractTypesFromSchema(paramSchema)
+            arguments[paramName] = convertValueWithTypes(paramValue, types: paramTypes)
 
             searchRange = paramEnd.upperBound ..< paramSection.endIndex
         }

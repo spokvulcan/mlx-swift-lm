@@ -318,6 +318,233 @@ struct ToolTests {
         #expect(toolCall.function.arguments["enabled"] == .bool(true))
     }
 
+    @Test("Test XML Function Parser - Integer Parameter With Schema (regression: opencode 'timeout: number' bug)")
+    func testXMLFunctionParserIntegerWithSchema() throws {
+        let parser = XMLFunctionParser(startTag: "<tool_call>", endTag: "</tool_call>")
+        let tools: [[String: any Sendable]] = [
+            [
+                "function": [
+                    "name": "bash",
+                    "parameters": [
+                        "properties": [
+                            "command": ["type": "string"],
+                            "timeout": ["type": "integer"],
+                        ]
+                    ],
+                ] as [String: any Sendable]
+            ]
+        ]
+        let content = """
+            <function=bash>
+            <parameter=command>npm run build</parameter>
+            <parameter=timeout>120000</parameter>
+            </function>
+            """
+
+        let toolCall = try #require(parser.parse(content: content, tools: tools))
+
+        #expect(toolCall.function.arguments["command"] == .string("npm run build"))
+        // Before this fix the value would have been `.string("120000")`.
+        #expect(toolCall.function.arguments["timeout"] == .int(120000))
+    }
+
+    @Test("Test XML Function Parser - Array Parameter With Schema (regression: opencode 'todos: array' bug)")
+    func testXMLFunctionParserArrayWithSchema() throws {
+        let parser = XMLFunctionParser(startTag: "<tool_call>", endTag: "</tool_call>")
+        let tools: [[String: any Sendable]] = [
+            [
+                "function": [
+                    "name": "todowrite",
+                    "parameters": [
+                        "properties": [
+                            "todos": ["type": "array"]
+                        ]
+                    ],
+                ] as [String: any Sendable]
+            ]
+        ]
+        let content = """
+            <function=todowrite>
+            <parameter=todos>[{"content": "step one", "priority": "high"}, {"content": "step two", "priority": "low"}]</parameter>
+            </function>
+            """
+
+        let toolCall = try #require(parser.parse(content: content, tools: tools))
+
+        let expected: JSONValue = .array([
+            .object([
+                "content": .string("step one"),
+                "priority": .string("high"),
+            ]),
+            .object([
+                "content": .string("step two"),
+                "priority": .string("low"),
+            ]),
+        ])
+        // Before this fix this came through as
+        // `.string("[{\"content\": \"step one\", …}]")`.
+        #expect(toolCall.function.arguments["todos"] == expected)
+    }
+
+    @Test("Test XML Function Parser - No Schema Leaves Numeric Value As String (no-regression guard)")
+    func testXMLFunctionParserStringStaysStringWithoutSchema() throws {
+        let parser = XMLFunctionParser(startTag: "<tool_call>", endTag: "</tool_call>")
+        let content =
+            "<function=bash><parameter=timeout>120000</parameter></function>"
+
+        let toolCall = try #require(parser.parse(content: content, tools: nil))
+
+        // When no schema is supplied, every value passes through as a string —
+        // matches the pre-fix behavior and the Python reference.
+        #expect(toolCall.function.arguments["timeout"] == .string("120000"))
+    }
+
+    @Test("Test XML Function Parser - 'null' Sentinel Under Non-String Schema")
+    func testXMLFunctionParserNullSentinel() throws {
+        let parser = XMLFunctionParser(startTag: "<tool_call>", endTag: "</tool_call>")
+        let tools: [[String: any Sendable]] = [
+            [
+                "function": [
+                    "name": "foo",
+                    "parameters": [
+                        "properties": [
+                            "x": ["type": "integer"]
+                        ]
+                    ],
+                ] as [String: any Sendable]
+            ]
+        ]
+        let content = "<function=foo><parameter=x>null</parameter></function>"
+
+        let toolCall = try #require(parser.parse(content: content, tools: tools))
+
+        // `convertValueWithTypes` short-circuits `null` / `none` / `nil`
+        // sentinels to a real null before attempting type coercion.
+        #expect(toolCall.function.arguments["x"] == .null)
+    }
+
+    @Test("Test XML Function Parser - anyOf Nullable Integer Schema")
+    func testXMLFunctionParserAnyOfNullable() throws {
+        let parser = XMLFunctionParser(startTag: "<tool_call>", endTag: "</tool_call>")
+        let tools: [[String: any Sendable]] = [
+            [
+                "function": [
+                    "name": "foo",
+                    "parameters": [
+                        "properties": [
+                            "x": [
+                                "anyOf": [
+                                    ["type": "integer"],
+                                    ["type": "null"],
+                                ]
+                            ]
+                        ]
+                    ],
+                ] as [String: any Sendable]
+            ]
+        ]
+        let content = "<function=foo><parameter=x>5</parameter></function>"
+
+        let toolCall = try #require(parser.parse(content: content, tools: tools))
+
+        #expect(toolCall.function.arguments["x"] == .int(5))
+    }
+
+    @Test("Test XML Function Parser - type: [integer, null] Array Schema")
+    func testXMLFunctionParserTypeArrayNullable() throws {
+        let parser = XMLFunctionParser(startTag: "<tool_call>", endTag: "</tool_call>")
+        let tools: [[String: any Sendable]] = [
+            [
+                "function": [
+                    "name": "foo",
+                    "parameters": [
+                        "properties": [
+                            "x": ["type": ["integer", "null"]]
+                        ]
+                    ],
+                ] as [String: any Sendable]
+            ]
+        ]
+        let content = "<function=foo><parameter=x>5</parameter></function>"
+
+        let toolCall = try #require(parser.parse(content: content, tools: tools))
+
+        #expect(toolCall.function.arguments["x"] == .int(5))
+    }
+
+    @Test("Test ToolCallProcessor - Forwards Schema To XML Parser End-To-End")
+    func testToolCallProcessorForwardsToolsToXMLFunctionParser() throws {
+        // Behavioral plumbing check: once the schema is threaded into
+        // `ToolCallProcessor`, a tagged `<tool_call>…</tool_call>` stream
+        // emerges as a `ToolCall` with properly-typed arguments. This is the
+        // end-to-end contract that `TextToolTokenLoopHandler.init(tools:)`
+        // (private, file-scoped in Evaluate.swift) relies on — if this ever
+        // regresses, every generation path loses schema-aware typing.
+        let tools: [[String: any Sendable]] = [
+            [
+                "function": [
+                    "name": "set_timeout",
+                    "parameters": [
+                        "properties": [
+                            "ms": ["type": "integer"]
+                        ]
+                    ],
+                ] as [String: any Sendable]
+            ]
+        ]
+        let processor = ToolCallProcessor(format: .xmlFunction, tools: tools)
+
+        // Feed the full tagged tool-call as one chunk; processor buffers until
+        // `</tool_call>` and then emits the typed ToolCall.
+        _ = processor.processChunk(
+            "<tool_call><function=set_timeout><parameter=ms>120000</parameter></function></tool_call>"
+        )
+
+        let call = try #require(processor.toolCalls.first)
+        #expect(call.function.name == "set_timeout")
+        #expect(call.function.arguments["ms"] == .int(120000))
+    }
+
+    @Test("Test ToolCallProcessor - Nil Tools Preserves String Values")
+    func testToolCallProcessorNilToolsPreservesStrings() throws {
+        // Pair with the above test: confirm that when the handler is built
+        // without a schema the processor still works but returns string-typed
+        // values (the pre-fix behavior). If this starts returning `.int(120000)`
+        // without a schema, something in the conversion path is guessing types.
+        let processor = ToolCallProcessor(format: .xmlFunction, tools: nil)
+
+        _ = processor.processChunk(
+            "<tool_call><function=set_timeout><parameter=ms>120000</parameter></function></tool_call>"
+        )
+
+        let call = try #require(processor.toolCalls.first)
+        #expect(call.function.arguments["ms"] == .string("120000"))
+    }
+
+    @Test("Test XML Function Parser - Enum-Inferred Integer Type")
+    func testXMLFunctionParserEnumInference() throws {
+        let parser = XMLFunctionParser(startTag: "<tool_call>", endTag: "</tool_call>")
+        let tools: [[String: any Sendable]] = [
+            [
+                "function": [
+                    "name": "foo",
+                    "parameters": [
+                        "properties": [
+                            "x": ["enum": [1, 2, 3]]
+                        ]
+                    ],
+                ] as [String: any Sendable]
+            ]
+        ]
+        let content = "<function=foo><parameter=x>2</parameter></function>"
+
+        let toolCall = try #require(parser.parse(content: content, tools: tools))
+
+        // No explicit `type` field — the integer type is inferred from the
+        // enum values by `extractTypesFromSchema`.
+        #expect(toolCall.function.arguments["x"] == .int(2))
+    }
+
     @Test("Test XML Function Parser - Multiline Content (Qwen3.5 style)")
     func testXMLFunctionParserMultiline() throws {
         let parser = XMLFunctionParser(startTag: "<tool_call>", endTag: "</tool_call>")
