@@ -626,20 +626,6 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
             }
         }
 
-        // Split pre-fused in_proj_ba → in_proj_b + in_proj_a
-        // (PARO checkpoints store these as a single fused key)
-        for k in Array(weights.keys) where k.hasSuffix(".in_proj_ba.weight") {
-            let prefix = String(k.dropLast(".in_proj_ba.weight".count))
-            guard weights["\(prefix).in_proj_b.weight"] == nil else { continue }
-            for suffix in [".weight", ".scales", ".biases", ".bias"] {
-                let baKey = "\(prefix).in_proj_ba\(suffix)"
-                guard let baVal = weights.removeValue(forKey: baKey) else { continue }
-                let half = baVal.dim(0) / 2
-                weights["\(prefix).in_proj_b\(suffix)"] = baVal[0 ..< half]
-                weights["\(prefix).in_proj_a\(suffix)"] = baVal[half...]
-            }
-        }
-
         return weights
     }
 }
