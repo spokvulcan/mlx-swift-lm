@@ -58,24 +58,26 @@ private enum AWQ {
     static let bits = 4
     static let packFactor = 32 / bits  // 8 values per uint32
     static let mask: Int32 = (1 << bits) - 1
-    static let shifts: [Int32] = (0 ..< 8).map { Int32($0 * bits) }
     /// Inverse of AutoAWQ reorder [0,2,4,6,1,3,5,7] → [0,4,1,5,2,6,3,7]
     static let inverseReorder = [0, 4, 1, 5, 2, 6, 3, 7]
-
-    // Pre-computed MLXArrays (created once, reused across calls)
-    nonisolated(unsafe) static let shiftsArray = MLXArray(shifts.map { Int64($0) }).reshaped(
-        1, 1, 8)
-    nonisolated(unsafe) static let reorderIndices = MLXArray(inverseReorder.map { Int32($0) })
 }
 
 /// Unpack AutoAWQ int32 → raw uint8 values, undoing the [0,2,4,6,1,3,5,7] reorder.
+///
+/// The shift table and reorder indices are rebuilt per call rather than cached
+/// as module-level statics — they're tiny (8 × 8 bytes) and only touched at
+/// model load time, so caching bought nothing and only created thread-safety
+/// concerns around unevaluated `MLXArray`s (PR #164 review comment C2).
 private func unpackAndReorder(_ packed: MLXArray) -> MLXArray {
     let rows = packed.dim(0)
     let cols = packed.dim(1)
 
+    let shifts = MLXArray((0 ..< 8).map { Int64($0 * AWQ.bits) }).reshaped(1, 1, 8)
+    let reorderIndices = MLXArray(AWQ.inverseReorder.map { Int32($0) })
+
     let expanded = packed.asType(.int64).expandedDimensions(axis: 2)
-    let raw = ((expanded >> AWQ.shiftsArray) & Int64(AWQ.mask)).asType(.uint8)
-    let reordered = raw.take(AWQ.reorderIndices, axis: 2)
+    let raw = ((expanded >> shifts) & Int64(AWQ.mask)).asType(.uint8)
+    let reordered = raw.take(reorderIndices, axis: 2)
 
     return reordered.reshaped(rows, cols * 8)
 }
