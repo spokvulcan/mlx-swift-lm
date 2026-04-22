@@ -83,24 +83,30 @@ nonisolated private func metalSource(
 
 // MARK: - Kernel Cache
 
-/// Cached compiled Metal kernels keyed by tile size.
-/// `nonisolated(unsafe)` — kernel creation is idempotent (same tile size always produces
-/// the same compiled kernel), so concurrent stores are benign. Same pattern as
-/// `GatedDeltaKernelManager` in the existing codebase.
+/// Cached compiled Metal kernels keyed by tile size, guarded by `kernelCacheLock`.
+/// Callers are multi-threaded (each `ModelContainer.perform` closure can run on its
+/// own task), so the dictionary read-modify-write is serialised. Contention is
+/// practically nil — only two tile sizes (1 and 4) are ever requested, so the lock
+/// is contended exactly twice per process before steady-state hits.
 nonisolated(unsafe) private var kernelCache: [Int: MLXFast.MLXFastKernel] = [:]
+private let kernelCacheLock = NSLock()
 
 nonisolated private func getRotationKernel(tile: Int) -> MLXFast.MLXFastKernel {
-    if let cached = kernelCache[tile] {
-        return cached
+    kernelCacheLock.withLock {
+        if let cached = kernelCache[tile] {
+            return cached
+        }
+        let kernel = MLXFast.metalKernel(
+            name: "paro_rotate_r\(tile)",
+            inputNames: [
+                "x", "packed_pairs", "cos_theta", "sin_theta", "channel_scales", "params",
+            ],
+            outputNames: ["out"],
+            source: metalSource(rowsPerTile: tile)
+        )
+        kernelCache[tile] = kernel
+        return kernel
     }
-    let kernel = MLXFast.metalKernel(
-        name: "paro_rotate_r\(tile)",
-        inputNames: ["x", "packed_pairs", "cos_theta", "sin_theta", "channel_scales", "params"],
-        outputNames: ["out"],
-        source: metalSource(rowsPerTile: tile)
-    )
-    kernelCache[tile] = kernel
-    return kernel
 }
 
 // MARK: - Pair Packing
