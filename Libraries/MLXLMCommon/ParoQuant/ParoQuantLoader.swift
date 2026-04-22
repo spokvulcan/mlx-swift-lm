@@ -94,6 +94,28 @@ private func packMLX(_ w: MLXArray) -> MLXArray {
     return packed
 }
 
+/// Split pre-fused `in_proj_ba` tensors back into separate `in_proj_b` / `in_proj_a`
+/// entries. PARO and some AutoAWQ-Mamba checkpoints concatenate the B and A
+/// projections along the output axis before quantising; the architecture code
+/// (e.g. `Qwen35TextModel`) expects them as distinct projections. Runs before
+/// model-specific `sanitize` so downstream layers see the standard layout.
+///
+/// No-op for keys that don't exist (non-Mamba PARO checkpoints) and for keys
+/// that already have an `in_proj_b` entry (idempotent on repeat calls).
+private func splitFusedMambaProjections(_ weights: inout [String: MLXArray]) {
+    for k in Array(weights.keys) where k.hasSuffix(".in_proj_ba.weight") {
+        let prefix = String(k.dropLast(".in_proj_ba.weight".count))
+        guard weights["\(prefix).in_proj_b.weight"] == nil else { continue }
+        for suffix in [".weight", ".scales", ".biases", ".bias"] {
+            let baKey = "\(prefix).in_proj_ba\(suffix)"
+            guard let baVal = weights.removeValue(forKey: baKey) else { continue }
+            let half = baVal.dim(0) / 2
+            weights["\(prefix).in_proj_b\(suffix)"] = baVal[0 ..< half]
+            weights["\(prefix).in_proj_a\(suffix)"] = baVal[half...]
+        }
+    }
+}
+
 /// Convert AutoAWQ checkpoint weights to MLX quantized format in-place.
 private func convertAutoAWQ(
     _ weights: inout [String: MLXArray], groupSize: Int
@@ -395,6 +417,12 @@ public func loadParoQuantModel(
         convertAutoAWQ(&weights, groupSize: paroConfig.groupSize)
         logger.info("Converted AutoAWQ weights to MLX format")
     }
+
+    // 6b. Split fused Mamba `in_proj_ba` into `in_proj_b` / `in_proj_a`.
+    //     PARO-specific layout detail, so it lives here rather than in the
+    //     generic Qwen35 sanitize. Runs before `model.sanitize` so downstream
+    //     layers see the already-split keys.
+    splitFusedMambaProjections(&weights)
 
     // 7. Model-specific sanitization
     weights = model.sanitize(weights: weights)
