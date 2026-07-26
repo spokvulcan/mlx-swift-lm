@@ -58,7 +58,31 @@ let package = Package(
         .default(enabledTraits: ["FoundationModelsIntegration"]),
     ],
     dependencies: [
-        .package(url: "https://github.com/ml-explore/mlx-swift", .upToNextMinor(from: "0.31.6")),
+        // Exact-revision pin on the spokvulcan/mlx-swift fork, branch
+        // pin-tesseract: 457a0d6d = ml-explore/mlx-swift 0bb916c (the 0.31.6
+        // tag) + the .gitmodules provenance commit + the Cmlx gitlink bumps
+        // carrying the accepted mlx-core experiments (C1 tiles, C4 commit
+        // accounting, C5 retention coalescing, C6 custom-kernel source memo,
+        // C7 commit-policy override + GPU.setCommitLimits, C8 eval_impl flat
+        // degree map, C9 gather identity-index cache, C13 fused
+        // causal-mask+softmax) at gitlink a3673067.
+        //
+        // mlx-core stays at v0.31.1 here. The branch
+        // pin-tesseract-2026-07-27 (mlx-swift 708a5142 / mlx e9d788fe) carries
+        // a working port to upstream mlx main, but mlx >= v0.32 makes command
+        // encoders thread-local and mlx-c exposes no
+        // new_thread_unsafe_stream binding, so a process-wide Stream used
+        // across Swift-concurrency threads throws "There is no Stream(gpu, 0)
+        // in current thread". See tesseract docs/mlx-core-fork.md.
+        //
+        // The pin must match the tesseract app's other vendored packages
+        // (mlx-audio-swift, tesseract-speech) exactly — SwiftPM cannot mix two
+        // different revision-based requirements for the same package in one
+        // graph, so every pin moves in lockstep. Scheme: tesseract
+        // docs/mlx-core-fork.md.
+        .package(
+            url: "https://github.com/spokvulcan/mlx-swift",
+            revision: "457a0d6df3a20c92341a6e7b7fa853d63d8549f9"),
         // 602.0.0 floor: swift.org publishes signed prebuilt swift-syntax artifacts only for
         // >= 602 tags on current toolchains; a 600.x/601.x resolution falls back to the full
         // source compile of swift-syntax.
