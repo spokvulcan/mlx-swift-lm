@@ -72,6 +72,21 @@ public enum TokenizerError: LocalizedError {
     }
 }
 
+/// A ``Tokenizer`` that can render its chat template to text without
+/// tokenizing — the render half of `applyChatTemplate`, exposed so callers can
+/// split render from encode (e.g. to tokenize only a verified suffix of a
+/// previously rendered prompt).
+///
+/// For any conforming tokenizer and input, `applyChatTemplate` must produce
+/// exactly `encode(text: renderChatTemplate(...), addSpecialTokens: false)`.
+public protocol ChatTemplateRendering: Tokenizer {
+    func renderChatTemplate(
+        messages: [[String: any Sendable]],
+        tools: [[String: any Sendable]]?,
+        additionalContext: [String: any Sendable]?
+    ) throws -> String
+}
+
 /// Decodes one generated sequence. Preserve special tokens for downstream protocol parsing.
 /// `next()` returns available text, or nil until more tokens arrive. Custom implementations
 /// should emit stable text, holding incomplete bytes or context-dependent suffixes as needed.
