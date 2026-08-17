@@ -1204,11 +1204,19 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
     }
 
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
-        let hasMTPWeights = weights.keys.contains { $0.contains("mtp.") }
+        // Raw-HF checkpoints store RMSNorm weights zero-centered (the HF
+        // module computes `(1 + w) * x̂`) and conv1d as `[out, 1, kernel]`;
+        // MLX-converted checkpoints ship both pre-sanitized. The conv1d
+        // layout is the direct observation of which convention the file
+        // uses. MTP-head presence is NOT a reliable proxy: it held for
+        // official releases (raw, ship mtp) vs community quants (sanitized,
+        // strip mtp), but a quantized checkpoint with an `mtp.*` head
+        // grafted in from an official shard would get its already-shifted
+        // norms shifted a second time.
         let hasUnsanitizedConv1d = weights.contains { key, value in
             key.contains("conv1d.weight") && value.dim(-1) != 1
         }
-        let shouldShiftNormWeights = hasMTPWeights || hasUnsanitizedConv1d
+        let shouldShiftNormWeights = hasUnsanitizedConv1d
 
         var weights = weights.filter { !$0.key.contains("mtp.") }
 

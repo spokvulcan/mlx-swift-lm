@@ -1330,11 +1330,15 @@ public class Qwen35: Module, VLMModel {
         // conversion time and must NOT be shifted again — doing so double-shifts
         // every layernorm and produces garbage tokens. Computed on the incoming
         // weights, before the `mtp.` filter below.
-        let hasMTPWeights = weights.keys.contains { $0.contains("mtp.") }
+        // MTP-head presence is NOT part of the signal: it held for official
+        // releases (raw, ship mtp) vs community quants (sanitized, strip
+        // mtp), but a quantized checkpoint with an `mtp.*` head grafted in
+        // from an official shard would get its already-shifted norms shifted
+        // a second time. The conv1d layout alone is the direct observation.
         let hasUnsanitizedConv1d = weights.contains { key, value in
             key.contains("conv1d.weight") && value.dim(-1) != 1
         }
-        let shouldShiftNormWeights = hasMTPWeights || hasUnsanitizedConv1d
+        let shouldShiftNormWeights = hasUnsanitizedConv1d
 
         var weights = weights.filter { !$0.key.contains("mtp.") }
 
