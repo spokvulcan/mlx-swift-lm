@@ -59,13 +59,11 @@ let package = Package(
     ],
     dependencies: [
         // Exact-revision pin on the spokvulcan/mlx-swift fork, branch
-        // pin-tesseract: 457a0d6d = ml-explore/mlx-swift 0bb916c (the 0.31.6
-        // tag) + the .gitmodules provenance commit + the Cmlx gitlink bumps
-        // carrying the accepted mlx-core experiments (C1 tiles, C4 commit
-        // accounting, C5 retention coalescing, C6 custom-kernel source memo,
-        // C7 commit-policy override + GPU.setCommitLimits, C8 eval_impl flat
-        // degree map, C9 gather identity-index cache, C13 fused
-        // causal-mask+softmax) at gitlink a3673067.
+        // pin-tesseract: 2110380 = 457a0d6d (ml-explore/mlx-swift 0bb916c, the
+        // 0.31.6 tag + provenance + C1/C4–C9/C13 gitlink bumps) + the Cmlx
+        // gitlink bump carrying the qmv_wide small-batch quantized matvec
+        // backport (upstream mlx#3764, mlx gitlink 452aecadd) — the DFlash2
+        // verify-pass fix (tesseract benchmarks/experiments-ledger.md K1–K4).
         //
         // mlx-core stays at v0.31.1 here. The branch
         // pin-tesseract-2026-07-27 (mlx-swift 708a5142 / mlx e9d788fe) carries
@@ -82,7 +80,7 @@ let package = Package(
         // docs/mlx-core-fork.md.
         .package(
             url: "https://github.com/spokvulcan/mlx-swift",
-            revision: "457a0d6df3a20c92341a6e7b7fa853d63d8549f9"),
+            revision: "211038040d4bb5fb881ab08bea3ae4875c59a410"),
         // 602.0.0 floor: swift.org publishes signed prebuilt swift-syntax artifacts only for
         // >= 602 tags on current toolchains; a 600.x/601.x resolution falls back to the full
         // source compile of swift-syntax.
