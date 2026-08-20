@@ -340,13 +340,14 @@ final class Qwen35GatedDeltaNet: Module {
         _ inputs: MLXArray,
         mask: MLXArray? = nil,
         cache: MambaCache? = nil,
-        checkpointAfter: Int? = nil
+        checkpointAfter: Int? = nil,
+        capture: GDNCaptureContext? = nil
     ) -> MLXArray {
         let convState =
             cache?[0] ?? zeroStates(batch: inputs.dim(0), dtype: inputs.dtype).conv
         let (out, newConvState, newRecState, checkpoint) = forward(
             inputs, convState: convState, recState: cache?[1], mask: mask,
-            checkpointAfter: checkpointAfter)
+            checkpointAfter: checkpointAfter, capture: capture)
         if let cache {
             cache[0] = newConvState
             cache[1] = newRecState
@@ -378,7 +379,8 @@ final class Qwen35GatedDeltaNet: Module {
         convState: MLXArray,
         recState: MLXArray?,
         mask: MLXArray?,
-        checkpointAfter: Int? = nil
+        checkpointAfter: Int? = nil,
+        capture: GDNCaptureContext? = nil
     ) -> (
         output: MLXArray,
         convState: MLXArray,
@@ -418,6 +420,18 @@ final class Qwen35GatedDeltaNet: Module {
         let kNormed =
             MLXArray(invScale).asType(dtype)
             * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
+
+        // DFlash2 verify passes record everything a prefix-replay rollback
+        // needs (see rollbackSpeculativeHybridCaches in MLXLMCommon).
+        if let capture {
+            capture.record(
+                GDNCapture(
+                    convInput: concatenated([convState, qkv], axis: 1),
+                    q: qNormed, k: kNormed, v: v, a: a, b: b,
+                    aLog: aLog, dtBias: dtBias,
+                    initialState: recState, mask: mask,
+                    convKernelSize: convKernelSize))
+        }
 
         let out: MLXArray
         let newRecState: MLXArray
@@ -474,6 +488,55 @@ final class Qwen35GatedDeltaNet: Module {
 
         let gated = norm(out, gate: z)
         return (outProj(gated.reshaped(B, S, -1)), newConvState, newRecState, checkpoint)
+    }
+
+    /// The DFlash2 verify-pass body: the same arithmetic as `forward`'s
+    /// general branch (S > 1, no mask, no checkpoint), additionally returning
+    /// the intermediates a prefix-replay rollback consumes (see `GDNCapture`)
+    /// so the pass can live inside a compiled trace — a trace cannot call the
+    /// `GDNCaptureContext.record` closure, so the pieces ride out as outputs.
+    func verifyForward(
+        _ x: MLXArray, convState: MLXArray, recState: MLXArray
+    ) -> (
+        output: MLXArray, convState: MLXArray, recurrentState: MLXArray,
+        convInput: MLXArray, q: MLXArray, k: MLXArray, v: MLXArray,
+        a: MLXArray, b: MLXArray
+    ) {
+        let B = x.dim(0)
+        let S = x.dim(1)
+
+        let qkv = inProjQKV(x)
+        let z = inProjZ(x).reshaped(B, S, numVHeads, headVDim)
+        let b = inProjB(x)
+        let a = inProjA(x)
+
+        let convInput = concatenated([convState, qkv], axis: 1)
+        let (convPre, newConvState) = generalConv(convState: convState, qkv: qkv)
+        let convOut = silu(convPre)
+
+        let convSplit = MLX.split(convOut, indices: [keyDim, 2 * keyDim], axis: -1)
+        let q = convSplit[0].reshaped(B, S, numKHeads, headKDim)
+        let k = convSplit[1].reshaped(B, S, numKHeads, headKDim)
+        let v = convSplit[2].reshaped(B, S, numVHeads, headVDim)
+
+        let dtype = q.dtype
+        let invScale = pow(Float(headKDim), -0.5)
+        let qNormed =
+            MLXArray(pow(invScale, 2)).asType(dtype)
+            * MLXFast.rmsNorm(q, weight: MLXArray.mlxNone, eps: 1e-6)
+        let kNormed =
+            MLXArray(invScale).asType(dtype)
+            * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
+
+        let (out, newRecState) = gatedDeltaUpdate(
+            q: qNormed, k: kNormed, v: v, a: a, b: b,
+            aLog: aLog, dtBias: dtBias, state: recState, mask: nil)
+
+        let gated = norm(out, gate: z)
+        return (
+            outProj(gated.reshaped(B, S, -1)), newConvState, newRecState,
+            convInput, qNormed, kNormed, v, a, b
+        )
     }
 
     /// The S == 1 depthwise conv as elementwise multiply-adds, so `compile`
@@ -758,12 +821,14 @@ final class Qwen35DecoderLayer: Module {
         ssmMask: MLXArray?,
         cache: KVCache?,
         positionOffset: Int? = nil,
-        checkpointAfter: Int? = nil
+        checkpointAfter: Int? = nil,
+        gdnCapture: GDNCaptureContext? = nil
     ) -> MLXArray {
         // Single-token unmasked decode runs the layer as one traced function
         // (two for full attention, split at the KV write). Everything else
-        // takes the general body below.
-        if x.dim(1) == 1, ssmMask == nil {
+        // takes the general body below. Capture requests (DFlash2 verify
+        // passes) take the general body too — the traced path cannot record.
+        if x.dim(1) == 1, ssmMask == nil, gdnCapture == nil {
             if isLinear, let mambaCache = cache as? MambaCache {
                 return decodeLinearLayer(x, cache: mambaCache)
             }
@@ -776,7 +841,7 @@ final class Qwen35DecoderLayer: Module {
         if isLinear {
             r = linearAttn!(
                 inputLayerNorm(x), mask: ssmMask, cache: cache as? MambaCache,
-                checkpointAfter: checkpointAfter)
+                checkpointAfter: checkpointAfter, capture: gdnCapture)
         } else {
             r = selfAttn!(
                 inputLayerNorm(x), mask: attentionMask, cache: cache,
@@ -879,6 +944,22 @@ final class Qwen35DecoderLayer: Module {
         return (h + mlpForward(postAttentionLayerNorm(h)), newConvState, newRecState)
     }
 
+    /// The verify-pass linear-layer body: `linearLayerBody` plus the rollback
+    /// capture pieces (see `Qwen35GatedDeltaNet.verifyForward`).
+    func linearLayerVerifyBody(x: MLXArray, convState: MLXArray, recState: MLXArray) -> (
+        out: MLXArray, convState: MLXArray, recState: MLXArray,
+        convInput: MLXArray, q: MLXArray, k: MLXArray, v: MLXArray,
+        a: MLXArray, b: MLXArray
+    ) {
+        let t = linearAttn!.verifyForward(
+            inputLayerNorm(x), convState: convState, recState: recState)
+        let h = x + t.output
+        return (
+            h + mlpForward(postAttentionLayerNorm(h)),
+            t.convState, t.recurrentState, t.convInput, t.q, t.k, t.v, t.a, t.b
+        )
+    }
+
     func attentionPreBody(x: MLXArray) -> (MLXArray, MLXArray, MLXArray, MLXArray) {
         selfAttn!.projectPreRope(inputLayerNorm(x))
     }
@@ -947,10 +1028,27 @@ public class Qwen35TextModelInner: Module {
         _ inputs: MLXArray,
         cache: [KVCache?]? = nil,
         applyFinalNorm: Bool,
-        checkpointAfter: Int? = nil
+        checkpointAfter: Int? = nil,
+        captureLayers: Set<Int>? = nil,
+        captureBox: DFlash2HiddenCaptureBox? = nil,
+        gdnCapture: GDNCaptureContext? = nil
     ) -> MLXArray {
         if applyFinalNorm, inputs.dim(1) == 1, let caches = cache,
+            captureBox == nil, gdnCapture == nil,
             let step = decodeStep(inputs, caches)
+        {
+            return step
+        }
+
+        // DFlash2 verify pass (S > 1 with both capture requests): the
+        // compiled verify segments; the general path below takes over when
+        // ineligible and records the captures itself.
+        if !applyFinalNorm, inputs.dim(1) > 1, let caches = cache,
+            checkpointAfter == nil,
+            let captureLayerSet = captureLayers, let captureBox, let gdnCapture,
+            let step = verifyStep(
+                inputs, caches, captureLayers: captureLayerSet,
+                captureBox: captureBox, gdnCapture: gdnCapture)
         {
             return step
         }
@@ -972,7 +1070,10 @@ public class Qwen35TextModelInner: Module {
                 ? MLXFast.ScaledDotProductAttentionMaskMode.none : faMask
             hiddenStates = layer(
                 hiddenStates, attentionMask: attnMask, ssmMask: mask, cache: cacheArray?[i],
-                checkpointAfter: checkpointAfter)
+                checkpointAfter: checkpointAfter, gdnCapture: gdnCapture)
+            if let captureBox, captureLayers?.contains(i) == true {
+                captureBox.store(layer: i, hidden: hiddenStates)
+            }
         }
 
         return applyFinalNorm ? norm(hiddenStates) : hiddenStates
@@ -1125,6 +1226,207 @@ public class Qwen35TextModelInner: Module {
 
         return carry
     }
+
+    // MARK: - Compiled verify segments (DFlash2)
+
+    private struct VerifySegmentKey: Hashable {
+        var segmentIndex: Int
+        var sequenceLength: Int
+        var captureLayers: [Int]  // sorted
+    }
+
+    // Lock rationale: see Qwen35SparseMoeBlock.compileLock (shares compileLock).
+    private var compiledVerifySegments: [VerifySegmentKey: ([MLXArray]) -> [MLXArray]] = [:]
+
+    /// Eager-fallback escape hatch for A/B benching (`DFLASH2_VERIFY=eager`).
+    private static var verifyCompiledDisabled: Bool {
+        ProcessInfo.processInfo.environment["DFLASH2_VERIFY"] == "eager"
+    }
+
+    /// One traced piece of a verify pass, mirroring `segmentBody` with two
+    /// additions: every GDN layer also emits its rollback capture pieces (a
+    /// trace cannot call `GDNCaptureContext.record`), and layers in
+    /// `captureLayers` emit their residual-stream outputs. Output layout:
+    /// `[x]`, then 8 arrays per GDN layer (`newConvState, newRecState`,
+    /// `convInput, q, k, v, a, b`), then one array per captured layer
+    /// (opening attention tail first, then GDN layers in order), then the
+    /// `[queries, gate, keys, values]` head when closing with an attention
+    /// layer. The final segment does NOT apply the final norm — the capture
+    /// path's caller does.
+    private func verifySegmentBody(
+        at index: Int, captureLayers: Set<Int>, _ args: [MLXArray]
+    ) -> [MLXArray] {
+        let segment = decodeSegments[index]
+        var hiddenStates = index == 0 ? embedTokens(args[0]) : args[0]
+        var captures: [MLXArray] = []
+
+        if let post = segment.attentionPostLayer {
+            hiddenStates = layers[post].attentionPostBody(
+                x: hiddenStates, attention: args[1], gate: args[2])
+            if captureLayers.contains(post) { captures.append(hiddenStates) }
+        }
+
+        var states: [MLXArray] = []
+        for (i, layerIndex) in segment.linearLayers.enumerated() {
+            let slot = segment.stateInputOffset + 2 * i
+            let t = layers[layerIndex].linearLayerVerifyBody(
+                x: hiddenStates, convState: args[slot], recState: args[slot + 1])
+            hiddenStates = t.out
+            states.append(t.convState)
+            states.append(t.recState)
+            states.append(t.convInput)
+            states.append(t.q)
+            states.append(t.k)
+            states.append(t.v)
+            states.append(t.a)
+            states.append(t.b)
+            if captureLayers.contains(layerIndex) { captures.append(hiddenStates) }
+        }
+
+        var outputs = [hiddenStates] + states + captures
+        if let pre = segment.attentionPreLayer {
+            let (queries, gate, keys, values) = layers[pre].attentionPreBody(x: hiddenStates)
+            outputs += [queries, gate, keys, values]
+        }
+        return outputs
+    }
+
+    private func verifyCaptureCount(_ segment: DecodeSegment, captureLayers: Set<Int>) -> Int {
+        var count = 0
+        if let post = segment.attentionPostLayer, captureLayers.contains(post) { count += 1 }
+        for layerIndex in segment.linearLayers where captureLayers.contains(layerIndex) {
+            count += 1
+        }
+        return count
+    }
+
+    /// Compiled DFlash2 verify pass over S > 1 rows, or nil when the general
+    /// path must take it (odd cache kinds, masks, out-of-range capture ids,
+    /// or the eager escape hatch). Mirrors `decodeStep`: traces split at each
+    /// full-attention KV write; rope/KV append/SDPA stay eager between
+    /// segments. GDN state writes land only after the whole pass, from the
+    /// trace outputs; those same outputs fill the rollback captures, so
+    /// `rollbackSpeculativeHybridCaches` works unchanged. Every layer index
+    /// in `0 ..< layers.count` is served by exactly one segment (an attention
+    /// layer's completed output is the next segment's opening tail), so the
+    /// range check up front makes the reassembly total.
+    private func verifyStep(
+        _ inputs: MLXArray, _ cache: [KVCache?],
+        captureLayers: Set<Int>, captureBox: DFlash2HiddenCaptureBox,
+        gdnCapture: GDNCaptureContext
+    ) -> MLXArray? {
+        let S = inputs.dim(1)
+        guard S > 1, cache.count == layers.count, !Self.verifyCompiledDisabled else {
+            return nil
+        }
+        guard captureLayers.allSatisfy({ $0 >= 0 && $0 < layers.count }) else { return nil }
+        if createSSMMask(h: inputs, cache: cache[ssmIdx] as? MambaCache) != nil {
+            return nil
+        }
+        guard let faCache = cache[faIdx] else { return nil }
+        let faMask = createAttentionMask(h: inputs, cache: faCache)
+
+        var mambaCaches = [MambaCache?](repeating: nil, count: layers.count)
+        for (i, layer) in layers.enumerated() {
+            if layer.isLinear {
+                // No GDN state yet (a single-token prompt): the general path
+                // builds the zero states.
+                guard let mambaCache = cache[i] as? MambaCache, mambaCache[0] != nil,
+                    mambaCache[1] != nil
+                else {
+                    return nil
+                }
+                mambaCaches[i] = mambaCache
+            } else {
+                guard let kv = cache[i], hasPlainAttentionRoute(kv) else {
+                    return nil
+                }
+            }
+        }
+
+        let sortedCaptures = captureLayers.sorted()
+        var carry = inputs
+        var pendingAttention: [MLXArray] = []
+        var capturedHidden: [Int: MLXArray] = [:]
+        /// Per GDN layer: the 8 trace outputs and the conv/recurrent inputs
+        /// the rollback replays from (the pre-pass cache states).
+        var gdnTraceOutputs: [Int: [MLXArray]] = [:]
+        var gdnTraceInputs: [Int: (conv: MLXArray, rec: MLXArray)] = [:]
+
+        for (segmentIndex, segment) in decodeSegments.enumerated() {
+            var args: [MLXArray] = [carry] + pendingAttention
+            for layerIndex in segment.linearLayers {
+                let mambaCache = mambaCaches[layerIndex]!
+                args.append(mambaCache[0]!)
+                args.append(mambaCache[1]!)
+                gdnTraceInputs[layerIndex] = (mambaCache[0]!, mambaCache[1]!)
+            }
+
+            let key = VerifySegmentKey(
+                segmentIndex: segmentIndex, sequenceLength: S,
+                captureLayers: sortedCaptures)
+            compileLock.lock()
+            if compiledVerifySegments[key] == nil {
+                // [unowned self]: see Qwen35SparseMoeBlock.callAsFunction.
+                compiledVerifySegments[key] = compile { [unowned self] segmentArgs in
+                    verifySegmentBody(
+                        at: segmentIndex, captureLayers: captureLayers, segmentArgs)
+                }
+            }
+            let fn = compiledVerifySegments[key]!
+            compileLock.unlock()
+            let outputs = fn(args)
+
+            carry = outputs[0]
+            let stateCount = 8 * segment.linearLayers.count
+            let captureCount = verifyCaptureCount(segment, captureLayers: captureLayers)
+            var captureIndex = 1 + stateCount
+            if let post = segment.attentionPostLayer, captureLayers.contains(post) {
+                capturedHidden[post] = outputs[captureIndex]
+                captureIndex += 1
+            }
+            for (i, layerIndex) in segment.linearLayers.enumerated() {
+                let base = 1 + 8 * i
+                gdnTraceOutputs[layerIndex] = Array(outputs[base ..< base + 8])
+                if captureLayers.contains(layerIndex) {
+                    capturedHidden[layerIndex] = outputs[captureIndex]
+                    captureIndex += 1
+                }
+            }
+
+            pendingAttention = []
+            if let pre = segment.attentionPreLayer {
+                let head = 1 + stateCount + captureCount
+                let attention = layers[pre].attentionCacheStep(
+                    queries: outputs[head], keys: outputs[head + 2],
+                    values: outputs[head + 3], cache: cache[pre]!, mask: faMask)
+                pendingAttention = [attention, outputs[head + 1]]
+            }
+        }
+
+        // Commit the GDN states and publish the rollback captures in GDN
+        // layer order — `rollbackSpeculativeHybridCaches` pairs them with the
+        // non-trimmable caches by position.
+        for (i, layer) in layers.enumerated() where layer.isLinear {
+            let outputs = gdnTraceOutputs[i]!
+            let inputs = gdnTraceInputs[i]!
+            let mambaCache = mambaCaches[i]!
+            mambaCache[0] = outputs[0]
+            mambaCache[1] = outputs[1]
+            mambaCache.advance(S)
+            gdnCapture.record(
+                GDNCapture(
+                    convInput: outputs[2], q: outputs[3], k: outputs[4], v: outputs[5],
+                    a: outputs[6], b: outputs[7],
+                    aLog: layer.linearAttn!.aLog, dtBias: layer.linearAttn!.dtBias,
+                    initialState: inputs.rec, mask: nil,
+                    convKernelSize: layer.linearAttn!.convKernelSize))
+        }
+        for layerId in captureLayers {
+            captureBox.store(layer: layerId, hidden: capturedHidden[layerId]!)
+        }
+        return carry
+    }
 }
 
 public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
@@ -1161,11 +1463,18 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
         _ input: LMInput.Text, cache: [KVCache]?, state: LMOutput.State?
     ) -> LMOutput {
         let emitDrafterState = state?[mtpEmitFlagKey] ?? false
+        let captureLayerIds = state?[dflash2CaptureLayerIdsKey]
+        let gdnCapture = state?[dflash2GDNCaptureContextKey]
+        let captureBox = captureLayerIds.map { _ in DFlash2HiddenCaptureBox() }
+
         let hiddenStates: MLXArray
-        if emitDrafterState {
+        if emitDrafterState || captureLayerIds != nil || gdnCapture != nil {
             let hidden = model.forward(
                 input.tokens, cache: cache, applyFinalNorm: false,
-                checkpointAfter: state?[mtpCacheCheckpointIndexKey])
+                checkpointAfter: state?[mtpCacheCheckpointIndexKey],
+                captureLayers: captureLayerIds.map(Set.init),
+                captureBox: captureBox,
+                gdnCapture: gdnCapture)
             hiddenStates = model.norm(hidden)
         } else {
             hiddenStates = model(input.tokens, cache: cache)
@@ -1178,17 +1487,29 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
             logits = model.embedTokens.asLinear(hiddenStates)
         }
 
-        guard emitDrafterState else {
+        guard emitDrafterState || captureLayerIds != nil || gdnCapture != nil else {
             return LMOutput(logits: logits)
         }
 
         var outState = state ?? LMOutput.State()
-        outState[mtpLastHiddenStatesKey] = hiddenStates
-        outState[mtpSharedKVStatesKey] = qwen35SharedKVState(
-            cache: cache, fullAttentionIndex: model.faIdx)
-        outState[mtpSharedKVOffsetsKey] = qwen35SharedKVOffsets(
-            cache: cache, fullAttentionIndex: model.faIdx)
-        outState[mtpSharedKVSourceIndicesKey] = ["full_attention": model.faIdx]
+        if emitDrafterState {
+            outState[mtpLastHiddenStatesKey] = hiddenStates
+            outState[mtpSharedKVStatesKey] = qwen35SharedKVState(
+                cache: cache, fullAttentionIndex: model.faIdx)
+            outState[mtpSharedKVOffsetsKey] = qwen35SharedKVOffsets(
+                cache: cache, fullAttentionIndex: model.faIdx)
+            outState[mtpSharedKVSourceIndicesKey] = ["full_attention": model.faIdx]
+        }
+        if let captureLayerIds, let captureBox {
+            outState[dflash2CapturedHiddenStatesKey] = captureLayerIds.map { layerId in
+                guard let captured = captureBox.value(for: layerId) else {
+                    preconditionFailure(
+                        "DFlash2 capture requested layer \(layerId), but the model "
+                            + "produced none (\(model.layers.count) layers)")
+                }
+                return captured
+            }
+        }
         return LMOutput(logits: logits, state: outState)
     }
 
