@@ -132,6 +132,11 @@ func dflash2RejectionSample(
 public struct DFlash2SpeculativeTokenIterator: TokenIteratorProtocol {
     /// The anchor: last emitted token, not yet committed to the target cache.
     var y: LMInput.Text
+    /// The anchor's token id on the host. The accept step already lands the
+    /// bonus token host-side, so tracking it here removes a per-round D2H
+    /// sync at proposal build time. Kept in lockstep with `y` everywhere
+    /// `y` is assigned.
+    private var dflash2AnchorValue: Int = -1
 
     let mainModel: any LanguageModel
     let drafter: any DFlash2DrafterModel
@@ -147,8 +152,26 @@ public struct DFlash2SpeculativeTokenIterator: TokenIteratorProtocol {
     let topK: Int
 
     public let maxTokens: Int?
-    /// Total tokens per verify pass: 1 anchor + (blockSize - 1) drafts.
+    /// Total tokens per verify pass at the current policy width: 1 anchor +
+    /// (width - 1) drafts. The init ``blockSize`` is the CAP (the draft
+    /// checkpoint's trained width); the policy narrows on measured speed.
     public let blockSize: Int
+
+    /// Adaptive-width bandit (the reference runs an acceptance-threshold
+    /// policy; on this stack per-width cost varies enough that the objective
+    /// has to be measured speed, not acceptance): the candidate shortlist is
+    /// {3, 4, cap} — mma8 makes verify near-flat across 5..8, so the optimum
+    /// is bracketed by the floor, the mid, and the cap. An 8-round window per
+    /// width (~0.5 s) scores decode tok/s; the stream settles on the argmax
+    /// with 3% hysteresis and re-probes a beaten candidate every 10 windows to
+    /// track content drift. Exploration is once per stream (~16 rounds).
+    private var roundWidth: Int = 0
+    private var widthWindowRounds = 0
+    private var widthWindowTokens = 0
+    private var widthWindowStart: ContinuousClock.Instant?
+    private var widthScores = [Int: Double]()
+    private var windowsSinceSettle = 0
+    private let adaptiveWidth: Bool
 
     public private(set) var promptPrefillTime: TimeInterval = 0.0
 
@@ -200,6 +223,7 @@ public struct DFlash2SpeculativeTokenIterator: TokenIteratorProtocol {
         mainCache: [KVCache]? = nil,
         parameters: GenerateParameters,
         blockSize: Int? = nil,
+        adaptiveWidth: Bool = true,
         components: GenerationComponents = .init()
     ) throws {
         let cache = try mainCache ?? mainModel.newCache(parameters: parameters)
@@ -216,6 +240,8 @@ public struct DFlash2SpeculativeTokenIterator: TokenIteratorProtocol {
         self.processor = components.logitProcessor(parameters: parameters)
         self.maxTokens = parameters.maxTokens
         self.blockSize = Swift.max(2, blockSize ?? drafter.dflashBlockSize)
+        self.roundWidth = self.blockSize
+        self.adaptiveWidth = adaptiveWidth
 
         let prefillStart = Date.timeIntervalSinceReferenceDate
         drafter.bindDFlashTarget(mainModel)
@@ -303,7 +329,9 @@ public struct DFlash2SpeculativeTokenIterator: TokenIteratorProtocol {
         processor?.didSample(token: token)
         eval(token)
         y = .init(tokens: token)
-        pendingTokens.append(token.item(Int.self))
+        let firstValue = token.item(Int.self)
+        dflash2AnchorValue = firstValue
+        pendingTokens.append(firstValue)
     }
 
     /// Capture-incapable target: finish prefill conventionally and mark the
@@ -331,7 +359,9 @@ public struct DFlash2SpeculativeTokenIterator: TokenIteratorProtocol {
         processor?.didSample(token: token)
         eval(token)
         y = .init(tokens: token)
-        pendingTokens.append(token.item(Int.self))
+        let firstValue = token.item(Int.self)
+        dflash2AnchorValue = firstValue
+        pendingTokens.append(firstValue)
     }
 
     // MARK: Rounds
@@ -340,21 +370,24 @@ public struct DFlash2SpeculativeTokenIterator: TokenIteratorProtocol {
     mutating func speculateRound() {
         guard !passthrough else { return }
 
-        // Round width: blockSize, clamped to the remaining output budget.
-        // Reference: `bs = min(block_size, max_tokens - n + 1)` — the verify
-        // pass always covers the anchor plus up to `remaining` drafts; the
-        // commit is clamped to `remaining` tokens below.
+        // Round width: the policy's current width, clamped to the remaining
+        // output budget. Reference: `bs = min(block_size, max_tokens - n + 1)`
+        // — the verify pass always covers the anchor plus up to `remaining`
+        // drafts; the commit is clamped to `remaining` tokens below.
         let numDraft: Int
         if let maxTokens {
             let remaining = maxTokens - tokenCount
             guard remaining > 0 else { return }
-            numDraft = Swift.min(blockSize - 1, remaining)
+            numDraft = Swift.min(roundWidth - 1, remaining)
         } else {
-            numDraft = blockSize - 1
+            numDraft = roundWidth - 1
         }
 
-        let anchorToken = y.tokens
-        let anchor = anchorToken.item(Int.self)
+        // Host-side anchor (no D2H): the block is built entirely from host
+        // values; the anchor's MLXArray for the verify pass is an H2D upload.
+        let anchor = dflash2AnchorValue
+        precondition(anchor >= 0, "DFlash2 round ran before prefill set an anchor")
+        let anchorToken = MLXArray([Int32(anchor)])
         let maskId = drafter.dflashMaskTokenId
         let blockIds = MLXArray([anchor] + Array(repeating: maskId, count: numDraft))
             .expandedDimensions(axis: 0)  // [1, bs]
@@ -412,27 +445,33 @@ public struct DFlash2SpeculativeTokenIterator: TokenIteratorProtocol {
 
         // 3. Accept.
         let acceptStart = ContinuousClock.now
-        eval(draftTokens)
-        let draftList = draftTokens.asArray(Int.self)
 
         // 3. Accept.
         let accepted: Int
         let bonusTokenValue: Int
-        let gamma = draftList.count
+        let gamma = numDraft
+        let draftList: [Int]
         if greedy {
             var processed = mainLogits[0, 0 ..< (gamma + 1), 0...]  // [bs, V]
             processed = processor?.process(logits: processed) ?? processed
-            let targetTokens = argMax(processed, axis: -1)  // [bs]
-            eval(targetTokens)
-            let targetList = targetTokens.asArray(Int.self)
+            let targetTokens = argMax(processed, axis: -1).asType(.int32)  // [bs]
+
+            // ONE D2H sync per round: draft ids and target argmax ids ship in
+            // a single packed transfer (the reference's single-sync cycle).
+            let packed = concatenated([draftTokens.flattened().asType(.int32), targetTokens])
+            eval(packed)
+            let both = packed.asArray(Int32.self)
+            let greedyDrafts = both[0 ..< gamma].map(Int.init)
+            let targetList = both[gamma...].map(Int.init)
+            draftList = greedyDrafts
 
             var acceptedCount = 0
-            while acceptedCount < gamma, targetList[acceptedCount] == draftList[acceptedCount] {
+            while acceptedCount < gamma, targetList[acceptedCount] == greedyDrafts[acceptedCount] {
                 acceptedCount += 1
             }
             accepted = acceptedCount
             bonusTokenValue = targetList[accepted]
-            for token in draftList.prefix(accepted) {
+            for token in greedyDrafts.prefix(accepted) {
                 processor?.didSample(token: MLXArray(token))
             }
             processor?.didSample(token: MLXArray(bonusTokenValue))
@@ -444,6 +483,9 @@ public struct DFlash2SpeculativeTokenIterator: TokenIteratorProtocol {
             guard let selectorProbs = draftProbs else {
                 preconditionFailure("DFlash2 selector returned no probabilities at T>0")
             }
+            eval(draftTokens)
+            let sampledDrafts = draftTokens.asArray(Int.self)
+            draftList = sampledDrafts
             let result = dflash2RejectionSample(
                 draftTokens: draftTokens.flattened(),
                 targetProbs: targetProbs,
@@ -451,7 +493,7 @@ public struct DFlash2SpeculativeTokenIterator: TokenIteratorProtocol {
                 draftCandidates: draftCandidates[0])
             accepted = result.accepted
             bonusTokenValue = result.bonus
-            for token in draftList.prefix(accepted) {
+            for token in sampledDrafts.prefix(accepted) {
                 processor?.didSample(token: MLXArray(token))
             }
             processor?.didSample(token: MLXArray(bonusTokenValue))
@@ -490,12 +532,60 @@ public struct DFlash2SpeculativeTokenIterator: TokenIteratorProtocol {
         telemetry.recordRound(
             drafted: gamma, accepted: accepted, targetVerified: gamma + 1, draftModelCalls: 1)
 
+        // Adaptive width bandit: fold the round into the window; act every 8.
+        if adaptiveWidth, blockSize > 3 {
+            if widthWindowRounds == 0 { widthWindowStart = ContinuousClock.now }
+            widthWindowRounds += 1
+            widthWindowTokens += accepted + 1
+            if widthWindowRounds >= 8, let windowStart = widthWindowStart {
+                let elapsed = ContinuousClock.now - windowStart
+                let secs = Double(elapsed.components.seconds)
+                    + Double(elapsed.components.attoseconds) / 1e18
+                if secs > 0 {
+                    widthScores[roundWidth] =
+                        Double(widthWindowTokens) / secs
+                }
+                widthWindowRounds = 0
+                widthWindowTokens = 0
+
+                // Candidate shortlist {3, 4, cap}: bracket the optimum.
+                var candidates = Set([3, 4, blockSize])
+                candidates = candidates.filter { $0 >= 3 && $0 <= blockSize }
+                // Unscored candidates first (initial sweep), then the argmax
+                // with 3% hysteresis; every 10th settled window re-scores the
+                // best beaten candidate to track content drift.
+                if let next = candidates.filter({ widthScores[$0] == nil })
+                    .min(by: { abs($0 - roundWidth) < abs($1 - roundWidth) }),
+                    next != roundWidth
+                {
+                    roundWidth = next
+                    windowsSinceSettle = 0
+                } else if let best = widthScores.max(by: { $0.value < $1.value }),
+                    let current = widthScores[roundWidth],
+                    best.key != roundWidth && best.value > current * 1.03
+                {
+                    roundWidth = best.key
+                    windowsSinceSettle = 0
+                } else {
+                    windowsSinceSettle += 1
+                    if windowsSinceSettle >= 24 {
+                        // Drift re-sweep: drop every score so the next windows
+                        // re-walk the shortlist (~2 windows every few minutes
+                        // of decode).
+                        widthScores.removeAll(keepingCapacity: true)
+                        windowsSinceSettle = 0
+                    }
+                }
+            }
+        }
+
         if profileEnabled {
             eval(pendingContextHidden)
             profileMark("reconcile", since: reconcileStart)
             profileRoundCount += 1
         }
-        y = .init(tokens: MLXArray([bonusTokenValue]))
+        y = .init(tokens: MLXArray([Int32(bonusTokenValue)]))
+        dflash2AnchorValue = bonusTokenValue
     }
 
     /// A verify pass whose target emitted no captures: salvage it as a plain
@@ -508,6 +598,7 @@ public struct DFlash2SpeculativeTokenIterator: TokenIteratorProtocol {
         processor?.didSample(token: token)
         eval(token)
         let value = token.item(Int.self)
+        dflash2AnchorValue = value
 
         processedTokens += 1
         if gamma > 0 {
@@ -537,6 +628,7 @@ public struct DFlash2SpeculativeTokenIterator: TokenIteratorProtocol {
         eval(token)
         let value = token.item(Int.self)
         y = .init(tokens: token)
+        dflash2AnchorValue = value
         return value
     }
 

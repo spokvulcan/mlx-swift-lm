@@ -462,7 +462,10 @@ private final class MockDFlash2Drafter: Module, DFlash2DrafterModel {
         proposeCalls += 1
         receivedBlockShapes.append(inputs.shape)
         receivedContextRows.append(targetHidden.dim(1))
-        let tokens = script[round]
+        // Propose exactly the requested width (the real drafter returns
+        // block-1 proposals, and narrows with the block near maxTokens).
+        let requested = inputs.dim(1) - 1
+        let tokens = Array(script[round].prefix(requested))
         // Fabricate consistent top-K metadata: candidates = token + junk.
         let K = 4
         var candidateRows: [[Int32]] = []
@@ -491,6 +494,11 @@ private final class MockDFlash2Target: Module, LanguageModel, KVCacheDimensionPr
     static let vocab = 100
     static let hidden = 8
 
+    /// Artificial per-position cost (µs) so width is priced in wall time
+    /// even though the mock computes nothing: the adaptive-width bandit's
+    /// tok/s objective then has a deterministic gradient in tests.
+    var perPositionSleepMicros: useconds_t = 0
+
     init(tokenScript: [Int32]) {
         self.tokenScript = tokenScript
         super.init()
@@ -512,6 +520,9 @@ private final class MockDFlash2Target: Module, LanguageModel, KVCacheDimensionPr
     ) -> LMOutput {
         forwardCalls += 1
         let positions = input.tokens.dim(-1)
+        if perPositionSleepMicros > 0 {
+            usleep(perPositionSleepMicros * useconds_t(positions))
+        }
         let logits = makeLogits(positions: positions)
 
         if let cache {
@@ -610,4 +621,60 @@ func testDFlash2IteratorEndToEndAcceptanceAndRollback() throws {
     let telemetry = iterator.speculativeDecodingTelemetry!
     #expect(telemetry.draftTokenCount >= 3)
     #expect(telemetry.acceptedDraftTokenCount >= 2)
+}
+
+
+@Test
+func testDFlash2AdaptiveWidthNarrowsWhenNothingAccepts() throws {
+    // The target never matches the draft: zero acceptance at any width, so the
+    // bandit's tok/s objective is pure per-width cost — and with width priced
+    // into the mock's forward, the floor width 3 must win deterministically.
+    let rounds = 24
+    var script = [Int32](repeating: 1, count: 3)  // prefill (chunks 2 + 1)
+    script.append(contentsOf: [Int32](repeating: 99, count: rounds * 4 + 16))
+    let target = MockDFlash2Target(tokenScript: script)
+    target.perPositionSleepMicros = 2000
+    let drafter = MockDFlash2Drafter(
+        script: Array(repeating: [55, 55, 55], count: rounds + 4))
+    let input = LMInput(tokens: MLXArray([Int32(1), 2, 3]))
+    var parameters = GenerateParameters(maxTokens: rounds + 2)
+    parameters.temperature = 0
+    var iterator = try DFlash2SpeculativeTokenIterator(
+        input: input, mainModel: target, drafter: drafter,
+        parameters: parameters, blockSize: 4)
+
+    var producedCount = 0
+    while iterator.next() != nil { producedCount += 1 }
+    #expect(producedCount == rounds + 2)
+
+    let widths = drafter.receivedBlockShapes.map { $0[1] }
+    #expect(widths.prefix(8).allSatisfy { $0 == 4 }, "bandit starts at the cap: \(widths)")
+    // One 8-round scoring window at the cap, one at the floor, then the
+    // floor argmaxes (equal acceptance, cheaper rounds) and sticks. (The
+    // last rounds narrow on the maxTokens tail clamp — excluded.)
+    #expect(
+        widths.dropFirst(8).dropLast(3).allSatisfy { $0 == 3 },
+        "bandit must settle at the floor on zero-acceptance content: \(widths)")
+}
+
+@Test
+func testDFlash2FixedWidthNeverAdapts() throws {
+    var script = [Int32](repeating: 1, count: 3)
+    script.append(contentsOf: [Int32](repeating: 99, count: 24 * 4 + 16))
+    let target = MockDFlash2Target(tokenScript: script)
+    target.perPositionSleepMicros = 2000
+    let drafter = MockDFlash2Drafter(
+        script: Array(repeating: [55, 55, 55], count: 28))
+    let input = LMInput(tokens: MLXArray([Int32(1), 2, 3]))
+    var parameters = GenerateParameters(maxTokens: 26)
+    parameters.temperature = 0
+    var iterator = try DFlash2SpeculativeTokenIterator(
+        input: input, mainModel: target, drafter: drafter,
+        parameters: parameters, blockSize: 4, adaptiveWidth: false)
+
+    while iterator.next() != nil {}
+
+    // The last few rounds narrow on the maxTokens tail clamp — excluded.
+    let widths = drafter.receivedBlockShapes.map { $0[1] }.dropLast(4)
+    #expect(widths.allSatisfy { $0 == 4 })
 }
