@@ -716,11 +716,38 @@ public final class DFlash2DraftModel: Module, DFlash2DrafterModel {
         temperature: Float,
         logitsStart: Int
     ) -> (tokens: MLXArray, candidates: MLXArray, probabilities: MLXArray?) {
+        // Sub-phase decomposition under DFLASH2_PROFILE=1 (same gate as the
+        // iterator's round profile): where the propose ms actually go.
+        let profile = ProcessInfo.processInfo.environment["DFLASH2_PROFILE"] == "1"
+        func mark(_ label: String, since start: ContinuousClock.Instant) {
+            let elapsed = ContinuousClock.now - start
+            let ms = Double(elapsed.components.seconds) * 1e3
+                + Double(elapsed.components.attoseconds) / 1e15
+            FileHandle.standardOutput.write(
+                Data((String(format: "[dflash2-bench] draft-%@: %.1fms\n", label, ms)).utf8))
+        }
+        let t0 = ContinuousClock.now
         let hidden = hiddenStates(
             inputs, targetHidden: targetHidden, cache: cache, logitsStart: logitsStart)
-        return candidateSelector.select(
-            hidden: hidden, logits: computeLogits(hidden),
+        if profile {
+            eval(hidden)
+            mark("hidden", since: t0)
+        }
+        let t1 = ContinuousClock.now
+        let logits = computeLogits(hidden)
+        if profile {
+            eval(logits)
+            mark("logits", since: t1)
+        }
+        let t2 = ContinuousClock.now
+        let selected = candidateSelector.select(
+            hidden: hidden, logits: logits,
             anchorIds: inputs[0..., 0], temperature: temperature)
+        if profile {
+            eval(selected.0)
+            mark("select", since: t2)
+        }
+        return selected
     }
 
     /// Checkpoint layout fix-ups. The safetensors stores the selector
