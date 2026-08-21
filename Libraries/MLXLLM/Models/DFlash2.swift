@@ -263,6 +263,15 @@ final class DFlash2DynamicConv: Module {
 
 // MARK: - Attention
 
+/// Per-round memo for the draft attention mask. Every sliding layer builds
+/// the identical [queryLen, contextLen + queryLen] mask (all-sliding drafts
+/// share isCausal/window and the layer caches append in lockstep), so the
+/// first layer's mask — built from the true post-append context length,
+/// compaction included — serves the remaining layers.
+final class DFlash2SharedMask {
+    var mask: MLXArray?
+}
+
 /// Draft attention: block queries attend to the cached context K/V (target
 /// hidden projections) plus the block's own K/V. For `sliding_attention`
 /// layers the context is distance-windowed against each block query; the
@@ -307,7 +316,8 @@ final class DFlash2Attention: Module {
         _ x: MLXArray,
         context xCtx: MLXArray,
         rope: RoPELayer,
-        cache: DFlash2ContextCache
+        cache: DFlash2ContextCache,
+        sharedMask: DFlash2SharedMask? = nil
     ) -> MLXArray {
         let b = x.dim(0)
         let l = x.dim(1)
@@ -346,9 +356,22 @@ final class DFlash2Attention: Module {
         let keys = concatenated([keys0, propKeys], axis: 2)
         let values = concatenated([values0, propValues], axis: 2)
 
-        let mask = Self.makeMask(
-            queryLen: l, contextLen: ctxLen, isCausal: isCausal,
-            slidingWindow: isSliding ? slidingWindow : nil)
+        let mask: MLXArray
+        if let sharedMask {
+            if let memoized = sharedMask.mask {
+                mask = memoized
+            } else {
+                let built = Self.makeMask(
+                    queryLen: l, contextLen: ctxLen, isCausal: isCausal,
+                    slidingWindow: isSliding ? slidingWindow : nil)
+                sharedMask.mask = built
+                mask = built
+            }
+        } else {
+            mask = Self.makeMask(
+                queryLen: l, contextLen: ctxLen, isCausal: isCausal,
+                slidingWindow: isSliding ? slidingWindow : nil)
+        }
         let output = MLXFast.scaledDotProductAttention(
             queries: queries, keys: keys, values: values, scale: scale, mask: mask)
         return oProj(output.transposed(0, 2, 1, 3).reshaped(b, l, numHeads * headDim))
@@ -415,11 +438,15 @@ final class DFlash2DecoderLayer: Module {
     }
 
     func callAsFunction(
-        _ x: MLXArray, context xCtx: MLXArray, rope: RoPELayer, cache: DFlash2ContextCache
+        _ x: MLXArray,
+        context xCtx: MLXArray,
+        rope: RoPELayer,
+        cache: DFlash2ContextCache,
+        sharedMask: DFlash2SharedMask? = nil
     ) -> MLXArray {
         var residual = x
         var (h, kernel) = attentionConv.prepare(inputLayerNorm(x))
-        h = selfAttn(h, context: xCtx, rope: rope, cache: cache)
+        h = selfAttn(h, context: xCtx, rope: rope, cache: cache, sharedMask: sharedMask)
         var out = residual + attentionConv.finish(h, dynamic: kernel)
         residual = out
         (h, kernel) = mlpConv.prepare(postAttentionLayerNorm(out))
@@ -650,8 +677,12 @@ public final class DFlash2DraftModel: Module, DFlash2DrafterModel {
         }
         var h = embedTokens(inputs) * config.dflash.inputEmbeddingScale
         let hCtx = hiddenNorm(fc(targetHidden))
+        // All-sliding drafters build the identical attention mask in every
+        // layer; memoize the first layer's (built from the true post-append
+        // context length) and reuse it for the rest.
+        let sharedMask = layerTypesAllSliding ? DFlash2SharedMask() : nil
         for (layer, layerCache) in zip(layers, cache) {
-            h = layer(h, context: hCtx, rope: rope, cache: layerCache)
+            h = layer(h, context: hCtx, rope: rope, cache: layerCache, sharedMask: sharedMask)
         }
         if logitsStart > 0 {
             h = h[0..., logitsStart..., 0...]

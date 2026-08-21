@@ -197,58 +197,88 @@ public func rollbackSpeculativeHybridCaches(
 /// (projections of the target hidden states — the block's own K/V are
 /// recomputed per round and never cached).
 ///
-/// Mirrors the reference port's `RotatingKVCache(max_size: window - 1)` under
-/// multi-row `update_and_fetch`, simplified by always storing entries in
-/// temporal order:
-///  - ``append(keys:values:)`` front-trims the stored tail to `maxSize - 1`
-///    entries before concatenating, so a write of S rows leaves at most
-///    `maxSize + S - 1` (every query keeps a full window of context).
-///  - ``trimNewest(_:)`` physically drops trailing rows (defensive reconcile
-///    after a round).
+/// Padded-buffer variant of the reference port's
+/// `RotatingKVCache(max_size: window - 1)`: the stored content is the
+/// `storedCount`-row prefix of a slice-updated buffer, and the front-trim to
+/// the window is LAZY (one compaction copy per ~256 appended rows instead of
+/// a full-cache concat every round — per-cycle concat churns the Metal heap;
+/// oMLX measured a progressive ~5x wall at ~7000 cycles). Attention-visible
+/// behavior is identical: `DFlash2Attention.makeMask` windows by distance
+/// (query - key < sliding_window), so rows kept past `maxSize` are masked
+/// out exactly as if trimmed.
+///  - ``append(keys:values:)`` slice-updates in place and returns the
+///    logical prefix views.
+///  - ``trimNewest(_:)`` rewinds the logical count (defensive reconcile
+///    after a round) — no copies.
 ///
 /// `offset` is the absolute position the next appended row will occupy; RoPE
 /// is applied to keys BEFORE they enter the cache, so stored entries keep the
-/// phase they were written with.
+/// phase they were written with. Compaction does not touch `offset`.
 public final class DFlash2ContextCache {
-    public private(set) var keys: MLXArray?
-    public private(set) var values: MLXArray?
+    /// Padded storage; the logical content is the `storedCount`-row prefix.
+    private var keyStore: MLXArray?
+    private var valueStore: MLXArray?
+    private var storedCount = 0
     public var offset: Int = 0
     public let maxSize: Int
+    /// Overflow tolerated past `maxSize` before the front-trim compaction
+    /// fires (amortized: one copy per ~slack appended rows).
+    private let compactSlack = 256
 
     public init(maxSize: Int) {
         self.maxSize = maxSize
     }
 
-    public var count: Int { keys?.dim(2) ?? 0 }
+    /// Logical content views (prefix of the padded buffers).
+    public var keys: MLXArray? { keyStore?[.ellipsis, ..<storedCount, 0...] }
+    public var values: MLXArray? { valueStore?[.ellipsis, ..<storedCount, 0...] }
+
+    public var count: Int { storedCount }
 
     @discardableResult
     public func append(keys newKeys: MLXArray, values newValues: MLXArray) -> (
         MLXArray, MLXArray
     ) {
-        if let keys, let values {
-            var storedKeys = keys
-            var storedValues = values
-            let trimSize = storedKeys.dim(2) - maxSize + 1
-            if trimSize > 0 {
-                storedKeys = storedKeys[.ellipsis, trimSize..., 0...]
-                storedValues = storedValues[.ellipsis, trimSize..., 0...]
-            }
-            self.keys = concatenated([storedKeys, newKeys], axis: 2)
-            self.values = concatenated([storedValues, newValues], axis: 2)
-        } else {
-            self.keys = newKeys
-            self.values = newValues
+        let n = newKeys.dim(2)
+        if keyStore == nil {
+            let cap = Swift.max(n, maxSize + compactSlack)
+            keyStore = MLXArray.zeros(
+                [newKeys.dim(0), newKeys.dim(1), cap, newKeys.dim(3)],
+                dtype: newKeys.dtype)
+            valueStore = MLXArray.zeros(
+                [newValues.dim(0), newValues.dim(1), cap, newValues.dim(3)],
+                dtype: newValues.dtype)
         }
-        offset += newKeys.dim(2)
-        return (self.keys!, self.values!)
+        var storeK = keyStore!
+        var storeV = valueStore!
+        if storedCount + n > storeK.dim(2) || storedCount > maxSize + compactSlack {
+            // Compaction (or first-round growth): keep the newest `maxSize`
+            // rows in a fresh buffer — never an overlapping in-place shift.
+            let keep = Swift.min(storedCount, Swift.max(maxSize, 0))
+            let keptK = storeK[.ellipsis, (storedCount - keep)..<storedCount, 0...]
+            let keptV = storeV[.ellipsis, (storedCount - keep)..<storedCount, 0...]
+            let cap = Swift.max(maxSize + compactSlack, keep + n)
+            let padShapeK = [storeK.dim(0), storeK.dim(1), cap - keep, storeK.dim(3)]
+            let padShapeV = [storeV.dim(0), storeV.dim(1), cap - keep, storeV.dim(3)]
+            storeK = concatenated(
+                [keptK, MLXArray.zeros(padShapeK, dtype: storeK.dtype)], axis: 2)
+            storeV = concatenated(
+                [keptV, MLXArray.zeros(padShapeV, dtype: storeV.dtype)], axis: 2)
+            storedCount = keep
+            keyStore = storeK
+            valueStore = storeV
+        }
+        storeK[.ellipsis, storedCount..<(storedCount + n), 0...] = newKeys
+        storeV[.ellipsis, storedCount..<(storedCount + n), 0...] = newValues
+        storedCount += n
+        offset += n
+        return (keys!, values!)
     }
 
     public func trimNewest(_ n: Int) {
-        guard n > 0, let keys, let values else { return }
-        let trimmed = Swift.min(n, keys.dim(2))
-        let keep = keys.dim(2) - trimmed
-        self.keys = keys[.ellipsis, ..<keep, 0...]
-        self.values = values[.ellipsis, ..<keep, 0...]
+        guard n > 0, keyStore != nil else { return }
+        let trimmed = Swift.min(n, storedCount)
+        storedCount -= trimmed
         offset = Swift.max(0, offset - trimmed)
     }
 }

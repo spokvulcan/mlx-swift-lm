@@ -163,8 +163,10 @@ public struct DFlash2SpeculativeTokenIterator: TokenIteratorProtocol {
     /// {3, 4, cap} — mma8 makes verify near-flat across 5..8, so the optimum
     /// is bracketed by the floor, the mid, and the cap. An 8-round window per
     /// width (~0.5 s) scores decode tok/s; the stream settles on the argmax
-    /// with 3% hysteresis and re-probes a beaten candidate every 10 windows to
-    /// track content drift. Exploration is once per stream (~16 rounds).
+    /// with 3% hysteresis. After 24 settled windows every score is dropped so
+    /// the shortlist re-walks — that drift re-sweep tracks content drift.
+    /// Exploration is once per stream (~16 rounds) plus ~2 windows per
+    /// re-sweep.
     private var roundWidth: Int = 0
     private var widthWindowRounds = 0
     private var widthWindowTokens = 0
@@ -552,8 +554,8 @@ public struct DFlash2SpeculativeTokenIterator: TokenIteratorProtocol {
                 var candidates = Set([3, 4, blockSize])
                 candidates = candidates.filter { $0 >= 3 && $0 <= blockSize }
                 // Unscored candidates first (initial sweep), then the argmax
-                // with 3% hysteresis; every 10th settled window re-scores the
-                // best beaten candidate to track content drift.
+                // with 3% hysteresis; every 24th settled window drops all
+                // scores so the shortlist re-walks (content-drift re-sweep).
                 if let next = candidates.filter({ widthScores[$0] == nil })
                     .min(by: { abs($0 - roundWidth) < abs($1 - roundWidth) }),
                     next != roundWidth

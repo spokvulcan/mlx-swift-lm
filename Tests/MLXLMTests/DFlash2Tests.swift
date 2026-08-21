@@ -122,28 +122,49 @@ func testDFlash2ContextCacheAppendAndTrim() {
     #expect(cache.offset == 5)
     #expect(cache.count == 5)
 
-    // Second append: stored tail front-trimmed to maxSize - 1 first.
+    // Padded-buffer cache: the front-trim to maxSize is LAZY (one compaction
+    // per ~256 appended rows), so a small second append keeps every row.
+    // Attention-visible behavior is unchanged — makeMask windows by distance,
+    // so rows past maxSize are masked exactly as if trimmed.
     let k2 = MLXArray.ones([1, 1, 3, 2]) * 3
     let (keys2, values2) = cache.append(keys: k2, values: k2)
-    // stored 5 -> trimmed to 3 -> +3 = 6
-    #expect(keys2.dim(2) == 6)
+    #expect(keys2.dim(2) == 8)
     #expect(cache.offset == 8)
-    // front-trimmed: first 3 rows are the OLDEST surviving (value 1), then 3s
     let keyValues = values2[0, 0, 0..., 0].asArray(Float.self)
-    #expect(keyValues == [2, 2, 2, 3, 3, 3])
+    #expect(keyValues == [2, 2, 2, 2, 2, 3, 3, 3])
 
-    // trimNewest drops trailing rows and rewinds the write position.
+    // trimNewest rewinds the logical count and the write position, no copies.
     cache.trimNewest(2)
-    #expect(cache.count == 4)
+    #expect(cache.count == 6)
     #expect(cache.offset == 6)
     let afterTrim = cache.values![0, 0, 0..., 0].asArray(Float.self)
-    #expect(afterTrim == [2, 2, 2, 3])
+    #expect(afterTrim == [2, 2, 2, 2, 2, 3])
 
-    // Trimming more than stored is clamped; the offset keeps the count of
-    // front-trimmed (never stored) rows.
+    // Trimming more than stored is clamped.
     cache.trimNewest(99)
     #expect(cache.count == 0)
-    #expect(cache.offset == 2)
+    #expect(cache.offset == 0)
+}
+
+@Test
+func testDFlash2ContextCacheCompaction() {
+    // Past maxSize + 256 pending rows the front-trim fires once: the newest
+    // maxSize rows survive in a fresh buffer, offset untouched.
+    let cache = DFlash2ContextCache(maxSize: 4)
+    var tag: Float = 0
+    var appends = 0
+    while cache.offset < 4 + 256 + 8 {
+        let rows = MLXArray.full([1, 1, 3, 2], values: MLXArray(tag))
+        cache.append(keys: rows, values: rows)
+        tag += 1
+        appends += 1
+    }
+    #expect(cache.count <= 4 + 256 + 3)
+    #expect(cache.offset == appends * 3)
+    // The surviving tail is the newest content, in temporal order.
+    let tail = cache.values![0, 0, 0..., 0].asArray(Float.self)
+    #expect(tail == Array(tail.sorted()))
+    #expect(tail.last == tag - 1)
 }
 
 // MARK: - Mask

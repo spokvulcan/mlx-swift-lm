@@ -209,12 +209,16 @@ private func runDFlash2TraceParity(
     }
 
     // Token-for-token identity is NOT attainable across the whole trace: the
-    // reference and this port diverge at token 45 on a draft-side near-tie
-    // (the drafts differ; every emitted token is still target-verified, and
-    // both runs accept 32 drafts over the trace). What must hold:
-    //  - a long exact common prefix (measured: 45 of 48),
-    //  - statistically identical draft quality (accepted count),
-    //  - full output length (maxTokens clamping behaves).
+    // reference and this port diverge on draft-side near-ties (the drafts
+    // differ; every emitted token is still target-verified). With the round-2
+    // kernel set (mma8 verify-width QMM) the first divergence moved from
+    // token 45 to token 10 — measured 2026-08-21 as a DEAD TIE at the seam
+    // (ids 279 vs 1092, logits 20.7500 == 20.7500; which one argmax picks is
+    // sub-ULP evaluation-order happenstance, not a verify defect). So the
+    // prefix gate is two-part: a sanity floor against gross pipeline
+    // breakage, plus the principled gate — the seam's two candidates must be
+    // near-tied in the TARGET's own logits (this is the property a broken
+    // port would violate).
     let commonPrefix =
         zip(produced, expected).enumerated().first(where: { $0.element.0 != $0.element.1 })?.offset
         ?? min(produced.count, expected.count)
@@ -222,13 +226,42 @@ private func runDFlash2TraceParity(
         produced.count == expected.count,
         "count: produced \(produced.count) vs expected \(expected.count)")
     #expect(
-        commonPrefix >= 40,
+        commonPrefix >= 8,
         """
-        common prefix \(commonPrefix) < 40 (\(traceName)): \
-        produced \(produced.dropFirst(Swift.max(0, commonPrefix - 2)).prefix(5)) vs \
+        common prefix \(commonPrefix) < 8 (\(traceName)) — gross pipeline breakage, \
+        not a near-tie: produced \(produced.dropFirst(Swift.max(0, commonPrefix - 2)).prefix(5)) vs \
         expected \(expected.dropFirst(Swift.max(0, commonPrefix - 2)).prefix(5)) at the seam; \
         accepted \(iterator.acceptedCount)/\(iterator.proposedCount)
         """)
+    if commonPrefix < 40, commonPrefix < produced.count {
+        // Seam gate: forward the shared prefix through the target and compare
+        // the two candidates' logits. Near-tie = within two bf16 ULPs at
+        // logit scale ~20 (0.25); a real divergence shows a clear gap.
+        let seamIDs = promptIDs + expected[0 ..< commonPrefix]
+        var seamCache = try context.model.newCache(parameters: GenerateParameters())
+        var start = 0
+        var seamRow: MLXArray?
+        while start < seamIDs.count {
+            let end = Swift.min(seamIDs.count, start + 2048)
+            let r = context.model(
+                LMInput.Text(tokens: MLXArray(seamIDs[start ..< end].map { Int32($0) }))[
+                    text: .newAxis],
+                cache: seamCache, state: nil)
+            seamRow = r.logits[0, -1, 0...].asType(.float32)
+            start = end
+        }
+        if let seamRow {
+            let expectedLogit = seamRow[expected[commonPrefix]].item(Float.self)
+            let producedLogit = seamRow[produced[commonPrefix]].item(Float.self)
+            #expect(
+                abs(expectedLogit - producedLogit) < 0.25,
+                """
+                seam divergence at \(commonPrefix) is NOT a near-tie (\(traceName)): \
+                expected \(expected[commonPrefix]) logit \(expectedLogit) vs \
+                produced \(produced[commonPrefix]) logit \(producedLogit)
+                """)
+        }
+    }
     #expect(
         iterator.acceptedCount >= 25,
         "accepted \(iterator.acceptedCount)/\(iterator.proposedCount) below floor")
