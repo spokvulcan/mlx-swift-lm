@@ -377,6 +377,22 @@ final class DFlash2Attention: Module {
         return oProj(output.transposed(0, 2, 1, 3).reshaped(b, l, numHeads * headDim))
     }
 
+    /// Context-side K/V (the projections the eager path applies to `xCtx`),
+    /// with the RoPE offset as an array so the whole body can live inside a
+    /// trace. The caller appends the result to the layer cache.
+    func draftContextKV(
+        _ xCtx: MLXArray, rope: RoPELayer, positionOffset: MLXArray
+    ) -> (keys: MLXArray, values: MLXArray) {
+        let b = xCtx.dim(0)
+        let s = xCtx.dim(1)
+        var ctxKeys = kProj(xCtx).reshaped(b, s, numKVHeads, headDim)
+        var ctxValues = vProj(xCtx).reshaped(b, s, numKVHeads, headDim)
+        ctxKeys = kNorm(ctxKeys).transposed(0, 2, 1, 3)
+        ctxValues = ctxValues.transposed(0, 2, 1, 3)
+        ctxKeys = applyRotaryPosition(rope, to: ctxKeys, offset: .batch(positionOffset))
+        return (ctxKeys, ctxValues)
+    }
+
     /// Bool mask [queryLen, contextLen + queryLen]: `true` = attend.
     /// Positions are indices into the concatenated [context, block] axis —
     /// distance-based windowing matches the reference mask exactly.
@@ -451,6 +467,49 @@ final class DFlash2DecoderLayer: Module {
         residual = out
         (h, kernel) = mlpConv.prepare(postAttentionLayerNorm(out))
         out = residual + mlpConv.finish(mlp(h), dynamic: kernel)
+        return out
+    }
+
+    // MARK: Compiled-route bodies
+
+    /// Everything before this layer's SDPA, as one traceable body: input norm,
+    /// conv prepare, and the block-side q/k/v projections with RoPE riding an
+    /// array offset. Returns the pieces the eager glue between traces needs.
+    func draftPreBody(
+        x: MLXArray, rope: RoPELayer, positionOffset: MLXArray
+    ) -> (
+        residual: MLXArray, kernel: MLXArray, queries: MLXArray,
+        propKeys: MLXArray, propValues: MLXArray
+    ) {
+        let (h, kernel) = attentionConv.prepare(inputLayerNorm(x))
+        let attn = selfAttn
+        let b = h.dim(0)
+        let l = h.dim(1)
+        var queries = attn.qProj(h).reshaped(b, l, attn.numHeads, attn.headDim)
+        var propKeys = attn.kProj(h).reshaped(b, l, attn.numKVHeads, attn.headDim)
+        var propValues = attn.vProj(h).reshaped(b, l, attn.numKVHeads, attn.headDim)
+        queries = attn.qNorm(queries).transposed(0, 2, 1, 3)
+        propKeys = attn.kNorm(propKeys).transposed(0, 2, 1, 3)
+        propValues = propValues.transposed(0, 2, 1, 3)
+        queries = applyRotaryPosition(rope, to: queries, offset: .batch(positionOffset))
+        propKeys = applyRotaryPosition(rope, to: propKeys, offset: .batch(positionOffset))
+        return (x, kernel, queries, propKeys, propValues)
+    }
+
+    /// Everything after this layer's SDPA: output projection, conv finish,
+    /// both residual adds, and the MLP sublayer with its conv pair.
+    func draftPostBody(
+        sdpaOutput: MLXArray, residual: MLXArray, kernel: MLXArray
+    ) -> MLXArray {
+        let attn = selfAttn
+        let b = residual.dim(0)
+        let l = residual.dim(1)
+        let attnOut = attn.oProj(
+            sdpaOutput.transposed(0, 2, 1, 3).reshaped(b, l, attn.numHeads * attn.headDim))
+        var out = residual + attentionConv.finish(attnOut, dynamic: kernel)
+        let mlpResidual = out
+        let (h, mlpKernel) = mlpConv.prepare(postAttentionLayerNorm(out))
+        out = mlpResidual + mlpConv.finish(mlp(h), dynamic: mlpKernel)
         return out
     }
 }
@@ -632,9 +691,11 @@ public final class DFlash2DraftModel: Module, DFlash2DrafterModel {
     public func bindDFlashTarget(_ target: any LanguageModel) {
         switch target {
         case let model as Qwen35TextModel:
+            clearDraftTraces(ifReboundTo: model.model.embedTokens)
             embedTokens = model.model.embedTokens
             lmHead = model.lmHead
         case let model as Qwen35Model:
+            clearDraftTraces(ifReboundTo: model.languageModel.model.embedTokens)
             embedTokens = model.languageModel.model.embedTokens
             lmHead = model.languageModel.lmHead
         default:
@@ -645,6 +706,7 @@ public final class DFlash2DraftModel: Module, DFlash2DrafterModel {
     /// Bind directly to an embedding table + LM head (test fixtures, exotic
     /// targets the switch doesn't know).
     public func bindDFlashTarget(embedding: Embedding, head: Linear?) {
+        clearDraftTraces(ifReboundTo: embedding)
         embedTokens = embedding
         lmHead = head
     }
@@ -674,6 +736,14 @@ public final class DFlash2DraftModel: Module, DFlash2DrafterModel {
     ) -> MLXArray {
         guard let embedTokens else {
             fatalError("DFlash2DraftModel used before bind(target:)")
+        }
+        if var h = compiledHiddenStates(inputs, targetHidden: targetHidden, cache: cache) {
+            // RMSNorm is row-wise, so norm-then-slice (the traced tail)
+            // equals the eager path's slice-then-norm exactly.
+            if logitsStart > 0 {
+                h = h[0..., logitsStart..., 0...]
+            }
+            return h
         }
         var h = embedTokens(inputs) * config.dflash.inputEmbeddingScale
         let hCtx = hiddenNorm(fc(targetHidden))
@@ -748,6 +818,205 @@ public final class DFlash2DraftModel: Module, DFlash2DrafterModel {
             mark("select", since: t2)
         }
         return selected
+    }
+
+    // MARK: Compiled draft forward
+
+    /// The propose pass was ~150 eager dispatches (ledger R11/R13); the block
+    /// stack is static-shaped per width, so it runs as traced segments split
+    /// at each layer's SDPA — the in-place cache append and the
+    /// variable-length context attention are the only ops that cannot live in
+    /// a trace (the same constraint as the target's verify segments). RoPE
+    /// rides inside the traces via the array-offset overload; the per-round
+    /// offsets enter as trace inputs.
+    private struct DraftSegmentKey: Hashable {
+        var segmentIndex: Int
+        var blockWidth: Int
+    }
+
+    /// Context appends larger than this (the round-0 prompt window) project
+    /// eagerly: per-round appends are 1...blockSize rows, and a trace per
+    /// arbitrary prompt-window size would churn the trace cache.
+    private static let maxTracedContextRows = 16
+
+    // Lock rationale: see Qwen35SparseMoeBlock.compileLock.
+    private let compileLock = NSLock()
+    private var compiledSegments: [DraftSegmentKey: ([MLXArray]) -> [MLXArray]] = [:]
+    private var compiledContext: [Int: ([MLXArray]) -> [MLXArray]] = [:]
+
+    /// Eager-fallback escape hatch for A/B benching (`DFLASH2_DRAFT=eager`);
+    /// per-instance so equivalence tests can pin one model eager.
+    var draftCompiledDisabled =
+        ProcessInfo.processInfo.environment["DFLASH2_DRAFT"] == "eager"
+
+    /// Live trace count — lets tests assert the compiled route engaged
+    /// rather than silently falling back to eager.
+    var draftTraceCount: Int {
+        compileLock.lock()
+        defer { compileLock.unlock() }
+        return compiledSegments.count + compiledContext.count
+    }
+
+    /// The traces bake the modules they captured; rebinding to a different
+    /// target would leave stale weights in the tapes.
+    private func clearDraftTraces(ifReboundTo embedding: Embedding?) {
+        guard embedTokens !== embedding else { return }
+        compileLock.lock()
+        compiledSegments.removeAll()
+        compiledContext.removeAll()
+        compileLock.unlock()
+    }
+
+    /// One traced piece of the block stack: the tail of the previous layer
+    /// (post-SDPA), then the head of the next one (whose SDPA runs between
+    /// this segment and the next). Segment `layers.count` closes with the
+    /// final norm. In: `[blockIds, positionOffset]` for segment 0,
+    /// `[sdpaOutput, residual, kernel(, positionOffset)]` after. Out:
+    /// `[residual, kernel, queries, propKeys, propValues]`, or `[normed]`
+    /// for the final segment.
+    private func draftSegmentBody(at index: Int, _ args: [MLXArray]) -> [MLXArray] {
+        let x: MLXArray
+        if index == 0 {
+            x = embedTokens!(args[0]) * config.dflash.inputEmbeddingScale
+        } else {
+            x = layers[index - 1].draftPostBody(
+                sdpaOutput: args[0], residual: args[1], kernel: args[2])
+        }
+        guard index < layers.count else { return [norm(x)] }
+        let positionOffset = args[index == 0 ? 1 : 3]
+        let t = layers[index].draftPreBody(x: x, rope: rope, positionOffset: positionOffset)
+        return [t.residual, t.kernel, t.queries, t.propKeys, t.propValues]
+    }
+
+    /// All layers' context K/V projections in one trace:
+    /// `[targetHidden, positionOffset]` → `[keys, values]` per layer.
+    private func draftContextBody(_ args: [MLXArray]) -> [MLXArray] {
+        let hCtx = hiddenNorm(fc(args[0]))
+        var outputs: [MLXArray] = []
+        for layer in layers {
+            let (keys, values) = layer.selfAttn.draftContextKV(
+                hCtx, rope: rope, positionOffset: args[1])
+            outputs.append(keys)
+            outputs.append(values)
+        }
+        return outputs
+    }
+
+    private func compiledContextFunction(rows: Int) -> ([MLXArray]) -> [MLXArray] {
+        compileLock.lock()
+        defer { compileLock.unlock() }
+        if let fn = compiledContext[rows] { return fn }
+        // [unowned self]: see Qwen35SparseMoeBlock.callAsFunction.
+        let fn = compile { [unowned self] args in draftContextBody(args) }
+        compiledContext[rows] = fn
+        return fn
+    }
+
+    private func compiledSegmentFunction(
+        index: Int, blockWidth: Int
+    ) -> ([MLXArray]) -> [MLXArray] {
+        let key = DraftSegmentKey(segmentIndex: index, blockWidth: blockWidth)
+        compileLock.lock()
+        defer { compileLock.unlock() }
+        if let fn = compiledSegments[key] { return fn }
+        // [unowned self]: see Qwen35SparseMoeBlock.callAsFunction.
+        let fn = compile { [unowned self] args in draftSegmentBody(at: index, args) }
+        compiledSegments[key] = fn
+        return fn
+    }
+
+    /// Compiled route for ``hiddenStates`` (final norm applied, no
+    /// `logitsStart` slicing), or nil when this call needs the general eager
+    /// path (escape hatch, non-sliding stacks, batched input, an oversized
+    /// incoming context, or caches out of lockstep).
+    /// One-time route announcement under DFLASH2_PROFILE=1 (decisive
+    /// evidence the compiled route engaged in a live run, not just in tests).
+    private var announcedCompiledRoute = false
+
+    private func compiledHiddenStates(
+        _ inputs: MLXArray, targetHidden: MLXArray, cache: [DFlash2ContextCache]
+    ) -> MLXArray? {
+        guard !draftCompiledDisabled, layerTypesAllSliding, embedTokens != nil,
+            !layers.isEmpty, inputs.dim(0) == 1, cache.count == layers.count
+        else { return nil }
+        let s = targetHidden.dim(1)
+        // The eager path handles the oversized-context front-trim (and its
+        // cache.offset advance); everything at or under the window takes the
+        // compiled route.
+        guard let keep = config.contextKeepCount, s <= keep else { return nil }
+        guard let first = cache.first,
+            cache.allSatisfy({ $0.offset == first.offset && $0.count == first.count })
+        else { return nil }
+        if !announcedCompiledRoute,
+            ProcessInfo.processInfo.environment["DFLASH2_PROFILE"] != nil
+        {
+            announcedCompiledRoute = true
+            FileHandle.standardOutput.write(
+                Data("[dflash2-bench] draft route: compiled\n".utf8))
+        }
+
+        let l = inputs.dim(1)
+        let ctxOffset = first.offset
+        let ctxOffsetArray = MLXArray([Int32(ctxOffset)])
+
+        let contextKV: [MLXArray]
+        if s <= Self.maxTracedContextRows {
+            contextKV = compiledContextFunction(rows: s)([targetHidden, ctxOffsetArray])
+        } else {
+            let hCtx = hiddenNorm(fc(targetHidden))
+            var kv: [MLXArray] = []
+            for layer in layers {
+                let (keys, values) = layer.selfAttn.draftContextKV(
+                    hCtx, rope: rope, positionOffset: ctxOffsetArray)
+                kv.append(keys)
+                kv.append(values)
+            }
+            contextKV = kv
+        }
+
+        // In-place appends (outside any trace), then one shared mask — the
+        // all-sliding stack appends in lockstep, so the first layer's
+        // post-append length serves every layer (same memo the eager path's
+        // DFlash2SharedMask exploits).
+        var layerKV: [(MLXArray, MLXArray)] = []
+        for (i, layerCache) in cache.enumerated() {
+            layerKV.append(
+                layerCache.append(keys: contextKV[2 * i], values: contextKV[2 * i + 1]))
+        }
+        let ctxLen = layerKV[0].0.dim(2)
+        let attn0 = layers[0].selfAttn
+        let mask = DFlash2Attention.makeMask(
+            queryLen: l, contextLen: ctxLen, isCausal: attn0.isCausal,
+            slidingWindow: attn0.isSliding ? attn0.slidingWindow : nil)
+
+        let blockOffsetArray = MLXArray([Int32(ctxOffset + s)])
+        var sdpaOutput: MLXArray! = nil
+        var residual: MLXArray! = nil
+        var kernel: MLXArray! = nil
+        for index in 0 ... layers.count {
+            let fn = compiledSegmentFunction(index: index, blockWidth: l)
+            let args: [MLXArray]
+            if index == 0 {
+                args = [inputs, blockOffsetArray]
+            } else if index < layers.count {
+                args = [sdpaOutput, residual, kernel, blockOffsetArray]
+            } else {
+                args = [sdpaOutput, residual, kernel]
+            }
+            let outputs = fn(args)
+            if index == layers.count {
+                return outputs[0]
+            }
+            residual = outputs[0]
+            kernel = outputs[1]
+            let (contextKeys, contextValues) = layerKV[index]
+            let keys = concatenated([contextKeys, outputs[3]], axis: 2)
+            let values = concatenated([contextValues, outputs[4]], axis: 2)
+            sdpaOutput = MLXFast.scaledDotProductAttention(
+                queries: outputs[2], keys: keys, values: values,
+                scale: layers[index].selfAttn.scale, mask: mask)
+        }
+        return nil  // unreachable: the loop returns at the final segment
     }
 
     /// Checkpoint layout fix-ups. The safetensors stores the selector

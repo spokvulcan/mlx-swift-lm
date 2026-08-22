@@ -327,6 +327,82 @@ func testDFlash2SelectorGreedyPrefersCoherentPath() throws {
     #expect(path.asArray(Int32.self) == [5, 2])
 }
 
+// MARK: - Compiled draft forward
+
+/// The compiled draft forward is a pure performance route: traced segments
+/// must reproduce the eager stack (hidden states, cache timeline, and the
+/// greedy propose path) across varying context-append sizes and block widths
+/// — including the >16-row eager-context fallback and a mid-stream width
+/// switch (the adaptive bandit's move).
+@Test
+func testDFlash2CompiledDraftForwardMatchesEager() throws {
+    // window 24 → keepCount 23; the first 20-row append exercises the
+    // eager-context fallback (S > 16), later rounds the traced context path.
+    let config = tinyConfig(window: 24)
+    MLXRandom.seed(11)
+    let compiled = DFlash2DraftModel(config)
+    let eager = DFlash2DraftModel(config)
+    eager.draftCompiledDisabled = true
+    try eager.update(parameters: compiled.parameters(), verify: [])
+
+    let vocab = config.vocabularySize
+    let embedding = Embedding(embeddingCount: vocab, dimensions: config.hiddenSize)
+    let head = Linear(config.hiddenSize, vocab, bias: false)
+    compiled.bindDFlashTarget(embedding: embedding, head: head)
+    eager.bindDFlashTarget(embedding: embedding, head: head)
+
+    let cacheA = compiled.makeDFlashContextCaches()
+    let cacheB = eager.makeDFlashContextCaches()
+
+    let concatDim = config.dflash.targetLayerIds.count * config.hiddenSize
+    let rounds: [(s: Int, l: Int)] = [(20, 5), (3, 5), (1, 3), (5, 5)]
+    var anchor = 7
+    for (round, spec) in rounds.enumerated() {
+        let targetHidden = MLXRandom.normal([1, spec.s, concatDim])
+        let blockIds = MLXArray(
+            [Int32(anchor)]
+                + Array(repeating: Int32(config.dflash.maskTokenId), count: spec.l - 1)
+        ).expandedDimensions(axis: 0)
+
+        let hiddenA = compiled.hiddenStates(
+            blockIds, targetHidden: targetHidden, cache: cacheA, logitsStart: 1)
+        let hiddenB = eager.hiddenStates(
+            blockIds, targetHidden: targetHidden, cache: cacheB, logitsStart: 1)
+        eval(hiddenA, hiddenB)
+
+        let diff = abs(hiddenA - hiddenB).max().item(Float.self)
+        #expect(diff < 1e-4, "round \(round): compiled vs eager hidden diff \(diff)")
+        for (a, b) in zip(cacheA, cacheB) {
+            #expect(a.offset == b.offset, "round \(round): cache offset")
+            #expect(a.count == b.count, "round \(round): cache count")
+        }
+
+        // Greedy propose end-to-end (logits + selector on top of the traced
+        // stack): the drafted tokens must be identical. This appends the same
+        // rows a second time on both timelines — equivalent on both sides,
+        // and it exercises extra cache states.
+        let tokensA = compiled.dflashPropose(
+            blockIds, targetHidden: targetHidden, cache: cacheA,
+            temperature: 0, logitsStart: 1
+        ).tokens
+        let tokensB = eager.dflashPropose(
+            blockIds, targetHidden: targetHidden, cache: cacheB,
+            temperature: 0, logitsStart: 1
+        ).tokens
+        eval(tokensA, tokensB)
+        #expect(
+            tokensA.asArray(Int32.self) == tokensB.asArray(Int32.self),
+            "round \(round): propose tokens diverge")
+
+        anchor = (anchor + 13) % vocab
+    }
+
+    // The compiled route must actually have engaged: 6 segments × 2 widths
+    // + traced context shapes (the 20-row round-0 append stays eager).
+    #expect(compiled.draftTraceCount >= 6, "compiled route never engaged")
+    #expect(eager.draftTraceCount == 0, "eager-pinned model built traces")
+}
+
 // MARK: - GDN rollback
 
 @Test
