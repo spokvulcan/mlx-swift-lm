@@ -432,7 +432,8 @@ public struct DFlash2SpeculativeTokenIterator: TokenIteratorProtocol {
             "pb-graph", "pb-vbuild", "pb-dsched", "sync", "accept", "reconcile",
         ]
         let perRound = phases.map { phase in
-            String(format: "%@ %.2f", phase, (alTimelineMs[phase] ?? 0) / Double(hostTimelineRounds))
+            String(
+                format: "%@ %.2f", phase, (alTimelineMs[phase] ?? 0) / Double(hostTimelineRounds))
         }.joined(separator: " | ")
         emit("[dflash2-accept] timeline ms/round: \(perRound) (n=\(hostTimelineRounds))")
         guard acceptLogEnabled, alRounds > 0 else { return }
@@ -1071,7 +1072,8 @@ public struct DFlash2SpeculativeTokenIterator: TokenIteratorProtocol {
             widthWindowTokens += accepted + 1
             if widthWindowRounds >= 8, let windowStart = widthWindowStart {
                 let elapsed = ContinuousClock.now - windowStart
-                let secs = Double(elapsed.components.seconds)
+                let secs =
+                    Double(elapsed.components.seconds)
                     + Double(elapsed.components.attoseconds) / 1e18
                 if secs > 0 {
                     widthScores[roundWidth] =

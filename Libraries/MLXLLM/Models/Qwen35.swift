@@ -1619,7 +1619,8 @@ public class Qwen35TextModelInner: Module {
         var attnSeconds = 0.0
         func vmark(_ total: inout Double, since start: ContinuousClock.Instant) {
             let elapsed = ContinuousClock.now - start
-            total += Double(elapsed.components.seconds)
+            total +=
+                Double(elapsed.components.seconds)
                 + Double(elapsed.components.attoseconds) / 1e18
         }
 

@@ -252,7 +252,8 @@ public func rollbackSpeculativeHybridCaches(
         }
         guard let mambaCache = cache as? MambaCache else {
             preconditionFailure(
-                "rollbackSpeculativeHybridCaches: non-trimmable, non-Mamba cache \(type(of: cache))")
+                "rollbackSpeculativeHybridCaches: non-trimmable, non-Mamba cache \(type(of: cache))"
+            )
         }
         precondition(
             captureIndex < context.captures.count,
@@ -553,8 +554,8 @@ public final class DFlash2ContextCache {
             keyStore = storeK
             valueStore = storeV
         }
-        storeK[.ellipsis, storedCount..<(storedCount + n), 0...] = newKeys
-        storeV[.ellipsis, storedCount..<(storedCount + n), 0...] = newValues
+        storeK[.ellipsis, storedCount ..< (storedCount + n), 0...] = newKeys
+        storeV[.ellipsis, storedCount ..< (storedCount + n), 0...] = newValues
         storedCount += n
     }
 

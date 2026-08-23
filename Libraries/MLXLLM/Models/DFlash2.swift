@@ -176,7 +176,8 @@ public struct DFlash2Configuration: Decodable, Sendable {
         guard layerTypes.count == hiddenLayers else {
             throw DecodingError.dataCorruptedError(
                 forKey: .layerTypes, in: container,
-                debugDescription: "layer_types count \(layerTypes.count) != num_hidden_layers \(hiddenLayers)")
+                debugDescription:
+                    "layer_types count \(layerTypes.count) != num_hidden_layers \(hiddenLayers)")
         }
     }
 
@@ -715,7 +716,8 @@ final class DFlash2CandidateSelector: Module {
             ((predecessorCodebook(anchorIds) * projected[0..., 0])[0..., .newAxis, 0...]
             * succEmbs[0..., 0, 0..., 0...]).sum(axis: -1)  // [B, K]
         // edges[t][a][b] for boundaries 1...L-1, batched: [B, L-1, K, K]
-        let gatedPrev = predEmbs[0..., 0 ..< (L - 1), 0..., 0...]
+        let gatedPrev =
+            predEmbs[0..., 0 ..< (L - 1), 0..., 0...]
             * projected[0..., 1..., .newAxis, 0...]  // A(cand_{t-1}) ⊙ H(h_t)
         let edges = MLX.matmul(
             gatedPrev,
@@ -1017,7 +1019,8 @@ public final class DFlash2DraftModel: Module, DFlash2DrafterModel {
         let profile = ProcessInfo.processInfo.environment["DFLASH2_PROFILE"] == "1"
         func mark(_ label: String, since start: ContinuousClock.Instant) {
             let elapsed = ContinuousClock.now - start
-            let ms = Double(elapsed.components.seconds) * 1e3
+            let ms =
+                Double(elapsed.components.seconds) * 1e3
                 + Double(elapsed.components.attoseconds) / 1e15
             FileHandle.standardOutput.write(
                 Data((String(format: "[dflash2-bench] draft-%@: %.1fms\n", label, ms)).utf8))

@@ -30,9 +30,11 @@ private func fixtureDirectory() -> URL? {
 
 private func draftSnapshotDirectory() -> URL? {
     let hub = FileManager.default.homeDirectoryForCurrentUser
-        .appendingPathComponent(".cache/huggingface/hub/models--incoai--Qwen3.8-27B-DFlash2/snapshots")
-    guard let entries = try? FileManager.default.contentsOfDirectory(
-        at: hub, includingPropertiesForKeys: nil)
+        .appendingPathComponent(
+            ".cache/huggingface/hub/models--incoai--Qwen3.8-27B-DFlash2/snapshots")
+    guard
+        let entries = try? FileManager.default.contentsOfDirectory(
+            at: hub, includingPropertiesForKeys: nil)
     else { return nil }
     return entries.first(where: {
         FileManager.default.fileExists(
@@ -50,9 +52,10 @@ func testDFlash2DraftModelParityWithPythonReference() throws {
 
     let draft = try loadDFlash2Draft(from: draftDir)
     let fixture = try loadArrays(url: fixtures.appendingPathComponent("draft_only.safetensors"))
-    let meta = try JSONSerialization.jsonObject(
-        with: Data(contentsOf: fixtures.appendingPathComponent("draft_only.json"))
-    ) as! [String: Any]
+    let meta =
+        try JSONSerialization.jsonObject(
+            with: Data(contentsOf: fixtures.appendingPathComponent("draft_only.json"))
+        ) as! [String: Any]
     let expectedTokens = meta["tokens"] as! [Int]
     let cacheOffset = meta["cache_offset"] as! Int
 
@@ -352,7 +355,9 @@ func testDFlash2Round0TensorParity() async throws {
     #expect(firstToken == expectedFirst)
 
     // ---- draft proposal ----
-    if debugDump { FileManager.default.createFile(atPath: "/tmp/dflash2_round0.marker", contents: nil) }
+    if debugDump {
+        FileManager.default.createFile(atPath: "/tmp/dflash2_round0.marker", contents: nil)
+    }
     print("[DFLASH2-DBG] prefill done; draft proposal next")
     let block = ref["block_ids"]!.asType(.int32)
     let finalHidden = draft.hiddenStates(
@@ -365,7 +370,8 @@ func testDFlash2Round0TensorParity() async throws {
     print("[DFLASH2-DBG] draft proposal done")
     assertRelL2(finalHidden, ref["draft_final_hidden"]!, "draft_final_hidden", tol: 0.06)
     assertRelL2(draftLogits, ref["draft_logits"]!, "draft_logits", tol: 0.06)
-    #expect(draftTokens.asArray(Int32.self) == ref["draft_tokens"]!.asType(.int32).asArray(Int32.self))
+    #expect(
+        draftTokens.asArray(Int32.self) == ref["draft_tokens"]!.asType(.int32).asArray(Int32.self))
 
     if debugDump {
         let url = URL(fileURLWithPath: "/tmp/swift_round0.safetensors")

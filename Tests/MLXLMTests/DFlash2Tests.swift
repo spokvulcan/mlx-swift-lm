@@ -14,8 +14,8 @@ import MLX
 import MLXNN
 import Testing
 
-@_spi(Testing) @testable import MLXLMCommon
 @testable import MLXLLM
+@_spi(Testing) @testable import MLXLMCommon
 
 // MARK: - Config
 
@@ -279,9 +279,10 @@ func testDFlash2DynamicConvMatchesNaive() throws {
 func testDFlash2SelectorGreedyPrefersCoherentPath() throws {
     // vocab 12, topK 3, rank 4, hidden 8. Position 0's top-1 candidate is a
     // decoy; the selector must switch to the candidate the anchor points at.
-    var config = tinyConfig(hiddenSize: 8, layers: 1, heads: 1, kvHeads: 1, headDim: 8,
-                            intermediate: 8, vocab: 12, window: 4, topK: 3, rank: 4,
-                            kernel: 2, group: 4)
+    var config = tinyConfig(
+        hiddenSize: 8, layers: 1, heads: 1, kvHeads: 1, headDim: 8,
+        intermediate: 8, vocab: 12, window: 4, topK: 3, rank: 4,
+        kernel: 2, group: 4)
     let selector = DFlash2CandidateSelector(config)
 
     // hidden_projection = identity on the first `rank` dims.
@@ -719,7 +720,6 @@ func testDFlash2IteratorEndToEndAcceptanceAndRollback() throws {
     #expect(telemetry.draftTokenCount >= 3)
     #expect(telemetry.acceptedDraftTokenCount >= 2)
 }
-
 
 @Test
 func testDFlash2AdaptiveWidthNarrowsWhenNothingAccepts() throws {
