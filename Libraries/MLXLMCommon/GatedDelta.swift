@@ -23,8 +23,36 @@ private let computeGatedDeltaG: @Sendable (MLXArray, MLXArray, MLXArray) -> MLXA
 
 // MARK: - Metal Kernel
 
-private func makeGatedDeltaKernel(hasMask: Bool) -> MLXFast.MLXFastKernel? {
+private func makeGatedDeltaKernel(hasMask: Bool, qkNorm: Bool = false) -> MLXFast.MLXFastKernel? {
     let maskSource = hasMask ? "mask[b_idx * T + t]" : "true"
+
+    // Fused q/k RMS norm + head scaling on load (weightless, eps 1e-6, the
+    // Qwen3.5 GDN convention: q gets inv_scale^2, k gets inv_scale with
+    // inv_scale = Dk^-0.5). Folding it here removes two fast-kernel launches
+    // and two scale multiplies per GDN layer per step. Both decode arms run
+    // this same kernel, so their outputs stay bitwise identical to each
+    // other (the binding losslessness criterion), though not to the unfused
+    // build's generations.
+    let normPrologue =
+        qkNorm
+        ? """
+                float qss = 0.0f, kss = 0.0f;
+                for (int i = 0; i < n_per_t; ++i) {
+                  auto s_idx = n_per_t * dk_idx + i;
+                  float qv = static_cast<float>(q_[s_idx]);
+                  float kv = static_cast<float>(k_[s_idx]);
+                  qss += qv * qv;
+                  kss += kv * kv;
+                }
+                qss = simd_sum(qss);
+                kss = simd_sum(kss);
+                const float inv_scale = rsqrt((float)Dk);
+                const float qfac = rsqrt(qss / Dk + 1e-6f) * inv_scale * inv_scale;
+                const float kfac = rsqrt(kss / Dk + 1e-6f) * inv_scale;
+        """
+        : ""
+    let kExpr = qkNorm ? "(k_[s_idx] * kfac)" : "k_[s_idx]"
+    let qExpr = qkNorm ? "(q_[s_idx] * qfac)" : "q_[s_idx]"
 
     let source = """
             auto n = thread_position_in_grid.z;
@@ -60,6 +88,7 @@ private func makeGatedDeltaKernel(hasMask: Bool) -> MLXFast.MLXFastKernel? {
 
             for (int t = 0; t < T; ++t) {
               if (\(maskSource)) {
+        \(normPrologue)
                 float kv_mem = 0.0f;
                 {
                   // Preserve Kahan summation under Metal's default fast math.
@@ -69,7 +98,7 @@ private func makeGatedDeltaKernel(hasMask: Bool) -> MLXFast.MLXFastKernel? {
                   for (int i = 0; i < n_per_t; ++i) {
                     auto s_idx = n_per_t * dk_idx + i;
                     state[i] = state[i] * g_[hv_idx];
-                    auto product = state[i] * k_[s_idx];
+                    auto product = state[i] * \(kExpr);
                     auto corrected = product - kv_compensation;
                     auto next_sum = kv_mem + corrected;
                     kv_compensation = (next_sum - kv_mem) - corrected;
@@ -83,8 +112,8 @@ private func makeGatedDeltaKernel(hasMask: Bool) -> MLXFast.MLXFastKernel? {
                 float out = 0.0f;
                 for (int i = 0; i < n_per_t; ++i) {
                   auto s_idx = n_per_t * dk_idx + i;
-                  state[i] = state[i] + k_[s_idx] * delta;
-                  out += state[i] * q_[s_idx];
+                  state[i] = state[i] + \(kExpr) * delta;
+                  out += state[i] * \(qExpr);
                 }
                 out = simd_sum(out);
                 if (thread_index_in_simdgroup == 0) {
@@ -112,7 +141,7 @@ private func makeGatedDeltaKernel(hasMask: Bool) -> MLXFast.MLXFastKernel? {
         inputNames.append("mask")
     }
 
-    let suffix = hasMask ? "_mask" : ""
+    let suffix = (hasMask ? "_mask" : "") + (qkNorm ? "_qknorm" : "")
 
     return MLXFast.metalKernel(
         name: "gated_delta_step\(suffix)",
@@ -127,10 +156,14 @@ private final class GatedDeltaKernelManager: Sendable {
 
     let kernel: MLXFast.MLXFastKernel?
     let kernelMasked: MLXFast.MLXFastKernel?
+    let kernelNormed: MLXFast.MLXFastKernel?
+    let kernelMaskedNormed: MLXFast.MLXFastKernel?
 
     private init() {
         kernel = makeGatedDeltaKernel(hasMask: false)
         kernelMasked = makeGatedDeltaKernel(hasMask: true)
+        kernelNormed = makeGatedDeltaKernel(hasMask: false, qkNorm: true)
+        kernelMaskedNormed = makeGatedDeltaKernel(hasMask: true, qkNorm: true)
     }
 }
 
@@ -143,7 +176,8 @@ func gatedDeltaKernel(
     g: MLXArray,
     beta: MLXArray,
     state: MLXArray,
-    mask: MLXArray? = nil
+    mask: MLXArray? = nil,
+    qkNorm: Bool = false
 ) -> (MLXArray, MLXArray) {
     let B = k.dim(0)
     let T = k.dim(1)
@@ -156,11 +190,12 @@ func gatedDeltaKernel(
 
     let selectedKernel: MLXFast.MLXFastKernel?
     var inputs: [MLXArray] = [q, k, v, g, beta, state, MLXArray(T)]
+    let manager = GatedDeltaKernelManager.shared
     if let mask {
-        selectedKernel = GatedDeltaKernelManager.shared.kernelMasked
+        selectedKernel = qkNorm ? manager.kernelMaskedNormed : manager.kernelMasked
         inputs.append(mask)
     } else {
-        selectedKernel = GatedDeltaKernelManager.shared.kernel
+        selectedKernel = qkNorm ? manager.kernelNormed : manager.kernel
     }
 
     guard let kernel = selectedKernel else {
@@ -288,16 +323,19 @@ func gatedDeltaOps(
 // MARK: - Public API
 
 public func gatedDeltaUpdate(
-    q: MLXArray,
-    k: MLXArray,
+    q qIn: MLXArray,
+    k kIn: MLXArray,
     v: MLXArray,
     a: MLXArray,
     b: MLXArray,
     aLog: MLXArray,
     dtBias: MLXArray,
     state: MLXArray? = nil,
-    mask: MLXArray? = nil
+    mask: MLXArray? = nil,
+    qkNorm: Bool = false
 ) -> (MLXArray, MLXArray) {
+    var q = qIn
+    var k = kIn
     let beta = sigmoid(b).asType(.float32)
     let g = computeGatedDeltaG(aLog, a, dtBias)
 
@@ -321,7 +359,21 @@ public func gatedDeltaUpdate(
     // non-multiple-of-32 Dk to the ops fallback, which handles an arbitrary key
     // dimension correctly (slower, but never truncating).
     if GatedDeltaKernelManager.shared.kernel != nil, Dk % 32 == 0 {
-        return gatedDeltaKernel(q: q, k: k, v: v, g: g, beta: beta, state: state, mask: mask)
+        return gatedDeltaKernel(
+            q: q, k: k, v: v, g: g, beta: beta, state: state, mask: mask, qkNorm: qkNorm)
+    }
+
+    if qkNorm {
+        // Ops fallback (Dk not a multiple of 32): apply the norm eagerly.
+        // Semantically equivalent to the fused prologue, not bitwise — the
+        // production Dk = 192 always takes the kernel path above.
+        let invScale = pow(Float(Dk), -0.5)
+        q =
+            MLXArray(invScale * invScale).asType(q.dtype)
+            * MLXFast.rmsNorm(q, weight: MLXArray.mlxNone, eps: 1e-6)
+        k =
+            MLXArray(invScale).asType(k.dtype)
+            * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
     }
 
     return gatedDeltaOps(q: q, k: k, v: v, g: g, beta: beta, state: state, mask: mask)
