@@ -293,6 +293,82 @@ final class DFlash2Attention: Module {
     @ModuleInfo(key: "q_norm") var qNorm: RMSNorm
     @ModuleInfo(key: "k_norm") var kNorm: RMSNorm
 
+    /// Post-load stacked projections (bitwise-identical per element — each
+    /// output row keeps its own K-accumulation and quant groups). `qkvStacked`
+    /// serves the block-side x projections, `kvStacked` the context-side
+    /// pair; k/v weights are duplicated across the two stacks (the drafter is
+    /// 5 layers at 4-bit — negligible). Built by ``stackProjections()``.
+    var qkvStacked: QuantizedLinear?
+    var kvStacked: QuantizedLinear?
+
+    /// Block-side q/k/v on a shared input — one QMM when stacked.
+    func blockQKV(_ x: MLXArray) -> (q: MLXArray, k: MLXArray, v: MLXArray) {
+        if let qkvStacked {
+            let all = qkvStacked(x)
+            let qEnd = numHeads * headDim
+            let kEnd = qEnd + numKVHeads * headDim
+            return (
+                all[.ellipsis, 0 ..< qEnd], all[.ellipsis, qEnd ..< kEnd],
+                all[.ellipsis, kEnd...]
+            )
+        }
+        return (qProj(x), kProj(x), vProj(x))
+    }
+
+    /// Context-side k/v on a shared input — one QMM when stacked.
+    func contextKV(_ xCtx: MLXArray) -> (k: MLXArray, v: MLXArray) {
+        if let kvStacked {
+            let all = kvStacked(xCtx)
+            let kEnd = numKVHeads * headDim
+            return (all[.ellipsis, 0 ..< kEnd], all[.ellipsis, kEnd...])
+        }
+        return (kProj(xCtx), vProj(xCtx))
+    }
+
+    /// Fold q/k/v into the two same-input stacks and release the originals.
+    /// Returns false (and changes nothing) unless all three are bias-free
+    /// QuantizedLinear layers with matching quantization.
+    func stackProjections() -> Bool {
+        guard qkvStacked == nil,
+            let q = qProj as? QuantizedLinear,
+            let k = kProj as? QuantizedLinear,
+            let v = vProj as? QuantizedLinear
+        else { return false }
+        let parts = [q, k, v]
+        guard parts.allSatisfy({ $0.bias == nil }),
+            parts.allSatisfy({
+                $0.groupSize == q.groupSize && $0.bits == q.bits && $0.mode == q.mode
+            })
+        else { return false }
+        func stack(_ layers: [QuantizedLinear]) -> QuantizedLinear? {
+            let quantBiases = layers.compactMap(\.biases)
+            let biases: MLXArray?
+            if quantBiases.count == layers.count {
+                biases = concatenated(quantBiases, axis: 0)
+            } else if quantBiases.isEmpty {
+                biases = nil
+            } else {
+                return nil
+            }
+            let weight = concatenated(layers.map(\.weight), axis: 0)
+            let scales = concatenated(layers.map(\.scales), axis: 0)
+            eval(weight, scales, biases ?? weight)
+            return QuantizedLinear(
+                weight: weight, bias: nil, scales: scales, biases: biases,
+                groupSize: layers[0].groupSize, bits: layers[0].bits, mode: layers[0].mode)
+        }
+        guard let qkv = stack([q, k, v]), let kv = stack([k, v]) else { return false }
+        qkvStacked = qkv
+        kvStacked = kv
+        update(
+            modules: ModuleChildren.unflattened([
+                ("q_proj", Linear(weight: MLXArray.zeros([1, 1]))),
+                ("k_proj", Linear(weight: MLXArray.zeros([1, 1]))),
+                ("v_proj", Linear(weight: MLXArray.zeros([1, 1]))),
+            ]))
+        return true
+    }
+
     init(_ config: DFlash2Configuration, layerIdx: Int) {
         numHeads = config.attentionHeads
         numKVHeads = config.kvHeads
@@ -334,11 +410,13 @@ final class DFlash2Attention: Module {
             cache.offset += skip
         }
 
-        var queries = qProj(x).reshaped(b, l, numHeads, headDim)
-        var ctxKeys = kProj(xCtx).reshaped(b, s, numKVHeads, headDim)
-        var ctxValues = vProj(xCtx).reshaped(b, s, numKVHeads, headDim)
-        var propKeys = kProj(x).reshaped(b, l, numKVHeads, headDim)
-        var propValues = vProj(x).reshaped(b, l, numKVHeads, headDim)
+        let (rawQ, rawPropK, rawPropV) = blockQKV(x)
+        let (rawCtxK, rawCtxV) = contextKV(xCtx)
+        var queries = rawQ.reshaped(b, l, numHeads, headDim)
+        var ctxKeys = rawCtxK.reshaped(b, s, numKVHeads, headDim)
+        var ctxValues = rawCtxV.reshaped(b, s, numKVHeads, headDim)
+        var propKeys = rawPropK.reshaped(b, l, numKVHeads, headDim)
+        var propValues = rawPropV.reshaped(b, l, numKVHeads, headDim)
 
         queries = qNorm(queries).transposed(0, 2, 1, 3)
         ctxKeys = kNorm(ctxKeys).transposed(0, 2, 1, 3)
@@ -385,8 +463,9 @@ final class DFlash2Attention: Module {
     ) -> (keys: MLXArray, values: MLXArray) {
         let b = xCtx.dim(0)
         let s = xCtx.dim(1)
-        var ctxKeys = kProj(xCtx).reshaped(b, s, numKVHeads, headDim)
-        var ctxValues = vProj(xCtx).reshaped(b, s, numKVHeads, headDim)
+        let (rawCtxK, rawCtxV) = contextKV(xCtx)
+        var ctxKeys = rawCtxK.reshaped(b, s, numKVHeads, headDim)
+        var ctxValues = rawCtxV.reshaped(b, s, numKVHeads, headDim)
         ctxKeys = kNorm(ctxKeys).transposed(0, 2, 1, 3)
         ctxValues = ctxValues.transposed(0, 2, 1, 3)
         ctxKeys = applyRotaryPosition(rope, to: ctxKeys, offset: .batch(positionOffset))
@@ -485,9 +564,10 @@ final class DFlash2DecoderLayer: Module {
         let attn = selfAttn
         let b = h.dim(0)
         let l = h.dim(1)
-        var queries = attn.qProj(h).reshaped(b, l, attn.numHeads, attn.headDim)
-        var propKeys = attn.kProj(h).reshaped(b, l, attn.numKVHeads, attn.headDim)
-        var propValues = attn.vProj(h).reshaped(b, l, attn.numKVHeads, attn.headDim)
+        let (rawQ, rawK, rawV) = attn.blockQKV(h)
+        var queries = rawQ.reshaped(b, l, attn.numHeads, attn.headDim)
+        var propKeys = rawK.reshaped(b, l, attn.numKVHeads, attn.headDim)
+        var propValues = rawV.reshaped(b, l, attn.numKVHeads, attn.headDim)
         queries = attn.qNorm(queries).transposed(0, 2, 1, 3)
         propKeys = attn.kNorm(propKeys).transposed(0, 2, 1, 3)
         propValues = propValues.transposed(0, 2, 1, 3)
@@ -520,6 +600,10 @@ final class DFlash2MLP: Module, UnaryLayer {
     @ModuleInfo(key: "up_proj") var upProj: Linear
     @ModuleInfo(key: "down_proj") var downProj: Linear
 
+    /// Post-load stacked gate|up (one QMM; bitwise-identical per element).
+    var gateUp: QuantizedLinear?
+    var gateDimensions = 0
+
     init(_ config: DFlash2Configuration) {
         _gateProj.wrappedValue = Linear(config.hiddenSize, config.intermediateSize, bias: false)
         _upProj.wrappedValue = Linear(config.hiddenSize, config.intermediateSize, bias: false)
@@ -528,7 +612,43 @@ final class DFlash2MLP: Module, UnaryLayer {
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        downProj(silu(gateProj(x)) * upProj(x))
+        if let gateUp {
+            let gu = gateUp(x)
+            let gate = gu[.ellipsis, 0 ..< gateDimensions]
+            let up = gu[.ellipsis, gateDimensions...]
+            return downProj(silu(gate) * up)
+        }
+        return downProj(silu(gateProj(x)) * upProj(x))
+    }
+
+    /// Fold gate_proj + up_proj into one stacked QuantizedLinear and release
+    /// the originals (same contract as `Qwen3NextMLP.stackGateUp`).
+    func stackGateUp() -> Bool {
+        guard gateUp == nil,
+            let g = gateProj as? QuantizedLinear,
+            let u = upProj as? QuantizedLinear,
+            g.bias == nil, u.bias == nil,
+            g.groupSize == u.groupSize, g.bits == u.bits, g.mode == u.mode
+        else { return false }
+        let biases: MLXArray?
+        switch (g.biases, u.biases) {
+        case (let gb?, let ub?): biases = concatenated([gb, ub], axis: 0)
+        case (nil, nil): biases = nil
+        default: return false
+        }
+        let weight = concatenated([g.weight, u.weight], axis: 0)
+        let scales = concatenated([g.scales, u.scales], axis: 0)
+        eval(weight, scales, biases ?? weight)
+        gateDimensions = g.weight.dim(0)
+        gateUp = QuantizedLinear(
+            weight: weight, bias: nil, scales: scales, biases: biases,
+            groupSize: g.groupSize, bits: g.bits, mode: g.mode)
+        update(
+            modules: ModuleChildren.unflattened([
+                ("gate_proj", Linear(weight: MLXArray.zeros([1, 1]))),
+                ("up_proj", Linear(weight: MLXArray.zeros([1, 1]))),
+            ]))
+        return true
     }
 }
 
@@ -545,6 +665,12 @@ final class DFlash2CandidateSelector: Module {
     @ModuleInfo(key: "predecessor_codebook") var predecessorCodebook: Embedding
     @ModuleInfo(key: "successor_codebook") var successorCodebook: Embedding
     @ModuleInfo(key: "hidden_projection") var hiddenProjection: Linear
+
+    /// Compiled greedy select (lattice scoring + walk) per block width. The
+    /// eager walk rebuilds ~60 small ops every round; the trace is rebuilt
+    /// only per width. Greedy only — the sampled path carries RNG state.
+    private var compiledGreedySelects: [Int: ([MLXArray]) -> [MLXArray]] = [:]
+    private let compileLock = NSLock()
 
     init(_ config: DFlash2Configuration) {
         topK = config.dflash.selectorTopK
@@ -564,9 +690,13 @@ final class DFlash2CandidateSelector: Module {
     ///   - temperature: 0 → greedy path; > 0 → categorical over softmax(scores / T).
     /// - Returns: (selected tokens [B, L], top-K candidate ids [B, L, K],
     ///   per-position selection probabilities [B, L, K] when sampling).
-    func select(
-        hidden: MLXArray, logits: MLXArray, anchorIds: MLXArray, temperature: Float
-    ) -> (MLXArray, MLXArray, MLXArray?) {
+    /// The batched (GPU) half of selection: per-position top-K candidates
+    /// with their unary scores, and the bigram edge scores for every
+    /// boundary. The walk over this lattice runs either on-GPU (``select``)
+    /// or host-side (the advised proposal path).
+    func latticeParts(
+        hidden: MLXArray, logits: MLXArray, anchorIds: MLXArray
+    ) -> (candidates: MLXArray, unary: MLXArray, edges0: MLXArray, edges: MLXArray) {
         let L = logits.dim(1)
         let vocab = logits.dim(-1)
         let kth = vocab - topK
@@ -590,9 +720,47 @@ final class DFlash2CandidateSelector: Module {
         let edges = MLX.matmul(
             gatedPrev,
             succEmbs[0..., 1..., 0..., 0...].transposed(0, 1, 3, 2))
+        return (candidates, unary, edges0, edges)
+    }
+
+    func select(
+        hidden: MLXArray, logits: MLXArray, anchorIds: MLXArray, temperature: Float
+    ) -> (MLXArray, MLXArray, MLXArray?) {
+        // Greedy path (production): one compiled trace per block width.
+        // Measurement modes (rank ordering, lattice dump) stay eager — they
+        // read walk intermediates.
+        if temperature <= 0, !Self.acceptLogRankOrder, Self.latticeDumpPath == nil {
+            let width = logits.dim(1)
+            compileLock.lock()
+            if compiledGreedySelects[width] == nil {
+                // [unowned self]: see Qwen35SparseMoeBlock.callAsFunction.
+                compiledGreedySelects[width] = compile { [unowned self] args in
+                    let (path, candidates, _) = selectBody(
+                        hidden: args[0], logits: args[1], anchorIds: args[2],
+                        temperature: 0)
+                    return [path, candidates]
+                }
+            }
+            let fn = compiledGreedySelects[width]!
+            compileLock.unlock()
+            let outputs = fn([hidden, logits, anchorIds])
+            return (outputs[0], outputs[1], nil)
+        }
+        return selectBody(
+            hidden: hidden, logits: logits, anchorIds: anchorIds,
+            temperature: temperature)
+    }
+
+    private func selectBody(
+        hidden: MLXArray, logits: MLXArray, anchorIds: MLXArray, temperature: Float
+    ) -> (MLXArray, MLXArray, MLXArray?) {
+        let L = logits.dim(1)
+        let (candidates, unary, edges0, edges) = latticeParts(
+            hidden: hidden, logits: logits, anchorIds: anchorIds)
 
         var path: [MLXArray] = []
         var qRows: [MLXArray] = []
+        var scoreRows: [MLXArray] = []
         var selectedIndex: MLXArray? = nil
         for position in 0 ..< L {
             let scores: MLXArray
@@ -615,16 +783,74 @@ final class DFlash2CandidateSelector: Module {
             } else {
                 selected = argMax(scores, axis: -1)
             }
+            if Self.acceptLogRankOrder, temperature <= 0 {
+                scoreRows.append(scores)
+            }
             selectedIndex = selected
             path.append(
                 MLX.takeAlong(
                     candidates[0..., position], selected[.newAxis, 0...], axis: -1
                 )[0..., 0])
         }
+        // Accept-log measurement mode: return the candidates sorted by the
+        // walk's conditioned score (descending) so downstream logging can
+        // read the selector's per-position ranking. The SET per position is
+        // unchanged (coverage identical); the greedy path is unaffected.
+        var outCandidates = candidates
+        if Self.acceptLogRankOrder, temperature <= 0, scoreRows.count == L {
+            let stackedScores = MLX.stacked(scoreRows, axis: 1)  // [B, L, K]
+            let order = MLX.argSort(-stackedScores, axis: -1)
+            outCandidates = MLX.takeAlong(candidates, order, axis: -1)
+        }
+        if let dumpPath = Self.latticeDumpPath, temperature <= 0 {
+            Self.dumpLattice(
+                to: dumpPath, candidates: candidates, unary: unary,
+                edges0: edges0, edges: edges, path: path)
+        }
         return (
-            MLX.stacked(path, axis: 1), candidates,
+            MLX.stacked(path, axis: 1), outCandidates,
             qRows.isEmpty ? nil : MLX.stacked(qRows, axis: 1)
         )
+    }
+
+    /// Set by DFLASH2_ACCEPT_LOG: the iterator's measurement mode wants
+    /// score-ranked candidates in the packed transfer.
+    private static let acceptLogRankOrder =
+        ProcessInfo.processInfo.environment["DFLASH2_ACCEPT_LOG"] != nil
+
+    /// DFLASH2_LATTICE_DUMP=<file>: append one JSON line per greedy proposal
+    /// with the raw selector lattice (candidate ids, unary scores, bigram
+    /// edges, chosen path) — the offline path-policy search corpus. The
+    /// iterator writes the matching targets to `<file>.accept`.
+    private static let latticeDumpPath =
+        ProcessInfo.processInfo.environment["DFLASH2_LATTICE_DUMP"]
+    nonisolated(unsafe) private static var latticeDumpRound = 0
+
+    private static func dumpLattice(
+        to file: String, candidates: MLXArray, unary: MLXArray,
+        edges0: MLXArray, edges: MLXArray, path: [MLXArray]
+    ) {
+        let pathArray = MLX.stacked(path, axis: 1)
+        eval(candidates, unary, edges0, edges, pathArray)
+        let L = candidates.dim(1)
+        let K = candidates.dim(2)
+        let cand = candidates.flattened().asArray(Int32.self)
+        let un = unary.asType(.float32).flattened().asArray(Float.self)
+        let e0 = edges0.asType(.float32).flattened().asArray(Float.self)
+        let ed = edges.asType(.float32).flattened().asArray(Float.self)
+        let chosen = pathArray.flattened().asArray(Int32.self)
+        var line = "{\"r\":\(latticeDumpRound),\"L\":\(L),\"K\":\(K)"
+        line += ",\"cand\":\(cand),\"unary\":\(un),\"e0\":\(e0)"
+        line += ",\"edges\":\(ed),\"path\":\(chosen)}\n"
+        latticeDumpRound += 1
+        if let handle = FileHandle(forWritingAtPath: file) {
+            handle.seekToEndOfFile()
+            handle.write(Data(line.utf8))
+            try? handle.close()
+        } else {
+            FileManager.default.createFile(
+                atPath: file, contents: Data(line.utf8))
+        }
     }
 }
 
@@ -819,6 +1045,80 @@ public final class DFlash2DraftModel: Module, DFlash2DrafterModel {
         }
         return selected
     }
+
+    /// Greedy proposal with a host-side lattice walk: the batched scoring
+    /// (top-K candidates, unary, bigram edges) stays on GPU; the sequential
+    /// path trace runs on the host over one small D2H (≈7 KB), where the
+    /// iterator's advisor can force a candidate from stream-history
+    /// n-grams — a signal the drafter cannot see. Falls back to the on-GPU
+    /// walk when sampling (advisors are a greedy-path feature).
+    public func dflashProposeAdvised(
+        _ inputs: MLXArray,
+        targetHidden: MLXArray,
+        cache: [DFlash2ContextCache],
+        temperature: Float,
+        logitsStart: Int,
+        pathAdvisor: DFlash2PathAdvisor?
+    ) -> (tokens: MLXArray, candidates: MLXArray, probabilities: MLXArray?) {
+        guard let pathAdvisor, temperature <= 0 else {
+            return dflashPropose(
+                inputs, targetHidden: targetHidden, cache: cache,
+                temperature: temperature, logitsStart: logitsStart)
+        }
+        let hidden = hiddenStates(
+            inputs, targetHidden: targetHidden, cache: cache, logitsStart: logitsStart)
+        let logits = computeLogits(hidden)
+        let (candidates, unary, edges0, edges) = candidateSelector.latticeParts(
+            hidden: hidden, logits: logits, anchorIds: inputs[0..., 0])
+
+        let L = candidates.dim(1)
+        let K = candidates.dim(2)
+        eval(candidates, unary, edges0, edges)
+        let cand = candidates.flattened().asArray(Int32.self)
+        let un = unary.asType(.float32).flattened().asArray(Float.self)
+        let e0 = edges0.asType(.float32).flattened().asArray(Float.self)
+        let ed =
+            L > 1 ? edges.asType(.float32).flattened().asArray(Float.self) : []
+
+        let lambda = Self.selectorLambda
+        var chosen: [Int] = []
+        var prev = 0
+        for t in 0 ..< L {
+            let rowCandidates = (0 ..< K).map { Int(cand[t * K + $0]) }
+            var pick: Int?
+            if let forced = pathAdvisor(chosen, rowCandidates),
+                let index = rowCandidates.firstIndex(of: forced)
+            {
+                pick = index
+            }
+            if pick == nil {
+                var bestIndex = 0
+                var bestScore = -Float.infinity
+                for k in 0 ..< K {
+                    let edge = t == 0 ? e0[k] : ed[((t - 1) * K + prev) * K + k]
+                    let score = un[t * K + k] + lambda * edge
+                    if score > bestScore {
+                        bestScore = score
+                        bestIndex = k
+                    }
+                }
+                pick = bestIndex
+            }
+            prev = pick!
+            chosen.append(rowCandidates[prev])
+        }
+        let tokens = MLXArray(chosen.map(Int32.init)).expandedDimensions(axis: 0)
+        return (tokens, candidates, nil)
+    }
+
+    /// Edge-score weight for the host-side walk (`DFLASH2_SELECTOR_LAMBDA`,
+    /// default 1 = the trained selector's own combination).
+    private static let selectorLambda: Float = {
+        guard let raw = ProcessInfo.processInfo.environment["DFLASH2_SELECTOR_LAMBDA"],
+            let value = Float(raw)
+        else { return 1.0 }
+        return value
+    }()
 
     // MARK: Compiled draft forward
 
@@ -1019,6 +1319,104 @@ public final class DFlash2DraftModel: Module, DFlash2DrafterModel {
         return nil  // unreachable: the loop returns at the final segment
     }
 
+    // MARK: Pipelined (accept-invariant) propose
+
+    /// Build the NEXT round's greedy proposal while the current round's
+    /// verify pass is still on the GPU. Accept-dependent values ride as lazy
+    /// arrays: the anchor id inside `blockIds`, the committed-row count
+    /// `validCount`, and the block RoPE offset. ALL verify rows are appended
+    /// to staging clones of the context caches with explicit positions;
+    /// rows past the accept count are excluded by a validity mask, so the
+    /// one prebuilt graph is correct for every accept outcome (committed
+    /// rows' K/V are bitwise the row-wise math of the synchronous route).
+    public func dflashProposePipelined(
+        blockIds: MLXArray,
+        targetHidden: MLXArray,
+        validCount: MLXArray,
+        contextPositionBase: Int,
+        blockPositionOffset: MLXArray,
+        caches: [DFlash2ContextCache]
+    ) -> DFlash2PipelinedProposal? {
+        guard !draftCompiledDisabled, layerTypesAllSliding, embedTokens != nil,
+            !layers.isEmpty, caches.count == layers.count,
+            let window = layers[0].selfAttn.slidingWindow,
+            !layers[0].selfAttn.isCausal
+        else { return nil }
+        let s = targetHidden.dim(1)
+        let width = blockIds.dim(1)
+        guard let keep = config.contextKeepCount, s <= keep,
+            s <= Self.maxTracedContextRows
+        else { return nil }
+
+        let ctxOffsetArray = MLXArray([Int32(contextPositionBase)])
+        let contextKV = compiledContextFunction(rows: s)([targetHidden, ctxOffsetArray])
+
+        let clones = caches.map { $0.stagingClone() }
+        var layerKV: [(MLXArray, MLXArray)] = []
+        let rowPositions = (0 ..< s).map { Int32(contextPositionBase + $0) }
+        for (i, clone) in clones.enumerated() {
+            layerKV.append(
+                clone.appendPipelined(
+                    keys: contextKV[2 * i], values: contextKV[2 * i + 1],
+                    positions: rowPositions))
+        }
+        let ctxLen = layerKV[0].0.dim(2)
+
+        // Visibility mask [width, ctxLen + width], built lazily: committed
+        // rows within the distance window are visible; placeholder rows (the
+        // just-appended tail past `validCount`, and any unresolved rows from
+        // earlier rounds) are not; the block attends to itself
+        // bidirectionally (non-causal drafter).
+        let oldCount = ctxLen - s
+        let kpos = MLXArray(clones[0].rowPositions)
+        let oldValid = MLXArray(Array(clones[0].rowValid[0 ..< oldCount]))
+        let tailValid = MLXArray(Int32(0) ..< Int32(s)) .< validCount.asType(.int32)
+        let valid = concatenated([oldValid, tailValid])
+        let qpos =
+            blockPositionOffset.asType(.int32) + MLXArray(Int32(0) ..< Int32(width))
+        let distance = qpos.expandedDimensions(axis: 1) - kpos.expandedDimensions(axis: 0)
+        let ctxVisible = valid.expandedDimensions(axis: 0) & (distance .< Int32(window))
+        let blockVisible = MLXArray.ones([width, width], dtype: .bool)
+        let mask = concatenated([ctxVisible, blockVisible], axis: 1)
+
+        var sdpaOutput: MLXArray! = nil
+        var residual: MLXArray! = nil
+        var kernel: MLXArray! = nil
+        var hidden: MLXArray! = nil
+        for index in 0 ... layers.count {
+            let fn = compiledSegmentFunction(index: index, blockWidth: width)
+            let args: [MLXArray]
+            if index == 0 {
+                args = [blockIds, blockPositionOffset]
+            } else if index < layers.count {
+                args = [sdpaOutput, residual, kernel, blockPositionOffset]
+            } else {
+                args = [sdpaOutput, residual, kernel]
+            }
+            let outputs = fn(args)
+            if index == layers.count {
+                hidden = outputs[0]
+                break
+            }
+            residual = outputs[0]
+            kernel = outputs[1]
+            let (contextKeys, contextValues) = layerKV[index]
+            let keys = concatenated([contextKeys, outputs[3]], axis: 2)
+            let values = concatenated([contextValues, outputs[4]], axis: 2)
+            sdpaOutput = MLXFast.scaledDotProductAttention(
+                queries: outputs[2], keys: keys, values: values,
+                scale: layers[index].selfAttn.scale, mask: mask)
+        }
+
+        let h = hidden[0..., 1..., 0...]
+        let logits = computeLogits(h)
+        let selected = candidateSelector.select(
+            hidden: h, logits: logits, anchorIds: blockIds[0..., 0], temperature: 0)
+        return DFlash2PipelinedProposal(
+            tokens: selected.0, candidates: selected.1,
+            stagedCaches: clones, appendedRows: s, width: width)
+    }
+
     /// Checkpoint layout fix-ups. The safetensors stores the selector
     /// codebooks as bare tensors (`candidate_selector.predecessor_codebook`),
     /// which the `Embedding` modules expect under a `.weight` suffix.
@@ -1058,3 +1456,5 @@ public func loadDFlash2Draft(
     }
     return model
 }
+
+extension DFlash2DraftModel: DFlash2PipelinedDrafter {}

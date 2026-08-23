@@ -127,6 +127,14 @@ final class Qwen3NextMLP: Module, UnaryLayer {
     @ModuleInfo(key: "down_proj") var downProj: Linear
     @ModuleInfo(key: "up_proj") var upProj: Linear
 
+    /// Post-load stacked gate+up projection (built by ``stackGateUp()``):
+    /// one QMM launch instead of two for the same input. The outputs are the
+    /// two original ones concatenated along the output axis — bitwise
+    /// identical per element, since every output row keeps its own
+    /// K-accumulation order and quantization groups.
+    var gateUp: QuantizedLinear?
+    var gateDimensions = 0
+
     init(dimensions: Int, hiddenDimensions: Int) {
         _gateProj.wrappedValue = Linear(dimensions, hiddenDimensions, bias: false)
         _downProj.wrappedValue = Linear(hiddenDimensions, dimensions, bias: false)
@@ -134,8 +142,75 @@ final class Qwen3NextMLP: Module, UnaryLayer {
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        downProj(silu(gateProj(x)) * upProj(x))
+        if let gateUp {
+            let gu = gateUp(x)
+            let gate = gu[.ellipsis, 0 ..< gateDimensions]
+            let up = gu[.ellipsis, gateDimensions...]
+            return downProj(silu(gate) * up)
+        }
+        return downProj(silu(gateProj(x)) * upProj(x))
     }
+
+    /// Fold gate_proj + up_proj into one stacked QuantizedLinear and release
+    /// the originals. Returns false (and changes nothing) when the pair is
+    /// not two bias-free QuantizedLinear layers with matching quantization.
+    func stackGateUp() -> Bool {
+        guard gateUp == nil,
+            let g = gateProj as? QuantizedLinear,
+            let u = upProj as? QuantizedLinear,
+            g.bias == nil, u.bias == nil,
+            g.groupSize == u.groupSize, g.bits == u.bits, g.mode == u.mode
+        else { return false }
+        let biases: MLXArray?
+        switch (g.biases, u.biases) {
+        case (let gb?, let ub?): biases = concatenated([gb, ub], axis: 0)
+        case (nil, nil): biases = nil
+        default: return false
+        }
+        let weight = concatenated([g.weight, u.weight], axis: 0)
+        let scales = concatenated([g.scales, u.scales], axis: 0)
+        eval(weight, scales, biases ?? weight)
+        gateDimensions = g.weight.dim(0)
+        gateUp = QuantizedLinear(
+            weight: weight, bias: nil, scales: scales, biases: biases,
+            groupSize: g.groupSize, bits: g.bits, mode: g.mode)
+        // Free the unstacked copies (the concat above owns the only data now
+        // needed); the placeholders are never called while gateUp is set.
+        // @ModuleInfo properties reject direct assignment once registered —
+        // replacement must go through update(modules:).
+        update(
+            modules: ModuleChildren.unflattened([
+                ("gate_proj", Linear(weight: MLXArray.zeros([1, 1]))),
+                ("up_proj", Linear(weight: MLXArray.zeros([1, 1]))),
+            ]))
+        return true
+    }
+}
+
+/// Stack every same-input projection group in `model` into one
+/// QuantizedLinear each: MLP gate+up (``Qwen3NextMLP/stackGateUp()``), the
+/// GDN four-way in-projection, and attention q/k/v. Bitwise-neutral — each
+/// output row keeps its own K-accumulation order and quantization groups.
+/// Returns the number of groups stacked.
+public func dflash2StackGateUpProjections(model: Module) -> Int {
+    var stacked = 0
+    for module in model.modules() {
+        switch module {
+        case let mlp as Qwen3NextMLP:
+            if mlp.stackGateUp() { stacked += 1 }
+        case let gdn as Qwen35GatedDeltaNet:
+            if gdn.stackInProjections() { stacked += 1 }
+        case let attn as Qwen35Attention:
+            if attn.stackQKVProjections() { stacked += 1 }
+        case let mlp as DFlash2MLP:
+            if mlp.stackGateUp() { stacked += 1 }
+        case let attn as DFlash2Attention:
+            if attn.stackProjections() { stacked += 1 }
+        default:
+            break
+        }
+    }
+    return stacked
 }
 
 public final class Qwen3NextGatedDeltaNet: Module {

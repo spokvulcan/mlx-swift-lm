@@ -272,6 +272,26 @@ public struct Qwen35TextConfiguration: Codable, Sendable {
 // MARK: - GatedDeltaNet
 
 final class Qwen35GatedDeltaNet: Module {
+    /// Fold the weightless q/k RMS norms (plus their scale factors) into the
+    /// `gated_delta_step` kernel's load path instead of launching separate
+    /// RMSNorm + multiply kernels. Both decode arms share the kernel, so
+    /// spec==AR identity is preserved by construction — but the fused norm
+    /// computes in f32 without eager's bf16 intermediate roundings, which
+    /// shifts the greedy trajectory and re-rolls draft acceptance (ledger
+    /// R44: 45.7% -> 33.6% on the canonical prompt, a net -12 tok/s).
+    /// Off by default; opt in with DFLASH2_FUSED_QKNORM=1.
+    static let fusedQKNormEnabled =
+        ProcessInfo.processInfo.environment["DFLASH2_FUSED_QKNORM"] == "1"
+
+    /// Verify-path sliding conv as in-trace elementwise multiply-adds (the
+    /// S>1 generalization of `decodeConv` — same tap order, f32 accumulation,
+    /// single final round; bitwise-verified vs the `Convolution` kernel at
+    /// S=3/S=8). REFUTED for speed (ledger R49: the specialized Convolution
+    /// kernel beats the fused f32 tap chain by ~1.2-1.5 tok/s same-binary
+    /// A/B). Off by default; opt in with DFLASH2_ELEMENTWISE_CONV=1.
+    static let elementwiseConvEnabled =
+        ProcessInfo.processInfo.environment["DFLASH2_ELEMENTWISE_CONV"] == "1"
+
     let hiddenSize: Int
     let numVHeads: Int
     let numKHeads: Int
@@ -293,6 +313,53 @@ final class Qwen35GatedDeltaNet: Module {
 
     @ModuleInfo(key: "norm") var norm: Qwen3NextRMSNormGated
     @ModuleInfo(key: "out_proj") var outProj: Linear
+
+    /// Post-load stacked in-projection (qkv | z | b | a — one QMM for the
+    /// four same-input launches; bitwise-identical per element). Built by
+    /// ``stackInProjections()``.
+    var inProjStacked: QuantizedLinear?
+
+    /// Fold the four same-input in-projections into one stacked
+    /// QuantizedLinear and release the originals. Returns false (and changes
+    /// nothing) unless all four are bias-free QuantizedLinear layers with
+    /// matching quantization.
+    func stackInProjections() -> Bool {
+        guard inProjStacked == nil,
+            let qkv = inProjQKV as? QuantizedLinear,
+            let z = inProjZ as? QuantizedLinear,
+            let b = inProjB as? QuantizedLinear,
+            let a = inProjA as? QuantizedLinear
+        else { return false }
+        let parts = [qkv, z, b, a]
+        guard parts.allSatisfy({ $0.bias == nil }),
+            parts.allSatisfy({
+                $0.groupSize == qkv.groupSize && $0.bits == qkv.bits && $0.mode == qkv.mode
+            })
+        else { return false }
+        let quantBiases = parts.compactMap(\.biases)
+        let biases: MLXArray?
+        if quantBiases.count == parts.count {
+            biases = concatenated(quantBiases, axis: 0)
+        } else if quantBiases.isEmpty {
+            biases = nil
+        } else {
+            return false
+        }
+        let weight = concatenated(parts.map(\.weight), axis: 0)
+        let scales = concatenated(parts.map(\.scales), axis: 0)
+        eval(weight, scales, biases ?? weight)
+        inProjStacked = QuantizedLinear(
+            weight: weight, bias: nil, scales: scales, biases: biases,
+            groupSize: qkv.groupSize, bits: qkv.bits, mode: qkv.mode)
+        update(
+            modules: ModuleChildren.unflattened([
+                ("in_proj_qkv", Linear(weight: MLXArray.zeros([1, 1]))),
+                ("in_proj_z", Linear(weight: MLXArray.zeros([1, 1]))),
+                ("in_proj_b", Linear(weight: MLXArray.zeros([1, 1]))),
+                ("in_proj_a", Linear(weight: MLXArray.zeros([1, 1]))),
+            ]))
+        return true
+    }
 
     init(_ args: Qwen35TextConfiguration) {
         self.hiddenSize = args.hiddenSize
@@ -390,10 +457,24 @@ final class Qwen35GatedDeltaNet: Module {
         let B = x.dim(0)
         let S = x.dim(1)
 
-        var qkv = inProjQKV(x)
-        let z = inProjZ(x).reshaped(B, S, numVHeads, headVDim)
-        let b = inProjB(x)
-        let a = inProjA(x)
+        var qkv: MLXArray
+        let z: MLXArray
+        let b: MLXArray
+        let a: MLXArray
+        if let stacked = inProjStacked {
+            let all = stacked(x)
+            let zEnd = convDim + valueDim
+            let bEnd = zEnd + numVHeads
+            qkv = all[.ellipsis, 0 ..< convDim]
+            z = all[.ellipsis, convDim ..< zEnd].reshaped(B, S, numVHeads, headVDim)
+            b = all[.ellipsis, zEnd ..< bEnd]
+            a = all[.ellipsis, bEnd...]
+        } else {
+            qkv = inProjQKV(x)
+            z = inProjZ(x).reshaped(B, S, numVHeads, headVDim)
+            b = inProjB(x)
+            a = inProjA(x)
+        }
 
         if let mask {
             qkv = MLX.where(mask[.ellipsis, .newAxis], qkv, 0)
@@ -412,14 +493,25 @@ final class Qwen35GatedDeltaNet: Module {
         let k = convSplit[1].reshaped(B, S, numKHeads, headKDim)
         let v = convSplit[2].reshaped(B, S, numVHeads, headVDim)
 
-        let dtype = q.dtype
-        let invScale = pow(Float(headKDim), -0.5)
-        let qNormed =
-            MLXArray(pow(invScale, 2)).asType(dtype)
-            * MLXFast.rmsNorm(q, weight: MLXArray.mlxNone, eps: 1e-6)
-        let kNormed =
-            MLXArray(invScale).asType(dtype)
-            * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
+        // With the fused q/k norm the raw projections go straight into the
+        // scan kernel, which norms + scales them on load (both decode arms
+        // run the same kernel, so spec==AR identity is preserved).
+        let fusedNorm = Self.fusedQKNormEnabled
+        let qNormed: MLXArray
+        let kNormed: MLXArray
+        if fusedNorm {
+            qNormed = q
+            kNormed = k
+        } else {
+            let dtype = q.dtype
+            let invScale = pow(Float(headKDim), -0.5)
+            qNormed =
+                MLXArray(pow(invScale, 2)).asType(dtype)
+                * MLXFast.rmsNorm(q, weight: MLXArray.mlxNone, eps: 1e-6)
+            kNormed =
+                MLXArray(invScale).asType(dtype)
+                * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
+        }
 
         // DFlash2 verify passes record everything a prefix-replay rollback
         // needs (see rollbackSpeculativeHybridCaches in MLXLMCommon).
@@ -430,7 +522,8 @@ final class Qwen35GatedDeltaNet: Module {
                     q: qNormed, k: kNormed, v: v, a: a, b: b,
                     aLog: aLog, dtBias: dtBias,
                     initialState: recState, mask: mask,
-                    convKernelSize: convKernelSize))
+                    convKernelSize: convKernelSize,
+                    qkNorm: fusedNorm))
         }
 
         let out: MLXArray
@@ -448,7 +541,8 @@ final class Qwen35GatedDeltaNet: Module {
                 aLog: aLog,
                 dtBias: dtBias,
                 state: recState,
-                mask: prefixMask)
+                mask: prefixMask,
+                qkNorm: fusedNorm)
             let (suffixOut, suffixState) = gatedDeltaUpdate(
                 q: qNormed[0..., split..., 0..., 0...],
                 k: kNormed[0..., split..., 0..., 0...],
@@ -458,7 +552,8 @@ final class Qwen35GatedDeltaNet: Module {
                 aLog: aLog,
                 dtBias: dtBias,
                 state: prefixState,
-                mask: suffixMask)
+                mask: suffixMask,
+                qkNorm: fusedNorm)
             out = concatenated([prefixOut, suffixOut], axis: 1)
             newRecState = suffixState
 
@@ -482,7 +577,8 @@ final class Qwen35GatedDeltaNet: Module {
                 aLog: aLog,
                 dtBias: dtBias,
                 state: recState,
-                mask: mask)
+                mask: mask,
+                qkNorm: fusedNorm)
             checkpoint = nil
         }
 
@@ -505,13 +601,51 @@ final class Qwen35GatedDeltaNet: Module {
         let B = x.dim(0)
         let S = x.dim(1)
 
-        let qkv = inProjQKV(x)
-        let z = inProjZ(x).reshaped(B, S, numVHeads, headVDim)
-        let b = inProjB(x)
-        let a = inProjA(x)
+        let qkv: MLXArray
+        let z: MLXArray
+        let b: MLXArray
+        let a: MLXArray
+        if let stacked = inProjStacked {
+            let all = stacked(x)
+            let zEnd = convDim + valueDim
+            let bEnd = zEnd + numVHeads
+            qkv = all[.ellipsis, 0 ..< convDim]
+            z = all[.ellipsis, convDim ..< zEnd].reshaped(B, S, numVHeads, headVDim)
+            b = all[.ellipsis, zEnd ..< bEnd]
+            a = all[.ellipsis, bEnd...]
+        } else {
+            qkv = inProjQKV(x)
+            z = inProjZ(x).reshaped(B, S, numVHeads, headVDim)
+            b = inProjB(x)
+            a = inProjA(x)
+        }
 
+        // One concat serves the conv, the trailing conv state, AND the
+        // rollback capture (generalConv would build its own duplicate).
         let convInput = concatenated([convState, qkv], axis: 1)
-        let (convPre, newConvState) = generalConv(convState: convState, qkv: qkv)
+        let newConvState = contiguous(convInput[0..., (-(convKernelSize - 1))..., 0...])
+        let convPre: MLXArray
+        if Self.elementwiseConvEnabled,
+            qkv.dtype == .float16 || qkv.dtype == .bfloat16
+        {
+            // In-trace elementwise sliding conv (the S>1 generalization of
+            // `decodeConv`): same tap order, f32 accumulation, single final
+            // round — pinned bitwise against the `Convolution` kernel for
+            // f16/bf16 — and `compile` fuses it into the segment instead of
+            // dispatching a separate Convolution launch per layer.
+            var acc =
+                convInput[0..., 0 ..< S, 0...].asType(.float32)
+                * conv1d.weight[0..., 0, 0].asType(.float32)
+            for tap in 1 ..< convKernelSize {
+                acc =
+                    acc
+                    + convInput[0..., tap ..< (tap + S), 0...].asType(.float32)
+                    * conv1d.weight[0..., tap, 0].asType(.float32)
+            }
+            convPre = acc.asType(qkv.dtype)
+        } else {
+            convPre = conv1d(convInput)
+        }
         let convOut = silu(convPre)
 
         let convSplit = MLX.split(convOut, indices: [keyDim, 2 * keyDim], axis: -1)
@@ -519,18 +653,27 @@ final class Qwen35GatedDeltaNet: Module {
         let k = convSplit[1].reshaped(B, S, numKHeads, headKDim)
         let v = convSplit[2].reshaped(B, S, numVHeads, headVDim)
 
-        let dtype = q.dtype
-        let invScale = pow(Float(headKDim), -0.5)
-        let qNormed =
-            MLXArray(pow(invScale, 2)).asType(dtype)
-            * MLXFast.rmsNorm(q, weight: MLXArray.mlxNone, eps: 1e-6)
-        let kNormed =
-            MLXArray(invScale).asType(dtype)
-            * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
+        let fusedNorm = Self.fusedQKNormEnabled
+        let qNormed: MLXArray
+        let kNormed: MLXArray
+        if fusedNorm {
+            qNormed = q
+            kNormed = k
+        } else {
+            let dtype = q.dtype
+            let invScale = pow(Float(headKDim), -0.5)
+            qNormed =
+                MLXArray(pow(invScale, 2)).asType(dtype)
+                * MLXFast.rmsNorm(q, weight: MLXArray.mlxNone, eps: 1e-6)
+            kNormed =
+                MLXArray(invScale).asType(dtype)
+                * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
+        }
 
         let (out, newRecState) = gatedDeltaUpdate(
             q: qNormed, k: kNormed, v: v, a: a, b: b,
-            aLog: aLog, dtBias: dtBias, state: recState, mask: nil)
+            aLog: aLog, dtBias: dtBias, state: recState, mask: nil,
+            qkNorm: fusedNorm)
 
         let gated = norm(out, gate: z)
         return (
@@ -593,6 +736,52 @@ final class Qwen35Attention: Module {
 
     let rope: RoPELayer
 
+    /// Post-load stacked q|k|v projection (one QMM for the three same-input
+    /// launches; bitwise-identical per element). Built by
+    /// ``stackQKVProjections()``.
+    var qkvStacked: QuantizedLinear?
+    var qkvStackedDims: (q: Int, k: Int) = (0, 0)
+
+    /// Fold q/k/v into one stacked QuantizedLinear and release the originals.
+    /// Returns false (and changes nothing) unless all three are bias-free
+    /// QuantizedLinear layers with matching quantization.
+    func stackQKVProjections() -> Bool {
+        guard qkvStacked == nil,
+            let q = qProj as? QuantizedLinear,
+            let k = kProj as? QuantizedLinear,
+            let v = vProj as? QuantizedLinear
+        else { return false }
+        let parts = [q, k, v]
+        guard parts.allSatisfy({ $0.bias == nil }),
+            parts.allSatisfy({
+                $0.groupSize == q.groupSize && $0.bits == q.bits && $0.mode == q.mode
+            })
+        else { return false }
+        let quantBiases = parts.compactMap(\.biases)
+        let biases: MLXArray?
+        if quantBiases.count == parts.count {
+            biases = concatenated(quantBiases, axis: 0)
+        } else if quantBiases.isEmpty {
+            biases = nil
+        } else {
+            return false
+        }
+        let weight = concatenated(parts.map(\.weight), axis: 0)
+        let scales = concatenated(parts.map(\.scales), axis: 0)
+        eval(weight, scales, biases ?? weight)
+        qkvStackedDims = (q.weight.dim(0), k.weight.dim(0))
+        qkvStacked = QuantizedLinear(
+            weight: weight, bias: nil, scales: scales, biases: biases,
+            groupSize: q.groupSize, bits: q.bits, mode: q.mode)
+        update(
+            modules: ModuleChildren.unflattened([
+                ("q_proj", Linear(weight: MLXArray.zeros([1, 1]))),
+                ("k_proj", Linear(weight: MLXArray.zeros([1, 1]))),
+                ("v_proj", Linear(weight: MLXArray.zeros([1, 1]))),
+            ]))
+        return true
+    }
+
     init(_ args: Qwen35TextConfiguration) {
         let headDim = args.headDim ?? (args.hiddenSize / args.attentionHeads)
         self.attentionHeads = args.attentionHeads
@@ -652,13 +841,24 @@ final class Qwen35Attention: Module {
         let B = x.dim(0)
         let L = x.dim(1)
 
-        let qProjOutput = qProj(x)
+        let qProjOutput: MLXArray
+        var keys: MLXArray
+        var values: MLXArray
+        if let stacked = qkvStacked {
+            let all = stacked(x)
+            let qEnd = qkvStackedDims.q
+            let kEnd = qEnd + qkvStackedDims.k
+            qProjOutput = all[.ellipsis, 0 ..< qEnd]
+            keys = all[.ellipsis, qEnd ..< kEnd]
+            values = all[.ellipsis, kEnd...]
+        } else {
+            qProjOutput = qProj(x)
+            keys = kProj(x)
+            values = vProj(x)
+        }
         let qSplit = qProjOutput.reshaped(B, L, attentionHeads, -1).split(parts: 2, axis: -1)
         var queries = qSplit[0]
         let gate = qSplit[1].reshaped(B, L, -1)
-
-        var keys = kProj(x)
-        var values = vProj(x)
 
         queries = qNorm(queries).transposed(0, 2, 1, 3)
         keys = kNorm(keys.reshaped(B, L, kvHeads, -1)).transposed(0, 2, 1, 3)
@@ -674,6 +874,15 @@ final class Qwen35Attention: Module {
             .transposed(0, 2, 1, 3)
             .reshaped(attention.dim(0), attention.dim(2), -1)
         return oProj(sigmoidMultiply(merged, gate))
+    }
+}
+
+/// The cache's rope offset as a `[1]` array — a trace input for the compiled
+/// decode/verify segments (`.batch` semantics, batch size 1).
+private func ropeOffsetArray(_ cache: KVCache) -> MLXArray {
+    switch cache.ropeOffset {
+    case .scalar(let v): MLXArray([Int32(v)])
+    case .batch(let a): a
     }
 }
 
@@ -894,7 +1103,8 @@ final class Qwen35DecoderLayer: Module {
         compileLock.lock()
         if compiledAttentionPre == nil {
             compiledAttentionPre = compile { [unowned self] args in
-                let (queries, gate, keys, values) = attentionPreBody(x: args[0])
+                let (queries, gate, keys, values) = attentionPreBody(
+                    x: args[0], ropeOffset: args[1])
                 return [queries, gate, keys, values]
             }
         }
@@ -907,28 +1117,26 @@ final class Qwen35DecoderLayer: Module {
         let post = compiledAttentionPost!
         compileLock.unlock()
 
-        let projected = pre([x])
+        let projected = pre([x, ropeOffsetArray(cache)])
         let attention = attentionCacheStep(
             queries: projected[0], keys: projected[2], values: projected[3],
             cache: cache, mask: mask)
         return post([x, attention, projected[1]])[0]
     }
 
-    /// The part of a full-attention decode step that cannot be traced: rope
-    /// (its offset moves every token), the KV write, and the SDPA over the
-    /// grown cache.
+    /// The part of a full-attention decode step that cannot be traced: the KV
+    /// write and the SDPA over the grown cache. Rope lives inside the traces
+    /// (`attentionPreBody`) — `queries`/`keys` arrive already rotated.
     func attentionCacheStep(
         queries: MLXArray, keys: MLXArray, values: MLXArray,
         cache: KVCache, mask: MLXFast.ScaledDotProductAttentionMaskMode
     ) -> MLXArray {
-        let attn = selfAttn!
-        let offset = cache.ropeOffset
-        return attentionWithCacheUpdate(
-            queries: applyRotaryPosition(attn.rope, to: queries, offset: offset),
-            keys: applyRotaryPosition(attn.rope, to: keys, offset: offset),
+        attentionWithCacheUpdate(
+            queries: queries,
+            keys: keys,
             values: values,
             cache: cache,
-            scale: attn.scale,
+            scale: selfAttn!.scale,
             mask: mask
         )
     }
@@ -960,8 +1168,20 @@ final class Qwen35DecoderLayer: Module {
         )
     }
 
-    func attentionPreBody(x: MLXArray) -> (MLXArray, MLXArray, MLXArray, MLXArray) {
-        selfAttn!.projectPreRope(inputLayerNorm(x))
+    /// `ropeOffset` is a `[1]` array riding in as a trace input, so rope can
+    /// live inside a compiled segment even though its offset moves every
+    /// token (same device as the drafter's `draftPreBody`).
+    func attentionPreBody(x: MLXArray, ropeOffset: MLXArray) -> (
+        MLXArray, MLXArray, MLXArray, MLXArray
+    ) {
+        let attn = selfAttn!
+        let (q, gate, k, values) = attn.projectPreRope(inputLayerNorm(x))
+        return (
+            applyRotaryPosition(attn.rope, to: q, offset: .batch(ropeOffset)),
+            gate,
+            applyRotaryPosition(attn.rope, to: k, offset: .batch(ropeOffset)),
+            values
+        )
     }
 
     /// `x` is the layer input — the residual branch around the attention block.
@@ -1142,7 +1362,8 @@ public class Qwen35TextModelInner: Module {
         }
 
         if let pre = segment.attentionPreLayer {
-            let (queries, gate, keys, values) = layers[pre].attentionPreBody(x: hiddenStates)
+            let (queries, gate, keys, values) = layers[pre].attentionPreBody(
+                x: hiddenStates, ropeOffset: args.last!)
             // The next segment needs the attention layer's input for its residual.
             return [hiddenStates] + states + [queries, gate, keys, values]
         }
@@ -1194,6 +1415,9 @@ public class Qwen35TextModelInner: Module {
                 args.append(mambaCache[0]!)
                 args.append(mambaCache[1]!)
             }
+            if let pre = segment.attentionPreLayer {
+                args.append(ropeOffsetArray(cache[pre]!))
+            }
 
             compileLock.lock()
             if compiledSegments[segmentIndex] == nil {
@@ -1243,6 +1467,25 @@ public class Qwen35TextModelInner: Module {
         ProcessInfo.processInfo.environment["DFLASH2_VERIFY"] == "eager"
     }
 
+    /// Verify sub-phase decomposition (`DFLASH2_VERIFY_PROFILE=1`): compiled
+    /// segments vs eager attention boundaries, eval-synced per phase.
+    /// Incremental scheduling of the verify build (probe-only, default OFF):
+    /// every Nth attention boundary is asyncEval'd so the GPU starts before
+    /// the whole graph is spliced. REFUTED as a default by a same-thermal
+    /// bare A/B (47.7 tok/s off vs 45.0 at stride 3): command-buffer
+    /// fragmentation costs more than the overlap buys once the pipelined
+    /// round has removed the propose from the critical path. Set
+    /// `DFLASH2_VERIFY_STREAM=<stride>` to probe.
+    private static let verifyStreamStride: Int = {
+        guard let raw = ProcessInfo.processInfo.environment["DFLASH2_VERIFY_STREAM"],
+            let value = Int(raw)
+        else { return 0 }
+        return value
+    }()
+    private static let verifyStreamEnabled = verifyStreamStride > 0
+    private static let verifyProfileEnabled =
+        ProcessInfo.processInfo.environment["DFLASH2_VERIFY_PROFILE"] == "1"
+
     /// One traced piece of a verify pass, mirroring `segmentBody` with two
     /// additions: every GDN layer also emits its rollback capture pieces (a
     /// trace cannot call `GDNCaptureContext.record`), and layers in
@@ -1285,7 +1528,8 @@ public class Qwen35TextModelInner: Module {
 
         var outputs = [hiddenStates] + states + captures
         if let pre = segment.attentionPreLayer {
-            let (queries, gate, keys, values) = layers[pre].attentionPreBody(x: hiddenStates)
+            let (queries, gate, keys, values) = layers[pre].attentionPreBody(
+                x: hiddenStates, ropeOffset: args.last!)
             outputs += [queries, gate, keys, values]
         }
         return outputs
@@ -1310,10 +1554,11 @@ public class Qwen35TextModelInner: Module {
     /// in `0 ..< layers.count` is served by exactly one segment (an attention
     /// layer's completed output is the next segment's opening tail), so the
     /// range check up front makes the reassembly total.
-    private func verifyStep(
+    func verifyStep(
         _ inputs: MLXArray, _ cache: [KVCache?],
         captureLayers: Set<Int>, captureBox: DFlash2HiddenCaptureBox,
-        gdnCapture: GDNCaptureContext
+        gdnCapture: GDNCaptureContext,
+        plan: DFlash2PipelinedVerifyPlan? = nil
     ) -> MLXArray? {
         let S = inputs.dim(1)
         guard S > 1, cache.count == layers.count, !Self.verifyCompiledDisabled else {
@@ -1324,7 +1569,11 @@ public class Qwen35TextModelInner: Module {
             return nil
         }
         guard let faCache = cache[faIdx] else { return nil }
-        let faMask = createAttentionMask(h: inputs, cache: faCache)
+        // Pipelined (stage-2) passes replace the host-offset causal mask with
+        // the plan's lazy visibility mask; `createAttentionMask` would read a
+        // lagging offset.
+        let faMask: MLXFast.ScaledDotProductAttentionMaskMode =
+            plan == nil ? createAttentionMask(h: inputs, cache: faCache) : .none
 
         var mambaCaches = [MambaCache?](repeating: nil, count: layers.count)
         for (i, layer) in layers.enumerated() {
@@ -1341,6 +1590,8 @@ public class Qwen35TextModelInner: Module {
                 guard let kv = cache[i], hasPlainAttentionRoute(kv) else {
                     return nil
                 }
+                // The pipelined write path needs the padded-buffer cache.
+                if plan != nil, !(kv is KVCacheSimple) { return nil }
             }
         }
 
@@ -1353,6 +1604,25 @@ public class Qwen35TextModelInner: Module {
         var gdnTraceOutputs: [Int: [MLXArray]] = [:]
         var gdnTraceInputs: [Int: (conv: MLXArray, rec: MLXArray)] = [:]
 
+        // Sub-phase decomposition under DFLASH2_VERIFY_PROFILE=1: compiled
+        // segments vs the eager attention boundaries. The forced per-phase
+        // evals inflate the absolute total (16 pipeline drains); the SPLIT is
+        // the measurement.
+        let vprofile = Self.verifyProfileEnabled
+        // Op-census window (MLX_OP_CENSUS=1, vprofile mode only — the forced
+        // per-phase evals make every verify op dispatch inside this scope, so
+        // the census counts exactly the verify pass).
+        let census = vprofile && ProcessInfo.processInfo.environment["MLX_OP_CENSUS"] == "1"
+        if census { setenv("MLX_OP_CENSUS_ACTIVE", "1", 1) }
+        defer { if census { setenv("MLX_OP_CENSUS_ACTIVE", "0", 1) } }
+        var segSeconds = 0.0
+        var attnSeconds = 0.0
+        func vmark(_ total: inout Double, since start: ContinuousClock.Instant) {
+            let elapsed = ContinuousClock.now - start
+            total += Double(elapsed.components.seconds)
+                + Double(elapsed.components.attoseconds) / 1e18
+        }
+
         for (segmentIndex, segment) in decodeSegments.enumerated() {
             var args: [MLXArray] = [carry] + pendingAttention
             for layerIndex in segment.linearLayers {
@@ -1360,6 +1630,11 @@ public class Qwen35TextModelInner: Module {
                 args.append(mambaCache[0]!)
                 args.append(mambaCache[1]!)
                 gdnTraceInputs[layerIndex] = (mambaCache[0]!, mambaCache[1]!)
+            }
+            if let pre = segment.attentionPreLayer {
+                // Pipelined passes rope at the lazy start position (the
+                // traces take the offset as a `[1]` array input either way).
+                args.append(plan.map { $0.kvStart } ?? ropeOffsetArray(cache[pre]!))
             }
 
             let key = VerifySegmentKey(
@@ -1375,7 +1650,12 @@ public class Qwen35TextModelInner: Module {
             }
             let fn = compiledVerifySegments[key]!
             compileLock.unlock()
+            let segStart = ContinuousClock.now
             let outputs = fn(args)
+            if vprofile {
+                eval(outputs)
+                vmark(&segSeconds, since: segStart)
+            }
 
             carry = outputs[0]
             let stateCount = 8 * segment.linearLayers.count
@@ -1397,11 +1677,45 @@ public class Qwen35TextModelInner: Module {
             pendingAttention = []
             if let pre = segment.attentionPreLayer {
                 let head = 1 + stateCount + captureCount
-                let attention = layers[pre].attentionCacheStep(
-                    queries: outputs[head], keys: outputs[head + 2],
-                    values: outputs[head + 3], cache: cache[pre]!, mask: faMask)
+                let attnStart = ContinuousClock.now
+                let attention: MLXArray
+                if let plan {
+                    // Stage-2 boundary: dynamic KV write at the lazy start,
+                    // SDPA over the worst-case slice under the plan's mask.
+                    let kvCache = cache[pre] as! KVCacheSimple
+                    let (cachedKeys, cachedValues) = kvCache.updatePipelined(
+                        keys: outputs[head + 2], values: outputs[head + 3],
+                        start: plan.kvStart, worstLen: plan.worstLen)
+                    attention = MLXFast.scaledDotProductAttention(
+                        queries: outputs[head], keys: cachedKeys, values: cachedValues,
+                        scale: layers[pre].selfAttn!.scale, mask: .array(plan.attnMask))
+                } else {
+                    attention = layers[pre].attentionCacheStep(
+                        queries: outputs[head], keys: outputs[head + 2],
+                        values: outputs[head + 3], cache: cache[pre]!, mask: faMask)
+                }
+                if vprofile {
+                    eval(attention)
+                    vmark(&attnSeconds, since: attnStart)
+                }
                 pendingAttention = [attention, outputs[head + 1]]
+                // Stream the build: schedule spliced boundaries at the
+                // stride so the GPU chases the host through the verify graph
+                // instead of idling until the round's packed eval.
+                if Self.verifyStreamEnabled, !vprofile,
+                    segmentIndex % Self.verifyStreamStride == Self.verifyStreamStride - 1
+                {
+                    asyncEval(attention)
+                }
             }
+        }
+        if vprofile {
+            FileHandle.standardOutput.write(
+                Data(
+                    String(
+                        format: "[dflash2-bench] verify-seg: %.1fms verify-attn: %.1fms\n",
+                        segSeconds * 1e3, attnSeconds * 1e3
+                    ).utf8))
         }
 
         // Commit the GDN states and publish the rollback captures in GDN
@@ -1420,7 +1734,8 @@ public class Qwen35TextModelInner: Module {
                     a: outputs[6], b: outputs[7],
                     aLog: layer.linearAttn!.aLog, dtBias: layer.linearAttn!.dtBias,
                     initialState: inputs.rec, mask: nil,
-                    convKernelSize: layer.linearAttn!.convKernelSize))
+                    convKernelSize: layer.linearAttn!.convKernelSize,
+                    qkNorm: Qwen35GatedDeltaNet.fusedQKNormEnabled))
         }
         for layerId in captureLayers {
             captureBox.store(layer: layerId, hidden: capturedHidden[layerId]!)
@@ -1466,6 +1781,40 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
         let captureLayerIds = state?[dflash2CaptureLayerIdsKey]
         let gdnCapture = state?[dflash2GDNCaptureContextKey]
         let captureBox = captureLayerIds.map { _ in DFlash2HiddenCaptureBox() }
+
+        if let plan = state?[dflash2PipelinedVerifyPlanKey] {
+            // Stage-2 accept-invariant verify build. On ANY ineligibility,
+            // decline without touching a cache — the general path below would
+            // splice host-offset updates into the in-flight lazy chain. A
+            // result without the captured-hidden key tells the caller to keep
+            // the synchronous round.
+            guard let captureLayerIds, let captureBox, let gdnCapture,
+                let kvCache = cache,
+                let hidden = model.verifyStep(
+                    input.tokens, kvCache.map { $0 as KVCache? },
+                    captureLayers: Set(captureLayerIds),
+                    captureBox: captureBox, gdnCapture: gdnCapture, plan: plan)
+            else {
+                return LMOutput(logits: MLXArray.zeros([1, 1, 1]))
+            }
+            let normed = model.norm(hidden)
+            let logits: MLXArray
+            if let lmHead {
+                logits = lmHead(normed)
+            } else {
+                logits = model.embedTokens.asLinear(normed)
+            }
+            var outState = state ?? LMOutput.State()
+            outState[dflash2CapturedHiddenStatesKey] = captureLayerIds.map { layerId in
+                guard let captured = captureBox.value(for: layerId) else {
+                    preconditionFailure(
+                        "DFlash2 pipelined capture requested layer \(layerId), "
+                            + "but the model produced none")
+                }
+                return captured
+            }
+            return LMOutput(logits: logits, state: outState)
+        }
 
         let hiddenStates: MLXArray
         if emitDrafterState || captureLayerIds != nil || gdnCapture != nil {
