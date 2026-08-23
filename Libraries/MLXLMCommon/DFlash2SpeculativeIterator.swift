@@ -145,6 +145,41 @@ public struct DFlash2SpeculativeTokenIterator: TokenIteratorProtocol {
     var draftCache: [DFlash2ContextCache]
     let gdnCapture = GDNCaptureContext()
 
+    /// Stream n-gram index feeding the selector's path advisor (prompt +
+    /// committed tokens). The advisor forces a drafted candidate when the
+    /// stream's own longest-suffix continuation is long and dominant enough
+    /// — self-similar content (code edits, quoting summaries, structured
+    /// output) resolves the near-ties the learned selector misses. Drafting
+    /// signal only; verification still gates every emitted token.
+    private let ngramIndex = DFlash2NGramIndex()
+    /// Trailing committed tokens (anchor last) — the advisor's context head.
+    private var ngramTail: [Int] = []
+    /// `DFLASH2_SELECTOR=advised` opts into the host-side walk + n-gram
+    /// force; `host` runs the host walk with the force disabled. Default is
+    /// the on-GPU walk: the 2026-08-22 A/B (ledger R21) measured the
+    /// advised path acceptance-NEUTRAL on canonical content (early-death
+    /// conversions get absorbed by phase-shifted deaths deeper in the
+    /// chain) while its mid-round sync costs real round time — kept as an
+    /// experimental hatch, not the production path.
+    private static let advisedSelectorEnabled: Bool = {
+        let mode = ProcessInfo.processInfo.environment["DFLASH2_SELECTOR"]
+        return mode == "advised" || mode == "host"
+    }()
+    private static let ngramForceEnabled =
+        ProcessInfo.processInfo.environment["DFLASH2_SELECTOR"] == "advised"
+    /// Force thresholds: the continuation must come from an order-4+ match
+    /// and carry >= 60% of the context's observed continuations.
+    private static let ngramMinOrder = 4
+    private static let ngramMinShare = 0.6
+
+    private mutating func ngramCommit(_ tokens: [Int]) {
+        ngramIndex.extend(tokens)
+        ngramTail.append(contentsOf: tokens)
+        if ngramTail.count > 8 {
+            ngramTail.removeFirst(ngramTail.count - 8)
+        }
+    }
+
     var processor: LogitProcessor?
     let sampler: LogitSampler
     let temperature: Float
@@ -218,6 +253,213 @@ public struct DFlash2SpeculativeTokenIterator: TokenIteratorProtocol {
             Double(elapsed.components.seconds) + Double(elapsed.components.attoseconds) / 1e18
     }
 
+    // MARK: Accept-log instrumentation (DFLASH2_ACCEPT_LOG=1)
+
+    /// Measurement mode for the greedy path: per-position acceptance,
+    /// selector-candidate coverage, and a host-phase wall-clock timeline.
+    /// Unlike DFLASH2_PROFILE it adds NO evals — the candidate ids ride the
+    /// round's existing packed D2H transfer, and the timeline stamps are
+    /// pure host clock reads — so round structure matches production.
+    private let acceptLogEnabled =
+        ProcessInfo.processInfo.environment["DFLASH2_ACCEPT_LOG"] != nil
+
+    /// DFLASH2_HOST_PROFILE=1: the accept-log wall-clock timeline WITHOUT the
+    /// candidate instrumentation, so the compiled selector walk stays engaged
+    /// (DFLASH2_ACCEPT_LOG forces the eager walk for rank capture) and the
+    /// round structure is exactly production. Pure clock reads, zero evals.
+    private let hostProfileEnabled =
+        ProcessInfo.processInfo.environment["DFLASH2_HOST_PROFILE"] != nil
+    private var hostTimelineEnabled: Bool { acceptLogEnabled || hostProfileEnabled }
+    private var hostTimelineRounds = 0
+
+    // MARK: Pipelined propose (DFLASH2_PIPELINE=1)
+
+    /// Build the next round's proposal during this round's verify sync: the
+    /// accept-dependent inputs ride as lazy arrays (see
+    /// ``DFlash2PipelinedDrafter``), so the propose host cost (graph splice +
+    /// schedule, ~11 ms/round measured) leaves the round's critical path and
+    /// the draft pass queues right behind the verify on the GPU. Greedy-only;
+    /// measurement modes that reshape the round (accept-log, lattice dump,
+    /// advised selector) fall back to the synchronous propose. Default ON;
+    /// `DFLASH2_PIPELINE=0` restores the synchronous round.
+    private static let pipelineEnabled =
+        ProcessInfo.processInfo.environment["DFLASH2_PIPELINE"] != "0"
+    private static let prebuiltEagerSchedule =
+        ProcessInfo.processInfo.environment["DFLASH2_PIPELINE_SCHED"] != "0"
+    /// Accept-invariant reconcile prebuild (stage 2a): build the GDN rollback
+    /// replay as a masked full-width graph in the same sync window, so the
+    /// reconcile splice (~2.9 ms/round measured) also leaves the critical
+    /// path. Default ON; `DFLASH2_ROLLBACK_PREBUILD=0` restores the
+    /// synchronous accepted-prefix replay.
+    private static let rollbackPrebuildEnabled =
+        ProcessInfo.processInfo.environment["DFLASH2_ROLLBACK_PREBUILD"] != "0"
+    /// Accept-invariant verify prebuild (stage 2): build the NEXT round's
+    /// whole verify pass (and its packed sync array) inside this round's sync
+    /// window and schedule it behind the in-flight verify, so the GPU never
+    /// drains between rounds. Every accept-dependent input is lazy: tokens
+    /// from the prebuilt draft, KV write offset via a dynamic slice update,
+    /// RoPE as a `[1]` array, GDN initial states from the stage-2a replay,
+    /// SDPA visibility as one lazy bool mask. Greedy, `processor == nil`
+    /// rounds only. Default ON; `DFLASH2_VERIFY_PREBUILD=0` restores the
+    /// synchronous verify build.
+    private static let verifyPrebuildEnabled =
+        ProcessInfo.processInfo.environment["DFLASH2_VERIFY_PREBUILD"] != "0"
+
+    /// A verify pass built one round ahead (stage 2): everything the accept
+    /// and reconcile of that round will need, all lazy, already scheduled.
+    private struct DFlash2PrebuiltVerify {
+        var logits: MLXArray
+        var hidden: MLXArray
+        var capture: GDNCaptureContext
+        var packed: MLXArray
+        var targetTokens: MLXArray
+        var width: Int
+    }
+
+    private var prebuiltVerify: DFlash2PrebuiltVerify?
+    /// Capture context of the round whose rows the caches currently hold —
+    /// `finalizeGeneration` replays it to rewind undrained tokens. For
+    /// synchronous rounds this is the shared `gdnCapture`; stage-2 rounds
+    /// carry their own per-build context.
+    private var lastRoundCapture: GDNCaptureContext?
+    private var prebuiltNext: DFlash2PipelinedProposal?
+    /// RoPE/timeline position of the CURRENT round's anchor token, once the
+    /// pipelined chain is running (tracked host-side; the cache write cursor
+    /// stops advancing on pipelined rounds).
+    private var pipelineAnchorPos = 0
+    /// Accept count of the previous round — resolves the staged rows'
+    /// validity when a prebuilt proposal is adopted.
+    private var lastAccepted = -1
+    private var alRounds = 0
+    private var alAcceptHist: [Int: Int] = [:]
+    private var alPosMatch: [Int: Int] = [:]
+    private var alPosSurvive: [Int: Int] = [:]
+    private var alPosCover: [Int: Int] = [:]
+    private var alPosCover2: [Int: Int] = [:]
+    private var alPosCover4: [Int: Int] = [:]
+    private var alPosDenom: [Int: Int] = [:]
+    private var alFirstMissCovered = 0
+    private var alFirstMissRounds = 0
+    /// Rank (0-based, score-ordered) of the target token at the first-miss
+    /// position; k = not in the candidate set.
+    private var alFirstMissRank: [Int: Int] = [:]
+    private var alTimelineMs: [String: Double] = [:]
+    private var alLastRoundEnd: ContinuousClock.Instant?
+    private var alSummaryEmitted = false
+
+    private static func alMs(_ duration: Duration) -> Double {
+        Double(duration.components.seconds) * 1e3
+            + Double(duration.components.attoseconds) / 1e15
+    }
+
+    /// DFLASH2_LATTICE_DUMP companion stream: per greedy round, the verify
+    /// targets and accept outcome (joined offline with the selector's
+    /// lattice lines by round index).
+    private static let latticeDumpPath =
+        ProcessInfo.processInfo.environment["DFLASH2_LATTICE_DUMP"]
+    nonisolated(unsafe) private static var latticeAcceptRound = 0
+
+    private static func dumpAccept(
+        to file: String, targets: [Int], drafts: [Int], accepted: Int
+    ) {
+        var line = "{\"r\":\(latticeAcceptRound),\"targets\":\(targets)"
+        line += ",\"drafts\":\(drafts),\"accepted\":\(accepted)}\n"
+        latticeAcceptRound += 1
+        dumpLine(to: file, line: line)
+    }
+
+    private static func dumpLine(to file: String, line: String) {
+        if let handle = FileHandle(forWritingAtPath: file) {
+            handle.seekToEndOfFile()
+            handle.write(Data(line.utf8))
+            try? handle.close()
+        } else {
+            FileManager.default.createFile(
+                atPath: file, contents: Data(line.utf8))
+        }
+    }
+
+    private mutating func alStamp(_ phase: String, since start: ContinuousClock.Instant) {
+        alTimelineMs[phase, default: 0] += Self.alMs(ContinuousClock.now - start)
+    }
+
+    /// Fold one greedy round into the accept log. `candidates` is the
+    /// selector's flattened top-K id list (`gamma * K`), from the packed
+    /// transfer.
+    private mutating func alRecordRound(
+        gamma: Int, accepted: Int, drafts: [Int], targets: [Int], candidates: [Int]
+    ) {
+        alRounds += 1
+        alAcceptHist[accepted, default: 0] += 1
+        let k = gamma > 0 ? candidates.count / gamma : 0
+        for i in 0 ..< gamma {
+            alPosDenom[i, default: 0] += 1
+            if targets[i] == drafts[i] { alPosMatch[i, default: 0] += 1 }
+            if i < accepted { alPosSurvive[i, default: 0] += 1 }
+            if k > 0 {
+                // Candidates arrive score-ordered (selector measurement
+                // mode), so the index of the target IS its selector rank.
+                let row = candidates[(i * k) ..< ((i + 1) * k)]
+                if let r = row.firstIndex(of: targets[i]) {
+                    let rank = r - i * k
+                    alPosCover[i, default: 0] += 1
+                    if rank < 2 { alPosCover2[i, default: 0] += 1 }
+                    if rank < 4 { alPosCover4[i, default: 0] += 1 }
+                }
+            }
+        }
+        if accepted < gamma, k > 0 {
+            alFirstMissRounds += 1
+            let i = accepted
+            let row = candidates[(i * k) ..< ((i + 1) * k)]
+            if let r = row.firstIndex(of: targets[i]) {
+                alFirstMissCovered += 1
+                alFirstMissRank[r - i * k, default: 0] += 1
+            } else {
+                alFirstMissRank[k, default: 0] += 1
+            }
+        }
+    }
+
+    private mutating func alEmitSummaryOnce() {
+        guard hostTimelineEnabled, !alSummaryEmitted, hostTimelineRounds > 0 else { return }
+        alSummaryEmitted = true
+        func emit(_ line: String) {
+            FileHandle.standardOutput.write(Data((line + "\n").utf8))
+        }
+        let phases = [
+            "gap", "propose", "p-splice", "p-sched", "build", "prebuild", "pb-vsched",
+            "pb-graph", "pb-vbuild", "pb-dsched", "sync", "accept", "reconcile",
+        ]
+        let perRound = phases.map { phase in
+            String(format: "%@ %.2f", phase, (alTimelineMs[phase] ?? 0) / Double(hostTimelineRounds))
+        }.joined(separator: " | ")
+        emit("[dflash2-accept] timeline ms/round: \(perRound) (n=\(hostTimelineRounds))")
+        guard acceptLogEnabled, alRounds > 0 else { return }
+        let maxGamma = (alPosDenom.keys.max() ?? -1) + 1
+        let hist = (0 ... maxGamma)
+            .map { "\($0):\(alAcceptHist[$0] ?? 0)" }.joined(separator: " ")
+        emit("[dflash2-accept] rounds=\(alRounds) hist \(hist)")
+        func rates(_ table: [Int: Int]) -> String {
+            (0 ..< maxGamma).map { i in
+                let d = alPosDenom[i] ?? 0
+                return d > 0
+                    ? String(format: "%.2f", Double(table[i] ?? 0) / Double(d)) : "-"
+            }.joined(separator: "/")
+        }
+        emit("[dflash2-accept] match \(rates(alPosMatch))")
+        emit("[dflash2-accept] survive \(rates(alPosSurvive))")
+        emit("[dflash2-accept] cover2 \(rates(alPosCover2))")
+        emit("[dflash2-accept] cover4 \(rates(alPosCover4))")
+        emit("[dflash2-accept] cover16 \(rates(alPosCover))")
+        emit("[dflash2-accept] first-miss-covered \(alFirstMissCovered)/\(alFirstMissRounds)")
+        if !alFirstMissRank.isEmpty {
+            let ranks = alFirstMissRank.keys.sorted()
+                .map { "r\($0):\(alFirstMissRank[$0]!)" }.joined(separator: " ")
+            emit("[dflash2-accept] first-miss-rank \(ranks)")
+        }
+    }
+
     public init(
         input: LMInput,
         mainModel: any LanguageModel,
@@ -262,6 +504,14 @@ public struct DFlash2SpeculativeTokenIterator: TokenIteratorProtocol {
         let promptTokens = input.text.tokens
         let promptLength = promptTokens.dim(0)
         precondition(promptLength > 0, "DFlash2 iterator requires a non-empty prompt")
+        if let dumpPath = Self.latticeDumpPath {
+            let ids = promptTokens.asArray(Int32.self).map(Int.init)
+            Self.dumpLine(
+                to: dumpPath + ".accept", line: "{\"r\":-1,\"prompt\":\(ids)}\n")
+        }
+        if Self.advisedSelectorEnabled {
+            ngramCommit(promptTokens.asArray(Int32.self).map(Int.init))
+        }
 
         let stepSize = Swift.max(1, prefill.stepSize ?? 2048)
         let keepCount = drafter.dflashContextKeepCount
@@ -334,6 +584,9 @@ public struct DFlash2SpeculativeTokenIterator: TokenIteratorProtocol {
         let firstValue = token.item(Int.self)
         dflash2AnchorValue = firstValue
         pendingTokens.append(firstValue)
+        if Self.advisedSelectorEnabled {
+            ngramCommit([firstValue])
+        }
     }
 
     /// Capture-incapable target: finish prefill conventionally and mark the
@@ -372,6 +625,11 @@ public struct DFlash2SpeculativeTokenIterator: TokenIteratorProtocol {
     mutating func speculateRound() {
         guard !passthrough else { return }
 
+        let alRoundStart = ContinuousClock.now
+        if hostTimelineEnabled, let last = alLastRoundEnd {
+            alTimelineMs["gap", default: 0] += Self.alMs(alRoundStart - last)
+        }
+
         // Round width: the policy's current width, clamped to the remaining
         // output budget. Reference: `bs = min(block_size, max_tokens - n + 1)`
         // — the verify pass always covers the anchor plus up to `remaining`
@@ -391,55 +649,126 @@ public struct DFlash2SpeculativeTokenIterator: TokenIteratorProtocol {
         precondition(anchor >= 0, "DFlash2 round ran before prefill set an anchor")
         let anchorToken = MLXArray([Int32(anchor)])
         let maskId = drafter.dflashMaskTokenId
-        let blockIds = MLXArray([anchor] + Array(repeating: maskId, count: numDraft))
-            .expandedDimensions(axis: 0)  // [1, bs]
 
         let proposeStart = ContinuousClock.now
 
-        // 1. Propose (one parallel draft pass + selector path).
-        let (draftTokens, draftCandidates, draftProbs) = drafter.dflashPropose(
-            blockIds,
-            targetHidden: pendingContextHidden,
-            cache: draftCache,
-            temperature: temperature,
-            logitsStart: 1)
+        // 1. Propose. A prebuilt (pipelined) proposal from the previous
+        // round's sync window is used whenever present — its accept-dependent
+        // inputs were lazy, so it is correct for the accept outcome that
+        // materialized; adopting the staged caches commits the appended
+        // verify rows, whose validity resolves with the now-known accept
+        // count. A width switched by the bandit takes effect one round late
+        // (the prebuilt width governs this round).
+        let (draftTokens, draftCandidates, draftProbs): (MLXArray, MLXArray, MLXArray?)
+        var roundGamma = numDraft
+        var usedPrebuilt = false
+        if let pre = prebuiltNext {
+            prebuiltNext = nil
+            for (cache, clone) in zip(draftCache, pre.stagedCaches) {
+                cache.adopt(clone)
+                cache.resolveNewestValidity(
+                    newestCount: pre.appendedRows, validCount: lastAccepted + 1)
+                cache.offset = pipelineAnchorPos
+            }
+            roundGamma = pre.width - 1
+            (draftTokens, draftCandidates, draftProbs) = (pre.tokens, pre.candidates, nil)
+            usedPrebuilt = true
+        } else if Self.advisedSelectorEnabled, greedy {
+            let index = ngramIndex
+            let tail = ngramTail
+            let forceEnabled = Self.ngramForceEnabled
+            let advisor: DFlash2PathAdvisor = { chosen, candidates in
+                guard
+                    forceEnabled,
+                    let prediction = index.predict(context: tail + chosen),
+                    prediction.order >= Self.ngramMinOrder,
+                    prediction.share >= Self.ngramMinShare,
+                    candidates.contains(prediction.token)
+                else { return nil }
+                return prediction.token
+            }
+            let blockIds = MLXArray([anchor] + Array(repeating: maskId, count: numDraft))
+                .expandedDimensions(axis: 0)  // [1, bs]
+            (draftTokens, draftCandidates, draftProbs) = drafter.dflashProposeAdvised(
+                blockIds,
+                targetHidden: pendingContextHidden,
+                cache: draftCache,
+                temperature: temperature,
+                logitsStart: 1,
+                pathAdvisor: advisor)
+        } else {
+            let blockIds = MLXArray([anchor] + Array(repeating: maskId, count: numDraft))
+                .expandedDimensions(axis: 0)  // [1, bs]
+            (draftTokens, draftCandidates, draftProbs) = drafter.dflashPropose(
+                blockIds,
+                targetHidden: pendingContextHidden,
+                cache: draftCache,
+                temperature: temperature,
+                logitsStart: 1)
+        }
 
         // Defensive reconcile (mirrors the reference): after the proposal the
         // draft cache timeline must sit at the count of processed positions.
-        let draftTrim = draftCache.first.map { $0.offset - processedTokens } ?? 0
-        if draftTrim > 0 {
-            for cache in draftCache { cache.trimNewest(draftTrim) }
+        // Prebuilt rounds skip it — their appended rows are placeholders the
+        // validity mask governs, and the tokens were scheduled last round.
+        if !usedPrebuilt {
+            let draftTrim = draftCache.first.map { $0.offset - processedTokens } ?? 0
+            if draftTrim > 0 {
+                for cache in draftCache { cache.trimNewest(draftTrim) }
+            }
+            if hostTimelineEnabled { alStamp("p-splice", since: proposeStart) }
+            let scheduleStart = ContinuousClock.now
+            asyncEval(draftTokens)
+            if hostTimelineEnabled { alStamp("p-sched", since: scheduleStart) }
         }
-        asyncEval(draftTokens)
         if profileEnabled {
             eval(draftTokens)
             profileMark("propose", since: proposeStart)
         }
+        if hostTimelineEnabled { alStamp("propose", since: alRoundStart) }
+        let alBuildStart = ContinuousClock.now
 
         // 2. Verify: one target pass over [anchor, drafts...], capturing the
         // layer hidden states and (hybrid targets) the GDN rollback inputs.
+        // A stage-2 prebuilt verify (built and scheduled in the previous
+        // round's sync window from lazy accept-dependent inputs) replaces the
+        // whole build; it is correct for whatever accept materialized.
         let verifyStart = ContinuousClock.now
-        gdnCapture.clear()
-        var verifyState = LMOutput.State()
-        verifyState[dflash2CaptureLayerIdsKey] = drafter.dflashTargetLayerIds
-        verifyState[dflash2GDNCaptureContextKey] = gdnCapture
-        let verifyTokens = concatenated([anchorToken, draftTokens.flattened()])
-        let verifyInput = LMInput.Text(tokens: verifyTokens)
-        let mainResult = mainModel(
-            verifyInput[text: .newAxis], cache: mainCache, state: verifyState)
-        let mainLogits = mainResult.logits  // [B, bs, V]: row i predicts position i+1
+        let mainLogits: MLXArray
+        let verifyHidden: MLXArray
+        let roundCapture: GDNCaptureContext
+        let consumedVerify = prebuiltVerify
+        prebuiltVerify = nil
+        if let pv = consumedVerify {
+            mainLogits = pv.logits
+            verifyHidden = pv.hidden
+            roundCapture = pv.capture
+        } else {
+            gdnCapture.clear()
+            var verifyState = LMOutput.State()
+            verifyState[dflash2CaptureLayerIdsKey] = drafter.dflashTargetLayerIds
+            verifyState[dflash2GDNCaptureContextKey] = gdnCapture
+            let verifyTokens = concatenated([anchorToken, draftTokens.flattened()])
+            let verifyInput = LMInput.Text(tokens: verifyTokens)
+            let mainResult = mainModel(
+                verifyInput[text: .newAxis], cache: mainCache, state: verifyState)
+            // [B, bs, V]: row i predicts position i+1
+            let logits = mainResult.logits
 
-        guard let captured = mainResult.state?[dflash2CapturedHiddenStatesKey],
-            !captured.isEmpty
-        else {
-            // The verify pass already ran: degrade to an accepted=0 round —
-            // keep the anchor's cache rows, emit the target's row-0 sample as
-            // a plain decode step, and stop speculating.
-            singleTokenFallbackRound(logits: mainLogits, gamma: numDraft)
-            return
+            guard let captured = mainResult.state?[dflash2CapturedHiddenStatesKey],
+                !captured.isEmpty
+            else {
+                // The verify pass already ran: degrade to an accepted=0 round —
+                // keep the anchor's cache rows, emit the target's row-0 sample
+                // as a plain decode step, and stop speculating.
+                singleTokenFallbackRound(logits: logits, gamma: roundGamma)
+                return
+            }
+            mainLogits = logits
+            verifyHidden =
+                captured.count == 1 ? captured[0] : concatenated(captured, axis: -1)
+            roundCapture = gdnCapture
         }
-        let verifyHidden =
-            captured.count == 1 ? captured[0] : concatenated(captured, axis: -1)
         if profileEnabled {
             eval(mainLogits)
             profileMark("verify", since: verifyStart)
@@ -451,20 +780,170 @@ public struct DFlash2SpeculativeTokenIterator: TokenIteratorProtocol {
         // 3. Accept.
         let accepted: Int
         let bonusTokenValue: Int
-        let gamma = numDraft
+        let gamma = roundGamma
         let draftList: [Int]
+        var alAcceptFrom = acceptStart
+        // This round's anchor position (the RoPE position of `anchorToken` in
+        // the target timeline) — the base the pipelined prebuild appends the
+        // verify rows at. Old-path rounds read it from the just-advanced
+        // cache write cursor; prebuilt rounds track it explicitly.
+        let roundAnchorPos = usedPrebuilt ? pipelineAnchorPos : (draftCache.first?.offset ?? 0)
+        var nextPrebuilt: DFlash2PipelinedProposal? = nil
+        var prebuiltRollback: [(state: MLXArray, conv: MLXArray)]? = nil
+        var nextVerify: DFlash2PrebuiltVerify? = nil
         if greedy {
-            var processed = mainLogits[0, 0 ..< (gamma + 1), 0...]  // [bs, V]
-            processed = processor?.process(logits: processed) ?? processed
-            let targetTokens = argMax(processed, axis: -1).asType(.int32)  // [bs]
+            let targetTokens: MLXArray
+            let packed: MLXArray
+            if let pv = consumedVerify {
+                // Prebuilt round: the packed transfer (and the argmax inside
+                // it) were built AND scheduled in the previous sync window.
+                targetTokens = pv.targetTokens
+                packed = pv.packed
+            } else {
+                var processed = mainLogits[0, 0 ..< (gamma + 1), 0...]  // [bs, V]
+                processed = processor?.process(logits: processed) ?? processed
+                targetTokens = argMax(processed, axis: -1).asType(.int32)  // [bs]
 
-            // ONE D2H sync per round: draft ids and target argmax ids ship in
-            // a single packed transfer (the reference's single-sync cycle).
-            let packed = concatenated([draftTokens.flattened().asType(.int32), targetTokens])
+                // ONE D2H sync per round: draft ids and target argmax ids ship
+                // in a single packed transfer (the reference's single-sync
+                // cycle). Accept-log mode appends the selector's top-K
+                // candidate ids to the same transfer (coverage measurement,
+                // no extra sync).
+                var packedParts = [draftTokens.flattened().asType(.int32), targetTokens]
+                if acceptLogEnabled {
+                    packedParts.append(draftCandidates.flattened().asType(.int32))
+                }
+                packed = concatenated(packedParts)
+            }
+            if hostTimelineEnabled { alStamp("build", since: alBuildStart) }
+
+            // Pipelined prebuild: start the verify pass on the GPU, then use
+            // its idle host window to build the NEXT round's proposal with
+            // the accept-dependent values as lazy arrays (accepted count via
+            // cumulative-product prefix match, bonus anchor via a lazy take).
+            // Scheduling the prebuilt tokens queues the draft pass right
+            // behind the verify on the GPU stream.
+            if Self.pipelineEnabled, !acceptLogEnabled, !Self.advisedSelectorEnabled,
+                Self.latticeDumpPath == nil,
+                let pipelined = drafter as? DFlash2PipelinedDrafter
+            {
+                let prebuildStart = ContinuousClock.now
+                // A prebuilt round's packed transfer was scheduled (with its
+                // whole verify pass) in the previous window.
+                if consumedVerify == nil { asyncEval(packed) }
+                // Sub-stamps discriminate throttled waiting (the encode thread
+                // paces to the GPU past MAX_ACTIVE_TASKS in-flight command
+                // buffers) from genuine host graph-build work in this window.
+                if hostTimelineEnabled { alStamp("pb-vsched", since: prebuildStart) }
+                let pbGraphStart = ContinuousClock.now
+                let eq = (draftTokens.flattened().asType(.int32) .== targetTokens[0 ..< gamma])
+                    .asType(.int32)
+                let acceptedLazy = cumprod(eq).sum()
+                let validCountLazy = acceptedLazy + 1
+                let bonusLazy = takeAlong(targetTokens, acceptedLazy.reshaped([1]), axis: 0)
+                let nextWidth = roundWidth
+                let blockIdsLazy = concatenated([
+                    bonusLazy.asType(.int32),
+                    MLXArray(Array(repeating: Int32(maskId), count: nextWidth - 1)),
+                ]).expandedDimensions(axis: 0)
+                let blockPosOffset =
+                    MLXArray([Int32(roundAnchorPos)]) + validCountLazy.asType(.int32)
+                nextPrebuilt = pipelined.dflashProposePipelined(
+                    blockIds: blockIdsLazy,
+                    targetHidden: verifyHidden,
+                    validCount: validCountLazy,
+                    contextPositionBase: roundAnchorPos,
+                    blockPositionOffset: blockPosOffset,
+                    caches: draftCache)
+                // Accept-invariant rollback for THIS round's reconcile: the
+                // masked replay equals the accepted-prefix replay for every
+                // outcome, so its graph splices here in the sync window.
+                // Left unscheduled — an all-accepted round drops it unrun.
+                if Self.rollbackPrebuildEnabled {
+                    prebuiltRollback = prebuildSpeculativeRollback(
+                        context: roundCapture, validCount: validCountLazy)
+                }
+                if hostTimelineEnabled { alStamp("pb-graph", since: pbGraphStart) }
+                let pbVBuildStart = ContinuousClock.now
+                // Stage-2: build the NEXT round's verify pass here, entirely
+                // from lazy accept-dependent inputs, so its graph (and the
+                // sync transfer) can be scheduled behind the in-flight verify
+                // and the GPU never drains between rounds.
+                if Self.verifyPrebuildEnabled, processor == nil,
+                    let np = nextPrebuilt, let pr = prebuiltRollback
+                {
+                    // GDN initial states for the next pass = the
+                    // accept-invariant replay (on full acceptance bitwise the
+                    // committed states — same kernel, same captured inputs;
+                    // rejected>0 rounds already take exactly this path).
+                    applyGDNRollback(mainCache, prebuilt: pr)
+                    let nextCapture = GDNCaptureContext()
+                    let nextWidthS = np.width
+                    let worstLen = roundAnchorPos + (gamma + 1) + nextWidthS
+                    // One lazy comparison encodes in-block causality, history
+                    // visibility, and stale-row exclusion: col j is visible
+                    // to row i iff j < start + i + 1.
+                    let cols = MLXArray(Int32(0) ..< Int32(worstLen))
+                        .expandedDimensions(axis: 0)
+                    let rowIdx = MLXArray(Int32(0) ..< Int32(nextWidthS))
+                        .reshaped([nextWidthS, 1])
+                    let attnMask = cols .< (blockPosOffset + rowIdx + 1)
+                    let plan = DFlash2PipelinedVerifyPlan(
+                        kvStart: blockPosOffset, worstLen: worstLen, attnMask: attnMask)
+                    var vState = LMOutput.State()
+                    vState[dflash2CaptureLayerIdsKey] = drafter.dflashTargetLayerIds
+                    vState[dflash2GDNCaptureContextKey] = nextCapture
+                    vState[dflash2PipelinedVerifyPlanKey] = plan
+                    let nextVerifyTokens = concatenated(
+                        [bonusLazy.asType(.int32), np.tokens.flattened().asType(.int32)])
+                    let vInput = LMInput.Text(tokens: nextVerifyTokens)
+                    let vResult = mainModel(
+                        vInput[text: .newAxis], cache: mainCache, state: vState)
+                    if let capturedNext = vResult.state?[dflash2CapturedHiddenStatesKey],
+                        !capturedNext.isEmpty
+                    {
+                        let hiddenNext =
+                            capturedNext.count == 1
+                            ? capturedNext[0] : concatenated(capturedNext, axis: -1)
+                        let gammaNext = nextWidthS - 1
+                        let targetNext = argMax(
+                            vResult.logits[0, 0 ..< (gammaNext + 1), 0...], axis: -1
+                        ).asType(.int32)
+                        let packedNext = concatenated(
+                            [np.tokens.flattened().asType(.int32), targetNext])
+                        nextVerify = DFlash2PrebuiltVerify(
+                            logits: vResult.logits, hidden: hiddenNext,
+                            capture: nextCapture, packed: packedNext,
+                            targetTokens: targetNext, width: nextWidthS)
+                    }
+                }
+                if hostTimelineEnabled { alStamp("pb-vbuild", since: pbVBuildStart) }
+                let pbDschedStart = ContinuousClock.now
+                // Eager scheduling wins (measured): deferring to the next
+                // round's build stream puts the draft's schedule cost on the
+                // GPU-chase path and reopens the packed sync (40.8 vs 46.7
+                // tok/s warm). `DFLASH2_PIPELINE_SCHED=0` defers for probes.
+                if Self.prebuiltEagerSchedule, let np = nextPrebuilt {
+                    asyncEval(np.tokens, np.candidates)
+                }
+                // Schedule the prebuilt verify (and its packed transfer)
+                // behind the draft pass: the GPU pipeline for the next round
+                // is fully committed before this round's accept resolves.
+                if let nv = nextVerify {
+                    asyncEval(nv.packed)
+                }
+                if hostTimelineEnabled {
+                    alStamp("pb-dsched", since: pbDschedStart)
+                    alStamp("prebuild", since: prebuildStart)
+                }
+            }
+            let alSyncStart = ContinuousClock.now
             eval(packed)
+            if hostTimelineEnabled { alStamp("sync", since: alSyncStart) }
+            alAcceptFrom = ContinuousClock.now
             let both = packed.asArray(Int32.self)
             let greedyDrafts = both[0 ..< gamma].map(Int.init)
-            let targetList = both[gamma...].map(Int.init)
+            let targetList = both[gamma ..< (2 * gamma + 1)].map(Int.init)
             draftList = greedyDrafts
 
             var acceptedCount = 0
@@ -473,6 +952,16 @@ public struct DFlash2SpeculativeTokenIterator: TokenIteratorProtocol {
             }
             accepted = acceptedCount
             bonusTokenValue = targetList[accepted]
+            if acceptLogEnabled {
+                alRecordRound(
+                    gamma: gamma, accepted: accepted, drafts: greedyDrafts,
+                    targets: targetList, candidates: both[(2 * gamma + 1)...].map(Int.init))
+            }
+            if let dumpPath = Self.latticeDumpPath {
+                Self.dumpAccept(
+                    to: dumpPath + ".accept", targets: targetList,
+                    drafts: greedyDrafts, accepted: accepted)
+            }
             for token in greedyDrafts.prefix(accepted) {
                 processor?.didSample(token: MLXArray(token))
             }
@@ -501,16 +990,57 @@ public struct DFlash2SpeculativeTokenIterator: TokenIteratorProtocol {
             processor?.didSample(token: MLXArray(bonusTokenValue))
         }
         if profileEnabled { profileMark("accept", since: acceptStart) }
+        if hostTimelineEnabled { alStamp("accept", since: alAcceptFrom) }
+
+        // Pipelined bookkeeping: next round's anchor position, and the
+        // accept count that resolves the staged rows' validity at adopt.
+        lastAccepted = accepted
+        pipelineAnchorPos = roundAnchorPos + accepted + 1
+        if nextPrebuilt == nil, usedPrebuilt {
+            // The pipelined chain broke (drafter escape hatch): restore the
+            // write cursor so a synchronous propose appends at the right
+            // positions next round.
+            for cache in draftCache { cache.offset = roundAnchorPos }
+        }
+        prebuiltNext = nextPrebuilt
+        prebuiltVerify = nextVerify
+        let alReconcileStart = ContinuousClock.now
 
         // 4. Reconcile caches: `accepted + 1` verify positions stay committed
         // (anchor + accepted drafts); the rest are rolled back.
         let reconcileStart = ContinuousClock.now
         let rejected = gamma - accepted
         processedTokens += accepted + 1
-        if rejected > 0 {
-            rollbackSpeculativeHybridCaches(
-                mainCache, context: gdnCapture, accepted: accepted, rejected: rejected)
+        if consumedVerify != nil {
+            // Stage-2 round: the KV rows were written at the true (lazily
+            // resolved) offset on the GPU — only the committed count moves.
+            // Rejected rows need no cleanup; the next write overwrites them.
+            for cache in mainCache where cache.isTrimmable {
+                (cache as! KVCacheSimple).commitPipelined(
+                    rows: accepted + 1, anchor: roundAnchorPos)
+            }
+            // GDN: a continuing chain re-assigns the replay states in every
+            // window; on a break, restore the slots for a synchronous
+            // successor round.
+            if nextVerify == nil, rejected > 0 {
+                guard let prebuilt = prebuiltRollback else {
+                    preconditionFailure(
+                        "pipelined verify round without a prebuilt rollback")
+                }
+                applyGDNRollback(mainCache, prebuilt: prebuilt)
+            }
+        } else if rejected > 0 {
+            if let prebuilt = prebuiltRollback {
+                // The masked replay built in the sync window equals the
+                // accepted-prefix replay for this outcome; only trims and
+                // cache-slot assignment remain on the host here.
+                applySpeculativeRollback(mainCache, prebuilt: prebuilt, rejected: rejected)
+            } else {
+                rollbackSpeculativeHybridCaches(
+                    mainCache, context: roundCapture, accepted: accepted, rejected: rejected)
+            }
         }
+        lastRoundCapture = roundCapture
 
         // The drafter's next context: hidden states of the committed verify
         // positions (anchor + accepted drafts).
@@ -588,6 +1118,14 @@ public struct DFlash2SpeculativeTokenIterator: TokenIteratorProtocol {
         }
         y = .init(tokens: MLXArray([Int32(bonusTokenValue)]))
         dflash2AnchorValue = bonusTokenValue
+        if Self.advisedSelectorEnabled {
+            ngramCommit([Int](draftList.prefix(accepted)) + [bonusTokenValue])
+        }
+        if hostTimelineEnabled {
+            alStamp("reconcile", since: alReconcileStart)
+            alLastRoundEnd = ContinuousClock.now
+            hostTimelineRounds += 1
+        }
     }
 
     /// A verify pass whose target emitted no captures: salvage it as a plain
@@ -644,6 +1182,7 @@ public struct DFlash2SpeculativeTokenIterator: TokenIteratorProtocol {
 
     public mutating func next() -> Int? {
         if let maxTokens, tokenCount >= maxTokens {
+            alEmitSummaryOnce()
             return nil
         }
 
@@ -695,7 +1234,8 @@ extension DFlash2SpeculativeTokenIterator: GenerationFinalizingTokenIterator {
         // Rows to drop = committed (accepted+1) minus retained (consumed+1).
         let rewind = lookahead - 1
         guard rewind > 0 else { return }
-        if gdnCapture.captures.isEmpty {
+        let finalCapture = lastRoundCapture ?? gdnCapture
+        if finalCapture.captures.isEmpty {
             // Uncaptured step (pure-attention target, or a passthrough step
             // that could not record): trim-only rollback.
             for cache in mainCache where cache.isTrimmable {
@@ -703,7 +1243,7 @@ extension DFlash2SpeculativeTokenIterator: GenerationFinalizingTokenIterator {
             }
         } else {
             rollbackSpeculativeHybridCaches(
-                mainCache, context: gdnCapture,
+                mainCache, context: finalCapture,
                 accepted: consumed, rejected: rewind)
         }
         processedTokens -= rewind
