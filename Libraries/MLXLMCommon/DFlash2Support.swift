@@ -696,7 +696,7 @@ public protocol DFlash2DrafterModel: BaseLanguageModel {
     /// selector's own choice. Advised proposals only change WHICH tokens are
     /// drafted — verification still gates every emitted token, so output
     /// equality with non-speculative decoding is unaffected. Implementations
-    /// may ignore the advisor (the default forwards to ``dflashPropose``).
+    /// may ignore the advisor (the default forwards to `dflashPropose`).
     func dflashProposeAdvised(
         _ inputs: MLXArray,
         targetHidden: MLXArray,
@@ -707,7 +707,7 @@ public protocol DFlash2DrafterModel: BaseLanguageModel {
     ) -> (tokens: MLXArray, candidates: MLXArray, probabilities: MLXArray?)
 }
 
-/// Path advisor for ``DFlash2DrafterModel/dflashProposeAdvised``: given the
+/// Path advisor for `DFlash2DrafterModel.dflashProposeAdvised`: given the
 /// tokens chosen so far in this block (empty at the first position — the
 /// caller prepends its own committed history, anchor included) and a
 /// position's candidate ids, return the candidate to force, or nil to keep

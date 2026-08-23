@@ -188,7 +188,7 @@ final class Qwen3NextMLP: Module, UnaryLayer {
 }
 
 /// Stack every same-input projection group in `model` into one
-/// QuantizedLinear each: MLP gate+up (``Qwen3NextMLP/stackGateUp()``), the
+/// QuantizedLinear each: MLP gate+up (`Qwen3NextMLP.stackGateUp()`), the
 /// GDN four-way in-projection, and attention q/k/v. Bitwise-neutral — each
 /// output row keeps its own K-accumulation order and quantization groups.
 /// Returns the number of groups stacked.

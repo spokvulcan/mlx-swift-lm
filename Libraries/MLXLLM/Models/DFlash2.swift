@@ -873,7 +873,7 @@ public final class DFlash2DraftModel: Module, DFlash2DrafterModel {
 
     let rope: RoPELayer
 
-    /// Borrowed from the target at ``bind(target:)``; never loaded from the
+    /// Borrowed from the target at ``bindDFlashTarget(_:)``; never loaded from the
     /// draft checkpoint (it has neither tensor).
     public private(set) var embedTokens: Embedding?
     public private(set) var lmHead: Linear?
@@ -954,6 +954,7 @@ public final class DFlash2DraftModel: Module, DFlash2DrafterModel {
     ///   - targetHidden: concatenated target layer outputs [B, S, nLayers*H]
     ///     for the context rows accepted since the previous round (the whole
     ///     prompt window on the first round).
+    ///   - cache: per-layer sliding-window context caches for this stream.
     ///   - logitsStart: drop this many leading positions from the result
     ///     (1 during drafting — the anchor's own prediction is unused).
     public func hiddenStates(
@@ -988,7 +989,7 @@ public final class DFlash2DraftModel: Module, DFlash2DrafterModel {
         return norm(h)
     }
 
-    /// Draft logits for hidden states produced by ``hiddenStates``.
+    /// Draft logits for hidden states produced by `hiddenStates`.
     public func computeLogits(_ hidden: MLXArray) -> MLXArray {
         var logits: MLXArray
         if let lmHead {
@@ -1438,7 +1439,7 @@ public final class DFlash2DraftModel: Module, DFlash2DrafterModel {
 // MARK: - Loader
 
 /// Load a DFlash/DFlash2 draft checkpoint from a local directory (config.json
-/// + safetensors). The returned model still needs ``DFlash2DraftModel/bind(target:)``.
+/// + safetensors). The returned model still needs ``DFlash2DraftModel/bindDFlashTarget(_:)``.
 ///
 /// `quantization` post-quantizes the draft in place (reference:
 /// `nn.quantize(draft, group_size: 64, bits: 4)` — every `Linear` and the
