@@ -461,11 +461,36 @@ public struct DFlash2SpeculativeTokenIterator: TokenIteratorProtocol {
         }
     }
 
+    /// - Parameters:
+    ///   - input: the full prompt to decode from (text tokens only).
+    ///   - mainModel: the target model whose output the speculation must
+    ///     reproduce; it also supplies the hidden states the drafter reads.
+    ///   - drafter: the DFlash2 draft model bound to `mainModel`'s family.
+    ///   - mainCache: an existing target cache to decode over. Pass a warm
+    ///     cache (a restored prefix-cache checkpoint, or a caller-side
+    ///     chunked prefill) together with `prefilledPrefixTokens` to start
+    ///     speculation without re-processing the prefix.
+    ///   - prefilledPrefixTokens: leading positions of `input` that
+    ///     `mainCache` already holds. The capture prefill runs only over the
+    ///     remaining suffix, so the drafter's context window starts with the
+    ///     suffix rows alone (hidden states are never stored with a KV
+    ///     prefix); RoPE positions stay absolute, so the math for the suffix
+    ///     and every decode round is identical to a cold run of the same
+    ///     timeline. The logit processor is still primed with the full
+    ///     prompt.
+    ///   - parameters: sampling and generation limits.
+    ///   - blockSize: round-width cap (1 anchor + `blockSize - 1` drafts);
+    ///     `nil` uses the drafter's trained block size.
+    ///   - adaptiveWidth: narrow the round width on rejection, re-widen on
+    ///     acceptance, under the `blockSize` cap.
+    ///   - components: caller-supplied generation hooks (e.g. an app logit
+    ///     processor replacing the parameter-built penalty processor).
     public init(
         input: LMInput,
         mainModel: any LanguageModel,
         drafter: any DFlash2DrafterModel,
         mainCache: [KVCache]? = nil,
+        prefilledPrefixTokens: Int = 0,
         parameters: GenerateParameters,
         blockSize: Int? = nil,
         adaptiveWidth: Bool = true,
@@ -490,7 +515,9 @@ public struct DFlash2SpeculativeTokenIterator: TokenIteratorProtocol {
 
         let prefillStart = Date.timeIntervalSinceReferenceDate
         drafter.bindDFlashTarget(mainModel)
-        try prepare(input: input, prefill: parameters.prefill)
+        try prepare(
+            input: input, prefilledPrefixTokens: prefilledPrefixTokens,
+            prefill: parameters.prefill)
         self.promptPrefillTime = Date.timeIntervalSinceReferenceDate - prefillStart
     }
 
@@ -500,11 +527,33 @@ public struct DFlash2SpeculativeTokenIterator: TokenIteratorProtocol {
     /// into a rolling window (the drafter's first context). Mirrors
     /// `_prefill_target`: the final prompt position is always its own chunk,
     /// and non-final chunks flush memory.
-    mutating func prepare(input: LMInput, prefill: PrefillParameters = .init()) throws {
+    ///
+    /// With `prefilledPrefixTokens > 0` the loop starts past the positions
+    /// `mainCache` already holds (a warm prefix-cache restore, or the
+    /// caller's own checkpoint-capturing prefill): only the suffix is
+    /// forwarded and captured, and the drafter's context timeline anchors at
+    /// the suffix start — the same absolute positions a cold run would give
+    /// those rows.
+    mutating func prepare(
+        input: LMInput, prefilledPrefixTokens: Int = 0,
+        prefill: PrefillParameters = .init()
+    ) throws {
         processor?.prompt(input.text.tokens)
         let promptTokens = input.text.tokens
         let promptLength = promptTokens.dim(0)
-        precondition(promptLength > 0, "DFlash2 iterator requires a non-empty prompt")
+        precondition(
+            prefilledPrefixTokens >= 0 && prefilledPrefixTokens < promptLength,
+            "DFlash2 iterator requires at least one unprefilled prompt token")
+        if prefilledPrefixTokens > 0,
+            let attention = mainCache.first(where: { $0.isTrimmable })
+        {
+            precondition(
+                attention.offset == prefilledPrefixTokens,
+                """
+                DFlash2 warm start: cache offset \(attention.offset) does not \
+                match prefilledPrefixTokens \(prefilledPrefixTokens)
+                """)
+        }
         if let dumpPath = Self.latticeDumpPath {
             let ids = promptTokens.asArray(Int32.self).map(Int.init)
             Self.dumpLine(
@@ -518,8 +567,9 @@ public struct DFlash2SpeculativeTokenIterator: TokenIteratorProtocol {
         let keepCount = drafter.dflashContextKeepCount
 
         var hiddenWindow: MLXArray? = nil
-        var hiddenOffset = 0
-        var start = 0
+        var hiddenOffset = prefilledPrefixTokens
+        var start = prefilledPrefixTokens
+        processedTokens = prefilledPrefixTokens
         var lastLogits: MLXArray? = nil
         while start < promptLength {
             let remaining = promptLength - start

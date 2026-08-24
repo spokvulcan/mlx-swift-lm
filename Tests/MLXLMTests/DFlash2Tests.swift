@@ -722,6 +722,51 @@ func testDFlash2IteratorEndToEndAcceptanceAndRollback() throws {
 }
 
 @Test
+func testDFlash2IteratorWarmStartMatchesColdStream() throws {
+    // The same run as `testDFlash2IteratorEndToEndAcceptanceAndRollback`,
+    // but the first two prompt positions are prefilled by the caller (the
+    // app's checkpoint-capturing driver in production) before the iterator
+    // is built with `prefilledPrefixTokens`. The forward-call order over the
+    // scripted target is identical to the cold run — prefix chunk, then the
+    // final position as the iterator's own chunk — so the emitted stream
+    // must match token for token.
+    let target = MockDFlash2Target(tokenScript: [
+        1, 1, 10,  // caller prefix (2 rows), then the iterator's final chunk
+        20, 21, 55, 0,
+        30, 77, 0, 0,
+        77, 77, 77, 77,
+        77, 77, 77, 77, 77, 77, 77, 77, 77, 77, 77, 77,
+    ])
+    let drafter = MockDFlash2Drafter(script: [
+        [20, 21, 99],
+        [30, 31, 32],
+        [77, 77, 77],
+    ])
+    let cache = target.newCache(parameters: nil)
+    let prefix = LMInput.Text(tokens: MLXArray([Int32(1), 2]))
+    _ = target(prefix[text: .newAxis], cache: cache, state: nil)
+
+    let input = LMInput(tokens: MLXArray([Int32(1), 2, 3]))
+    var parameters = GenerateParameters(maxTokens: 20)
+    parameters.temperature = 0
+    var iterator = try DFlash2SpeculativeTokenIterator(
+        input: input, mainModel: target, drafter: drafter,
+        mainCache: cache, prefilledPrefixTokens: 2,
+        parameters: parameters, blockSize: 4)
+
+    var produced: [Int] = []
+    while let token = iterator.next() {
+        produced.append(token)
+    }
+
+    #expect(produced.prefix(7) == [10, 20, 21, 55, 30, 77, 77])
+    // The drafter's first context window holds only the suffix row — hidden
+    // states are never stored with a KV prefix, so a warm start begins with
+    // the tail's captures alone.
+    #expect(drafter.receivedContextRows.first == 1)
+}
+
+@Test
 func testDFlash2AdaptiveWidthNarrowsWhenNothingAccepts() throws {
     // The target never matches the draft: zero acceptance at any width, so the
     // bandit's tok/s objective is pure per-width cost — and with width priced
