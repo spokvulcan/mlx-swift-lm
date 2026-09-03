@@ -153,11 +153,12 @@ final class Qwen3NextMLP: Module, UnaryLayer {
 
     /// Fold gate_proj + up_proj into one stacked QuantizedLinear and release
     /// the originals. Returns false (and changes nothing) when the pair is
-    /// not two bias-free QuantizedLinear layers with matching quantization.
+    /// not two bias-free plain QuantizedLinear layers with matching
+    /// quantization (see `plainQuantizedLinear(_:)`).
     func stackGateUp() -> Bool {
         guard gateUp == nil,
-            let g = gateProj as? QuantizedLinear,
-            let u = upProj as? QuantizedLinear,
+            let g = plainQuantizedLinear(gateProj),
+            let u = plainQuantizedLinear(upProj),
             g.bias == nil, u.bias == nil,
             g.groupSize == u.groupSize, g.bits == u.bits, g.mode == u.mode
         else { return false }
@@ -187,11 +188,25 @@ final class Qwen3NextMLP: Module, UnaryLayer {
     }
 }
 
+/// The one shape same-input stacking may fold: a layer whose forward *is*
+/// `quantizedMM(x, weight, scales, biases)` and nothing else. Subclasses of
+/// `QuantizedLinear` override the forward with extra work on the input —
+/// `RotateQuantizedLinear` (ParoQuant) rotates and channel-scales `x` before
+/// the matmul — so folding their `weight`/`scales` into a plain
+/// `QuantizedLinear` silently drops that work: the 2026-09-03 Qwen3.8-27B
+/// PARO incident, where every stacked block decoded garbage the moment the
+/// DFlash2 draft loaded. Exact class, never `as?`.
+func plainQuantizedLinear(_ module: Module) -> QuantizedLinear? {
+    guard type(of: module) == QuantizedLinear.self else { return nil }
+    return module as? QuantizedLinear
+}
+
 /// Stack every same-input projection group in `model` into one
 /// QuantizedLinear each: MLP gate+up (`Qwen3NextMLP.stackGateUp()`), the
 /// GDN four-way in-projection, and attention q/k/v. Bitwise-neutral — each
-/// output row keeps its own K-accumulation order and quantization groups.
-/// Returns the number of groups stacked.
+/// output row keeps its own K-accumulation order and quantization groups —
+/// and a no-op for any projection that is not a plain `QuantizedLinear`
+/// (`plainQuantizedLinear(_:)`). Returns the number of groups stacked.
 public func dflash2StackGateUpProjections(model: Module) -> Int {
     var stacked = 0
     for module in model.modules() {

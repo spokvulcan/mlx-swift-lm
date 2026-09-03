@@ -331,9 +331,9 @@ final class DFlash2Attention: Module {
     /// QuantizedLinear layers with matching quantization.
     func stackProjections() -> Bool {
         guard qkvStacked == nil,
-            let q = qProj as? QuantizedLinear,
-            let k = kProj as? QuantizedLinear,
-            let v = vProj as? QuantizedLinear
+            let q = plainQuantizedLinear(qProj),
+            let k = plainQuantizedLinear(kProj),
+            let v = plainQuantizedLinear(vProj)
         else { return false }
         let parts = [q, k, v]
         guard parts.allSatisfy({ $0.bias == nil }),
@@ -626,8 +626,8 @@ final class DFlash2MLP: Module, UnaryLayer {
     /// the originals (same contract as `Qwen3NextMLP.stackGateUp`).
     func stackGateUp() -> Bool {
         guard gateUp == nil,
-            let g = gateProj as? QuantizedLinear,
-            let u = upProj as? QuantizedLinear,
+            let g = plainQuantizedLinear(gateProj),
+            let u = plainQuantizedLinear(upProj),
             g.bias == nil, u.bias == nil,
             g.groupSize == u.groupSize, g.bits == u.bits, g.mode == u.mode
         else { return false }

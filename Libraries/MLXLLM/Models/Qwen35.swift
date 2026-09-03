@@ -321,14 +321,14 @@ final class Qwen35GatedDeltaNet: Module {
 
     /// Fold the four same-input in-projections into one stacked
     /// QuantizedLinear and release the originals. Returns false (and changes
-    /// nothing) unless all four are bias-free QuantizedLinear layers with
-    /// matching quantization.
+    /// nothing) unless all four are bias-free plain QuantizedLinear layers
+    /// with matching quantization (`plainQuantizedLinear(_:)`).
     func stackInProjections() -> Bool {
         guard inProjStacked == nil,
-            let qkv = inProjQKV as? QuantizedLinear,
-            let z = inProjZ as? QuantizedLinear,
-            let b = inProjB as? QuantizedLinear,
-            let a = inProjA as? QuantizedLinear
+            let qkv = plainQuantizedLinear(inProjQKV),
+            let z = plainQuantizedLinear(inProjZ),
+            let b = plainQuantizedLinear(inProjB),
+            let a = plainQuantizedLinear(inProjA)
         else { return false }
         let parts = [qkv, z, b, a]
         guard parts.allSatisfy({ $0.bias == nil }),
@@ -744,12 +744,13 @@ final class Qwen35Attention: Module {
 
     /// Fold q/k/v into one stacked QuantizedLinear and release the originals.
     /// Returns false (and changes nothing) unless all three are bias-free
-    /// QuantizedLinear layers with matching quantization.
+    /// plain QuantizedLinear layers with matching quantization
+    /// (`plainQuantizedLinear(_:)`).
     func stackQKVProjections() -> Bool {
         guard qkvStacked == nil,
-            let q = qProj as? QuantizedLinear,
-            let k = kProj as? QuantizedLinear,
-            let v = vProj as? QuantizedLinear
+            let q = plainQuantizedLinear(qProj),
+            let k = plainQuantizedLinear(kProj),
+            let v = plainQuantizedLinear(vProj)
         else { return false }
         let parts = [q, k, v]
         guard parts.allSatisfy({ $0.bias == nil }),

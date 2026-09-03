@@ -820,3 +820,31 @@ func testDFlash2FixedWidthNeverAdapts() throws {
     let widths = drafter.receivedBlockShapes.map { $0[1] }.dropLast(4)
     #expect(widths.allSatisfy { $0 == 4 })
 }
+
+// MARK: - Same-input stacking
+
+/// Same-input stacking folds only plain `QuantizedLinear` members — a
+/// subclass that transforms the input first (ParoQuant's
+/// `RotateQuantizedLinear`) must stay as loaded; see `plainQuantizedLinear(_:)`.
+@Test
+func testSameInputStackingSkipsQuantizedLinearSubclasses() throws {
+    let plain = Qwen3NextMLP(dimensions: 64, hiddenDimensions: 96)
+    quantize(model: plain, groupSize: 32, bits: 4)
+    #expect(plain.gateProj is QuantizedLinear)
+    #expect(dflash2StackGateUpProjections(model: plain) == 1)
+    #expect(plain.gateUp != nil)
+
+    let rotated = Qwen3NextMLP(dimensions: 64, hiddenDimensions: 96)
+    quantize(
+        model: rotated, groupSize: 32, bits: 4,
+        apply: { module, groupSize, bits in
+            guard let linear = module as? Linear else { return nil }
+            return RotateQuantizedLinear(
+                inputDims: linear.weight.dim(1), outputDims: linear.weight.dim(0),
+                hasBias: false, groupSize: groupSize, bits: bits, krot: 8)
+        })
+    #expect(dflash2StackGateUpProjections(model: rotated) == 0)
+    #expect(rotated.gateUp == nil)
+    #expect(rotated.gateProj is RotateQuantizedLinear)
+    #expect(rotated.upProj is RotateQuantizedLinear)
+}
