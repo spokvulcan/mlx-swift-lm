@@ -765,9 +765,10 @@ public protocol TokenIteratorProtocol: Sequence, IteratorProtocol where Element 
     mutating func discardGeneratedToken()
 }
 
-/// Internal lifecycle capability for iterators that retain generation work
-/// which must be reconciled after the token loop stops.
-protocol GenerationFinalizingTokenIterator: TokenIteratorProtocol {
+/// Lifecycle capability for iterators that retain generation work
+/// which must be reconciled after the token loop stops. Public so app-side
+/// token loops can honor the same rewind contract as `generateLoopTask`.
+public protocol GenerationFinalizingTokenIterator: TokenIteratorProtocol {
     mutating func finalizeGeneration()
 }
 
@@ -1193,7 +1194,7 @@ public struct TokenIterator: TokenIteratorProtocol {
 }
 
 extension TokenIterator: GenerationFinalizingTokenIterator {
-    mutating func finalizeGeneration() {
+    public mutating func finalizeGeneration() {
         processor?.finalizeGeneration()
     }
 }
@@ -1662,7 +1663,7 @@ public struct SpeculativeTokenIterator: TokenIteratorProtocol {
 }
 
 extension SpeculativeTokenIterator: GenerationFinalizingTokenIterator {
-    mutating func finalizeGeneration() {
+    public mutating func finalizeGeneration() {
         defer { processor?.finalizeGeneration() }
         // A round that accepted every draft left the last one for the next round to feed
         // (`draftY` carries it). Feed it now if it was returned, so both caches end together.
