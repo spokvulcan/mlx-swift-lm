@@ -674,9 +674,10 @@ public protocol TokenIteratorProtocol: Sequence, IteratorProtocol where Element 
     mutating func discardGeneratedToken()
 }
 
-/// Internal lifecycle capability for iterators that retain generation work
-/// which must be reconciled after the token loop stops.
-protocol GenerationFinalizingTokenIterator: TokenIteratorProtocol {
+/// Lifecycle capability for iterators that retain generation work
+/// which must be reconciled after the token loop stops. Public so app-side
+/// token loops can honor the same rewind contract as `generateLoopTask`.
+public protocol GenerationFinalizingTokenIterator: TokenIteratorProtocol {
     mutating func finalizeGeneration()
 }
 
@@ -1331,7 +1332,7 @@ public struct SpeculativeTokenIterator: TokenIteratorProtocol {
 }
 
 extension SpeculativeTokenIterator: GenerationFinalizingTokenIterator {
-    mutating func finalizeGeneration() {
+    public mutating func finalizeGeneration() {
         // Trim through the storages so the model-wide processed-token timeline
         // rewinds with the caches; `ChatSession` reconciles its ledger against
         // that timeline, not against per-entry offsets.
