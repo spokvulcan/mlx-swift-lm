@@ -210,6 +210,10 @@ final class Qwen35GatedDeltaNet: Module {
     private let fusedInputProjection = FusedQuantizedLinearProjectionCache()
     var fusedInputProjectionEnabled = qwen35FourGDNEnabled
 
+    /// Post-load stacked `qkv|z` for a checkpoint whose gate projections
+    /// cannot join the fused row; see `SameInputProjectionStacking`.
+    var qkvzStacked: QuantizedLinear?
+
     @ParameterInfo(key: "dt_bias") var dtBias: MLXArray
     @ParameterInfo(key: "A_log") var aLog: MLXArray
 
@@ -343,22 +347,34 @@ final class Qwen35GatedDeltaNet: Module {
         qkv: MLXArray, z: MLXArray, gates: GatedDeltaGateSource, zSource: GateSource,
         qkvSource: GateSource
     ) {
+        let qkvEnd = keyDim * 2 + valueDim
+        let zEnd = qkvEnd + valueDim
         guard fusedInputProjectionEnabled, let fusedInProj = fusedInputProjection.fused else {
+            let gates = GatedDeltaGateSource(
+                a: inProjA(inputs), b: inProjB(inputs), aLog: aLog, dtBias: dtBias)
+            if let qkvzStacked {
+                let projected = qkvzStacked(inputs)
+                return (
+                    projected[0..., 0..., ..<qkvEnd],
+                    projected[0..., 0..., qkvEnd ..< zEnd].reshaped(
+                        batch, sequence, numVHeads, headVDim),
+                    gates,
+                    GateSource(array: projected, offset: qkvEnd, rowLength: zEnd),
+                    GateSource(array: projected, offset: 0, rowLength: zEnd)
+                )
+            }
             let z = inProjZ(inputs)
             let qkv = inProjQKV(inputs)
             return (
                 qkv,
                 z.reshaped(batch, sequence, numVHeads, headVDim),
-                GatedDeltaGateSource(
-                    a: inProjA(inputs), b: inProjB(inputs), aLog: aLog, dtBias: dtBias),
+                gates,
                 GateSource(array: z, offset: 0, rowLength: valueDim),
                 GateSource(array: qkv, offset: 0, rowLength: convDim)
             )
         }
 
         let projected = fusedInProj(inputs)
-        let qkvEnd = keyDim * 2 + valueDim
-        let zEnd = qkvEnd + valueDim
         let offsets = fusedGateOffsets
         let aEnd = offsets.a + numVHeads
         return (
@@ -821,15 +837,26 @@ final class Qwen35Attention: Module {
     }
 }
 
+extension Qwen35GatedDeltaNet: SameInputProjectionStacking {
+    /// `qkv|z` only when the four-projection fusion did not apply: a pack
+    /// that stores `in_proj_b` / `in_proj_a` unquantized (a rotated ternary
+    /// checkpoint does) still shares the input between these two.
+    func stackSameInputProjections() -> Bool {
+        guard qkvzStacked == nil, fusedInputProjectionEnabled, !hasFusedInputProjection,
+            let stacked = stackedSameInputProjection([inProjQKV, inProjZ])
+        else { return false }
+        qkvzStacked = stacked
+        releaseStackedProjections(["in_proj_qkv", "in_proj_z"])
+        return true
+    }
+}
+
 extension Qwen35Attention: SameInputProjectionStacking {
     func stackSameInputProjections() -> Bool {
         guard qkvStacked == nil,
-            let q = plainQuantizedLinear(qProj),
-            let k = plainQuantizedLinear(kProj),
-            let v = plainQuantizedLinear(vProj),
-            let stacked = stackedQuantizedLinear([q, k, v])
+            let stacked = stackedSameInputProjection([qProj, kProj, vProj])
         else { return false }
-        qkvStackedDims = (q.weight.dim(0), k.weight.dim(0))
+        qkvStackedDims = (qProj.shape.0, kProj.shape.0)
         qkvStacked = stacked
         releaseStackedProjections(["q_proj", "k_proj", "v_proj"])
         return true

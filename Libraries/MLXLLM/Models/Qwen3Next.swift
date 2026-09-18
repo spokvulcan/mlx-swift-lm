@@ -159,11 +159,9 @@ final class Qwen3NextMLP: Module, UnaryLayer {
 extension Qwen3NextMLP: SameInputProjectionStacking {
     func stackSameInputProjections() -> Bool {
         guard gateUp == nil,
-            let gate = plainQuantizedLinear(gateProj),
-            let up = plainQuantizedLinear(upProj),
-            let stacked = stackedQuantizedLinear([gate, up])
+            let stacked = stackedSameInputProjection([gateProj, upProj])
         else { return false }
-        gateDimensions = gate.weight.dim(0)
+        gateDimensions = gateProj.shape.0
         gateUp = stacked
         releaseStackedProjections(["gate_proj", "up_proj"])
         return true
