@@ -3,42 +3,19 @@
 import Foundation
 import MLX
 import MLXLLM
-import MLXLMCommon
 import MLXNN
 import MLXVLM
 import XCTest
+
+@testable import MLXLMCommon
 
 final class HadamardQuantizedTests: XCTestCase {
 
     // MARK: - Fixtures
 
-    /// The Sylvester Walsh–Hadamard matrix of order `n`, unnormalized, row-major.
-    private static func hadamardMatrix(_ n: Int) -> MLXArray {
-        var h: [[Float]] = [[1]]
-        while h.count < n {
-            let m = h.count
-            var next = [[Float]](repeating: [Float](repeating: 0, count: 2 * m), count: 2 * m)
-            for i in 0 ..< m {
-                for j in 0 ..< m {
-                    next[i][j] = h[i][j]
-                    next[i][j + m] = h[i][j]
-                    next[i + m][j] = h[i][j]
-                    next[i + m][j + m] = -h[i][j]
-                }
-            }
-            h = next
-        }
-        return MLXArray(h.flatMap { $0 }, [n, n])
-    }
-
     /// A deterministic ±1 vector.
-    private static func signs(_ n: Int, seed: UInt64 = 7) -> MLXArray {
-        var state = seed
-        let values = (0 ..< n).map { _ -> Float in
-            state = state &* 6_364_136_223_846_793_005 &+ 1_442_695_040_888_963_407
-            return (state >> 33) & 1 == 0 ? -1 : 1
-        }
-        return MLXArray(values)
+    private static func signs(_ n: Int) -> MLXArray {
+        TurboQuantRotation.whtSigns(dim: n, seed: 7)
     }
 
     /// A deterministic float array with values in about `[-1, 1]`.
@@ -57,6 +34,21 @@ final class HadamardQuantizedTests: XCTestCase {
             "\(message) actual=\(actual) expected=\(expected)", file: file, line: line)
     }
 
+    private func assertThrows(
+        _ expected: HadamardQuantizedCheckpointError, file: StaticString = #filePath,
+        line: UInt = #line, _ body: () throws -> Void
+    ) {
+        XCTAssertThrowsError(try body(), file: file, line: line) {
+            XCTAssertEqual(
+                $0 as? HadamardQuantizedCheckpointError, expected, file: file, line: line)
+        }
+    }
+
+    /// The validation the `PrismHadamardQwen35` classes run.
+    private static func validateForQwen35(_ manifest: HadamardQuantizedManifest) throws {
+        try manifest.validate(baseModelType: "qwen3_5", tensorNamespace: "mlx-vlm-qwen3_5")
+    }
+
     // MARK: - Rotation
 
     func testForwardMatchesExplicitSignedHadamard() {
@@ -65,7 +57,7 @@ final class HadamardQuantizedTests: XCTestCase {
         let x = Self.values([3, 16])
         let signs = Self.signs(16)
 
-        let h = Self.hadamardMatrix(block) / sqrt(Float(block))
+        let h = TurboQuantRotation.hadamardMatrix(dim: block) / sqrt(Float(block))
         let expected = matmul((x * signs).reshaped(-1, block), h).reshaped(3, 16)
 
         assertClose(rotation.forward(x, signs: signs), expected)
@@ -117,8 +109,9 @@ final class HadamardQuantizedTests: XCTestCase {
             Self.values([count, dimensions]), groupSize: groupSize, bits: bits)
         let signs = Self.signs(dimensions)
         let layer = HadamardQuantizedEmbedding(
-            weight: weight, scales: scales, biases: biases, signs: signs,
-            groupSize: groupSize, bits: bits, rotation: rotation)
+            replacing: Embedding(weight: Self.values([count, dimensions])), groupSize: groupSize,
+            bits: bits, rotation: rotation)
+        layer.update(parameters: ModuleParameters.unflattened(["signs": signs]))
 
         XCTAssertEqual(layer.shape.0, count)
         XCTAssertEqual(layer.shape.1, dimensions)
@@ -227,18 +220,13 @@ final class HadamardQuantizedTests: XCTestCase {
             in: wrapper, manifest: Self.tinyManifest, pathPrefix: "language_model.")
         let gateBefore = wrapper.languageModel.model.layers[0].gate
 
-        var weights = [String: MLXArray]()
-        weights.merge(
+        var weights = [
             Self.packedWeights(
-                path: "language_model.model.embed_tokens", rows: 16, columns: 64, phase: 0)
-        ) { $1 }
-        weights.merge(
+                path: "language_model.model.embed_tokens", rows: 16, columns: 64, phase: 0),
             Self.packedWeights(
-                path: "language_model.model.layers.0.gate_proj", rows: 32, columns: 64, phase: 1)
-        ) { $1 }
-        weights.merge(
-            Self.packedWeights(path: "language_model.lm_head", rows: 16, columns: 64, phase: 2)
-        ) { $1 }
+                path: "language_model.model.layers.0.gate_proj", rows: 32, columns: 64, phase: 1),
+            Self.packedWeights(path: "language_model.lm_head", rows: 16, columns: 64, phase: 2),
+        ].reduce(into: [String: MLXArray]()) { $0.merge($1) { $1 } }
         // An ordinary quantized module beside the rotated ones, as the vision tower or
         // an unrotated projection would be.
         let (upWeight, upScales, upBiases) = quantized(
@@ -273,25 +261,19 @@ final class HadamardQuantizedTests: XCTestCase {
         let missing = HadamardQuantizedManifest(
             modules: [.init(path: "model.layers.9.gate_proj", block: 32)],
             quantization: .init(groupSize: 32, bits: 2))
-        XCTAssertThrowsError(
+        assertThrows(.moduleNotFound("language_model.model.layers.9.gate_proj")) {
             try substituteHadamardQuantizedModules(
                 in: TinyWrapper(), manifest: missing, pathPrefix: "language_model.")
-        ) { error in
-            XCTAssertEqual(
-                error as? HadamardQuantizedCheckpointError,
-                .moduleNotFound("language_model.model.layers.9.gate_proj"))
         }
 
         let wrongKind = HadamardQuantizedManifest(
             modules: [.init(path: "model.embed_tokens", block: 32, embedding: false)],
             quantization: .init(groupSize: 32, bits: 2))
-        XCTAssertThrowsError(
+        assertThrows(
+            .moduleNotSubstitutable("language_model.model.embed_tokens", found: "Embedding")
+        ) {
             try substituteHadamardQuantizedModules(
                 in: TinyWrapper(), manifest: wrongKind, pathPrefix: "language_model.")
-        ) { error in
-            XCTAssertEqual(
-                error as? HadamardQuantizedCheckpointError,
-                .moduleNotSubstitutable("language_model.model.embed_tokens", found: "Embedding"))
         }
     }
 
@@ -381,8 +363,7 @@ final class HadamardQuantizedTests: XCTestCase {
             manifest.modules[0],
             .init(path: "model.embed_tokens", block: 32, embedding: true, dtype: "float16"))
         XCTAssertEqual(manifest.modules[5].embedding, false)
-        XCTAssertNoThrow(
-            try manifest.validate(baseModelType: "qwen3_5", tensorNamespace: "mlx-vlm-qwen3_5"))
+        XCTAssertNoThrow(try Self.validateForQwen35(manifest))
     }
 
     func testManifestValidationRejectsWhatTheLoaderCannotHonor() throws {
@@ -391,59 +372,32 @@ final class HadamardQuantizedTests: XCTestCase {
 
         var schema = base
         schema.schemaVersion = 1
-        XCTAssertThrowsError(
-            try schema.validate(baseModelType: "qwen3_5", tensorNamespace: "mlx-vlm-qwen3_5")
-        ) { XCTAssertEqual($0 as? HadamardQuantizedCheckpointError, .unsupportedSchemaVersion(1)) }
+        assertThrows(.unsupportedSchemaVersion(1)) { try Self.validateForQwen35(schema) }
 
-        XCTAssertThrowsError(
+        assertThrows(.unsupportedBaseModelType("qwen3_5", expected: "llama")) {
             try base.validate(baseModelType: "llama", tensorNamespace: "mlx-vlm-qwen3_5")
-        ) {
-            XCTAssertEqual(
-                $0 as? HadamardQuantizedCheckpointError,
-                .unsupportedBaseModelType("qwen3_5", expected: "llama"))
         }
-
-        XCTAssertThrowsError(
+        assertThrows(.unsupportedTensorNamespace("mlx-vlm-qwen3_5", expected: "mlx-lm-qwen3_5")) {
             try base.validate(baseModelType: "qwen3_5", tensorNamespace: "mlx-lm-qwen3_5")
-        ) {
-            XCTAssertEqual(
-                $0 as? HadamardQuantizedCheckpointError,
-                .unsupportedTensorNamespace("mlx-vlm-qwen3_5", expected: "mlx-lm-qwen3_5"))
         }
 
         var layout = base
         layout.gdnActivationLayout = "tiled"
-        XCTAssertThrowsError(
-            try layout.validate(baseModelType: "qwen3_5", tensorNamespace: "mlx-vlm-qwen3_5")
-        ) {
-            XCTAssertEqual(
-                $0 as? HadamardQuantizedCheckpointError, .unsupportedActivationLayout("tiled"))
-        }
+        assertThrows(.unsupportedActivationLayout("tiled")) { try Self.validateForQwen35(layout) }
 
         var empty = base
         empty.modules = []
-        XCTAssertThrowsError(
-            try empty.validate(baseModelType: "qwen3_5", tensorNamespace: "mlx-vlm-qwen3_5")
-        ) { XCTAssertEqual($0 as? HadamardQuantizedCheckpointError, .emptyManifest) }
+        assertThrows(.emptyManifest) { try Self.validateForQwen35(empty) }
 
         var mixed = base
         mixed.modules[2].dtype = "bfloat16"
-        XCTAssertThrowsError(
-            try mixed.validate(baseModelType: "qwen3_5", tensorNamespace: "mlx-vlm-qwen3_5")
-        ) {
-            XCTAssertEqual(
-                $0 as? HadamardQuantizedCheckpointError,
-                .mixedActivationDTypes(["bfloat16", "float16"]))
+        assertThrows(.mixedActivationDTypes(["bfloat16", "float16"])) {
+            try Self.validateForQwen35(mixed)
         }
 
         var wide = base
         for i in wide.modules.indices { wide.modules[i].dtype = "float32" }
-        XCTAssertThrowsError(
-            try wide.validate(baseModelType: "qwen3_5", tensorNamespace: "mlx-vlm-qwen3_5")
-        ) {
-            XCTAssertEqual(
-                $0 as? HadamardQuantizedCheckpointError, .unsupportedActivationDType("float32"))
-        }
+        assertThrows(.unsupportedActivationDType("float32")) { try Self.validateForQwen35(wide) }
     }
 
     // MARK: - Factories
@@ -471,20 +425,27 @@ final class HadamardQuantizedTests: XCTestCase {
         "language_model.model.layers.1.self_attn.o_proj",
     ]
 
+    /// Both classes substitute the same manifest modules and cast the same unpacked
+    /// tensors; `visionTower` is false for the text class, whose sanitize drops the tower.
+    private func assertRotatedQwen35(_ model: Module & LanguageModel, visionTower: Bool) {
+        XCTAssertEqual(rotatedModulePaths(in: model), Self.expectedRotatedPaths)
+        let paths = Set(model.leafModules().flattened().map(\.0))
+        // Layer 0 is gated-delta and layer 1 full attention; both keep their unrotated parts.
+        XCTAssertTrue(paths.contains("language_model.model.layers.0.linear_attn.in_proj_a"))
+        XCTAssertTrue(paths.contains("language_model.model.layers.1.self_attn.q_norm"))
+        XCTAssertEqual(paths.contains { $0.hasPrefix("vision_tower.") }, visionTower)
+        // The pack stores its norms in float32; sanitize brings them to the activation dtype.
+        let sanitized = model.sanitize(
+            weights: Self.unpackedWeightsFixture(), metadata: ["format": "mlx"])
+        Self.assertUnpackedWeightsCast(sanitized, visionTower: visionTower)
+    }
+
     func testLLMRegistryBuildsTheQwen35TextClassWithRotatedModules() async throws {
         let model = try await LLMTypeRegistry.shared.createModel(
             configuration: Data(Self.packConfig.utf8), modelType: "prism_hadamard_qwen35")
         XCTAssertTrue(model is Qwen35Model)
         XCTAssertTrue(model is PrismHadamardQwen35Model)
-        XCTAssertEqual(rotatedModulePaths(in: model), Self.expectedRotatedPaths)
-        // Layer 0 is gated-delta and layer 1 full attention; both keep their unrotated parts.
-        let paths = Set(model.leafModules().flattened().map(\.0))
-        XCTAssertTrue(paths.contains("language_model.model.layers.0.linear_attn.in_proj_a"))
-        XCTAssertTrue(paths.contains("language_model.model.layers.1.self_attn.q_norm"))
-        // The pack stores its norms in float32; sanitize brings them to the activation dtype.
-        let sanitized = model.sanitize(
-            weights: Self.unpackedWeightsFixture(), metadata: ["format": "mlx"])
-        Self.assertUnpackedWeightsCast(sanitized, visionTower: false)
+        assertRotatedQwen35(model, visionTower: false)
     }
 
     func testVLMRegistryBuildsTheQwen35VisionClassWithRotatedModules() async throws {
@@ -492,12 +453,7 @@ final class HadamardQuantizedTests: XCTestCase {
             configuration: Data(Self.packConfig.utf8), modelType: "prism_hadamard_qwen35")
         XCTAssertTrue(model is Qwen35)
         XCTAssertTrue(model is PrismHadamardQwen35)
-        XCTAssertEqual(rotatedModulePaths(in: model), Self.expectedRotatedPaths)
-        let paths = Set(model.leafModules().flattened().map(\.0))
-        XCTAssertTrue(paths.contains { $0.hasPrefix("vision_tower.") })
-        let sanitized = model.sanitize(
-            weights: Self.unpackedWeightsFixture(), metadata: ["format": "mlx"])
-        Self.assertUnpackedWeightsCast(sanitized, visionTower: true)
+        assertRotatedQwen35(model, visionTower: true)
     }
 
     /// What a pack stores beside its packed modules: float32 norms, taps and the small
@@ -525,7 +481,6 @@ final class HadamardQuantizedTests: XCTestCase {
         ]
     }
 
-    /// `visionTower` is false for the text class, whose sanitize drops the tower.
     private static func assertUnpackedWeightsCast(
         _ weights: [String: MLXArray], visionTower: Bool
     ) {
