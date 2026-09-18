@@ -19,14 +19,20 @@ public struct SignedBlockHadamard: Sendable, Equatable {
     /// Elements per Hadamard block along the last axis. A power of two.
     public let blockSize: Int
 
+    private let scale: Float
+
     /// Creates a rotation over blocks of `blockSize` elements.
     public init(blockSize: Int) {
-        precondition(
-            blockSize > 0 && blockSize & (blockSize - 1) == 0, "blockSize must be a power of two")
+        precondition(Self.isValidBlockSize(blockSize), "blockSize must be a power of two")
         self.blockSize = blockSize
+        self.scale = 1 / Float(blockSize).squareRoot()
     }
 
-    private var scale: Float { 1 / Float(blockSize).squareRoot() }
+    /// Whether `blockSize` is a positive power of two, the only order Sylvester's
+    /// construction defines.
+    public static func isValidBlockSize(_ blockSize: Int) -> Bool {
+        blockSize > 0 && blockSize & (blockSize - 1) == 0
+    }
 
     /// `R·x` along the last axis: flip signs, then transform each block.
     public func forward(_ x: MLXArray, signs: MLXArray) -> MLXArray {
@@ -92,32 +98,16 @@ open class HadamardQuantizedLinear: QuantizedLinear {
     }
 
     open override func callAsFunction(_ x: MLXArray) -> MLXArray {
-        var y = quantizedMM(
-            rotation.forward(x, signs: signs), weight, scales: scales, biases: biases,
-            transpose: true, groupSize: groupSize, bits: bits, mode: mode)
-        if let bias {
-            y = y + bias
-        }
-        return y
+        super.callAsFunction(rotation.forward(x, signs: signs))
     }
 }
 
-/// An `Embedding` whose rows were quantized in a rotated basis.
+/// A `QuantizedEmbedding` whose rows were quantized in a rotated basis.
 ///
 /// Lookup dequantizes the rows and applies ``SignedBlockHadamard/inverse(_:signs:)``;
 /// ``asLinear(_:)`` rotates the input forward and runs the packed matmul, so a tied
 /// head shares the table the way an unrotated `QuantizedEmbedding` does.
-open class HadamardQuantizedEmbedding: Embedding, Quantized {
-
-    public let groupSize: Int
-    public let bits: Int
-    public let mode: QuantizationMode
-
-    /// Per-group quantization scales.
-    public let scales: MLXArray
-
-    /// Per-group quantization biases, or `nil` for modes without them.
-    public let biases: MLXArray?
+open class HadamardQuantizedEmbedding: QuantizedEmbedding {
 
     /// The rotation's ±1 signs, one per embedding dimension.
     public let signs: MLXArray
@@ -125,57 +115,25 @@ open class HadamardQuantizedEmbedding: Embedding, Quantized {
     /// The rotation folded into `weight`.
     public let rotation: SignedBlockHadamard
 
-    open override var shape: (Int, Int) {
-        let (count, packed) = super.shape
-        return (count, packed * 32 / bits)
-    }
-
-    /// Creates the layer from a checkpoint's packed arrays.
-    public init(
-        weight: MLXArray, scales: MLXArray, biases: MLXArray?, signs: MLXArray,
-        groupSize: Int, bits: Int, mode: QuantizationMode = .affine,
-        rotation: SignedBlockHadamard
-    ) {
-        self.groupSize = groupSize
-        self.bits = bits
-        self.mode = mode
-        self.scales = scales
-        self.biases = biases
-        self.signs = signs
-        self.rotation = rotation
-        super.init(weight: weight)
-        freeze()
-    }
-
     /// A placeholder shaped like the checkpoint's arrays, standing in for `embedding`
-    /// until the loader updates its parameters.
-    public convenience init(
+    /// until the loader updates its parameters. The table is quantized lazily, as the
+    /// loader's own quantize pass does for an unrotated embedding, and never evaluated.
+    public init(
         replacing embedding: Embedding, groupSize: Int, bits: Int,
         mode: QuantizationMode = .affine, rotation: SignedBlockHadamard
     ) {
-        let (count, dimensions) = embedding.shape
-        let groups = dimensions / groupSize
-        self.init(
-            weight: MLXArray.zeros([count, dimensions * bits / 32], dtype: .uint32),
-            scales: MLXArray.zeros([count, groups], dtype: .float16),
-            biases: mode == .affine ? MLXArray.zeros([count, groups], dtype: .float16) : nil,
-            signs: MLXArray.ones([dimensions], dtype: .float32),
-            groupSize: groupSize, bits: bits, mode: mode, rotation: rotation)
+        self.signs = MLXArray.ones([embedding.shape.1], dtype: .float32)
+        self.rotation = rotation
+        super.init(weight: embedding.weight, groupSize: groupSize, bits: bits, mode: mode)
+        freeze()
     }
 
     open override func callAsFunction(_ x: MLXArray) -> MLXArray {
-        let shape = x.shape
-        let flat = x.flattened()
-        let rows = dequantized(
-            weight[flat], scales: scales[flat], biases: biases.map { $0[flat] },
-            groupSize: groupSize, bits: bits, mode: mode)
-        return rotation.inverse(rows, signs: signs).reshaped(shape + [-1])
+        rotation.inverse(super.callAsFunction(x), signs: signs)
     }
 
     open override func asLinear(_ x: MLXArray) -> MLXArray {
-        quantizedMM(
-            rotation.forward(x, signs: signs), weight, scales: scales, biases: biases,
-            transpose: true, groupSize: groupSize, bits: bits, mode: mode)
+        super.asLinear(rotation.forward(x, signs: signs))
     }
 }
 
@@ -204,10 +162,6 @@ public struct HadamardQuantizedModule: Codable, Sendable, Equatable {
         self.block = block
         self.embedding = embedding
         self.dtype = dtype
-    }
-
-    enum CodingKeys: String, CodingKey {
-        case path, block, embedding, dtype
     }
 
     public init(from decoder: Decoder) throws {
@@ -339,15 +293,11 @@ public struct HadamardQuantizedManifest: Codable, Sendable {
         _ weights: [String: MLXArray], to dtype: DType, pathPrefix: String = ""
     ) -> [String: MLXArray] {
         let packed = Set(modules.map { pathPrefix + $0.path })
-        var cast = [String: MLXArray]()
-        cast.reserveCapacity(weights.count)
-        for (key, value) in weights {
-            guard value.dtype.isFloatingPoint, value.dtype != dtype,
-                !key.hasSuffix("A_log"), !packed.contains(Self.modulePath(of: key))
-            else {
-                cast[key] = value
-                continue
-            }
+        var cast = weights
+        for (key, value) in weights
+        where value.dtype.isFloatingPoint && value.dtype != dtype && !key.hasSuffix("A_log")
+            && !packed.contains(Self.modulePath(of: key))
+        {
             cast[key] = value.asType(dtype)
         }
         return cast
@@ -420,11 +370,7 @@ public enum HadamardQuantizedCheckpointError: Error, CustomStringConvertible, Eq
 public func substituteHadamardQuantizedModules(
     in model: Module, manifest: HadamardQuantizedManifest, pathPrefix: String = ""
 ) throws {
-    var modulesByPath = [String: Module]()
-    for (path, module) in model.leafModules().flattened() {
-        modulesByPath[path] = module
-    }
-
+    let modulesByPath = Dictionary(uniqueKeysWithValues: model.leafModules().flattened())
     let quantization = manifest.quantization
     var updates = [(String, Module)]()
     for entry in manifest.modules {
@@ -432,36 +378,77 @@ public func substituteHadamardQuantizedModules(
         guard let module = modulesByPath[path] else {
             throw HadamardQuantizedCheckpointError.moduleNotFound(path)
         }
-        guard entry.block > 0, entry.block & (entry.block - 1) == 0 else {
+        guard SignedBlockHadamard.isValidBlockSize(entry.block) else {
             throw HadamardQuantizedCheckpointError.unsupportedBlockSize(path, block: entry.block)
         }
         let rotation = SignedBlockHadamard(blockSize: entry.block)
-        if entry.embedding {
-            guard type(of: module) == Embedding.self, let embedding = module as? Embedding else {
-                throw HadamardQuantizedCheckpointError.moduleNotSubstitutable(
-                    path, found: "\(type(of: module))")
-            }
-            updates.append(
-                (
-                    path,
-                    HadamardQuantizedEmbedding(
-                        replacing: embedding, groupSize: quantization.groupSize,
-                        bits: quantization.bits, mode: quantization.mode, rotation: rotation)
-                ))
-        } else {
-            guard type(of: module) == Linear.self, let linear = module as? Linear else {
-                throw HadamardQuantizedCheckpointError.moduleNotSubstitutable(
-                    path, found: "\(type(of: module))")
-            }
-            updates.append(
-                (
-                    path,
-                    HadamardQuantizedLinear(
-                        replacing: linear, groupSize: quantization.groupSize,
-                        bits: quantization.bits, mode: quantization.mode, rotation: rotation)
-                ))
+        let replacement: Module
+        switch module {
+        case let embedding as Embedding where entry.embedding && type(of: module) == Embedding.self:
+            replacement = HadamardQuantizedEmbedding(
+                replacing: embedding, groupSize: quantization.groupSize, bits: quantization.bits,
+                mode: quantization.mode, rotation: rotation)
+        case let linear as Linear where !entry.embedding && type(of: module) == Linear.self:
+            replacement = HadamardQuantizedLinear(
+                replacing: linear, groupSize: quantization.groupSize, bits: quantization.bits,
+                mode: quantization.mode, rotation: rotation)
+        default:
+            throw HadamardQuantizedCheckpointError.moduleNotSubstitutable(
+                path, found: "\(type(of: module))")
         }
+        updates.append((path, replacement))
     }
 
     model.update(modules: ModuleChildren.unflattened(updates))
+}
+
+// MARK: - Checkpoint
+
+/// A rotated checkpoint's manifest, validated against the base model that loads it.
+///
+/// A model class built from such a checkpoint creates one of these before `super.init`
+/// (the manifest is rejected before any weights are allocated), calls
+/// ``substituteModules(in:)`` once the base model exists, and routes its `sanitize`
+/// through ``sanitize(_:)``. The `PrismHadamardQwen35` classes in MLXLLM and MLXVLM are
+/// the pattern.
+public struct HadamardQuantizedCheckpoint: Sendable {
+
+    /// The checkpoint's manifest.
+    public let manifest: HadamardQuantizedManifest
+
+    /// What the model prepends to the manifest's paths.
+    public let pathPrefix: String
+
+    /// The activation dtype the packed modules declare; `nil` leaves the unpacked
+    /// tensors as stored.
+    public let activationDType: DType?
+
+    /// Validates `manifest` for a model of `baseModelType` whose module paths follow
+    /// `tensorNamespace`.
+    ///
+    /// - Throws: `HadamardQuantizedCheckpointError` when the manifest is not one this
+    ///   loader can honor.
+    public init(
+        manifest: HadamardQuantizedManifest, baseModelType: String, tensorNamespace: String,
+        pathPrefix: String = ""
+    ) throws {
+        try manifest.validate(baseModelType: baseModelType, tensorNamespace: tensorNamespace)
+        self.manifest = manifest
+        self.pathPrefix = pathPrefix
+        self.activationDType = try manifest.activationDType()
+    }
+
+    /// Replaces the manifest modules of `model` with rotated placeholders; see
+    /// ``substituteHadamardQuantizedModules(in:manifest:pathPrefix:)``.
+    public func substituteModules(in model: Module) throws {
+        try substituteHadamardQuantizedModules(
+            in: model, manifest: manifest, pathPrefix: pathPrefix)
+    }
+
+    /// Casts the checkpoint's unpacked floating-point tensors to the activation dtype;
+    /// see `HadamardQuantizedManifest.castingUnpackedWeights(_:to:pathPrefix:)`.
+    public func sanitize(_ weights: [String: MLXArray]) -> [String: MLXArray] {
+        guard let activationDType else { return weights }
+        return manifest.castingUnpackedWeights(weights, to: activationDType, pathPrefix: pathPrefix)
+    }
 }
