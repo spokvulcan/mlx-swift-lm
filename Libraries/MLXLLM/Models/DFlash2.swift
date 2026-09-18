@@ -421,11 +421,8 @@ extension DFlash2Attention: SameInputProjectionStacking {
     /// `k`/`v` weights land in both stacks; the drafter is small enough.
     func stackSameInputProjections() -> Bool {
         guard qkvStacked == nil,
-            let q = plainQuantizedLinear(qProj),
-            let k = plainQuantizedLinear(kProj),
-            let v = plainQuantizedLinear(vProj),
-            let qkv = stackedQuantizedLinear([q, k, v]),
-            let kv = stackedQuantizedLinear([k, v])
+            let qkv = stackedSameInputProjection([qProj, kProj, vProj]),
+            let kv = stackedSameInputProjection([kProj, vProj])
         else { return false }
         qkvStacked = qkv
         kvStacked = kv
@@ -522,11 +519,9 @@ final class DFlash2MLP: Module, UnaryLayer {
 extension DFlash2MLP: SameInputProjectionStacking {
     func stackSameInputProjections() -> Bool {
         guard gateUp == nil,
-            let gate = plainQuantizedLinear(gateProj),
-            let up = plainQuantizedLinear(upProj),
-            let stacked = stackedQuantizedLinear([gate, up])
+            let stacked = stackedSameInputProjection([gateProj, upProj])
         else { return false }
-        gateDimensions = gate.weight.dim(0)
+        gateDimensions = gateProj.shape.0
         gateUp = stacked
         releaseStackedProjections(["gate_proj", "up_proj"])
         return true

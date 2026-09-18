@@ -2,11 +2,11 @@
 
 import Foundation
 import MLX
-import MLXLLM
 import MLXNN
 import MLXVLM
 import XCTest
 
+@testable import MLXLLM
 @testable import MLXLMCommon
 
 final class HadamardQuantizedTests: XCTestCase {
@@ -512,5 +512,211 @@ final class HadamardQuantizedTests: XCTestCase {
                     error as? HadamardQuantizedCheckpointError, .unsupportedSchemaVersion(1))
             }
         }
+    }
+
+    // MARK: - Same-input stacking
+
+    private func assertBitIdentical(
+        _ actual: MLXArray, _ expected: MLXArray, _ message: String = "",
+        file: StaticString = #filePath, line: UInt = #line
+    ) {
+        XCTAssertEqual(actual.dtype, expected.dtype, message, file: file, line: line)
+        XCTAssertEqual(actual.shape, expected.shape, message, file: file, line: line)
+        let mismatches = zip(
+            actual.asType(.float32).asArray(Float.self),
+            expected.asType(.float32).asArray(Float.self)
+        ).lazy.filter { $0.bitPattern != $1.bitPattern }.count
+        XCTAssertEqual(
+            mismatches, 0, "\(message): \(mismatches) values differ", file: file, line: line)
+    }
+
+    /// One module of a rotated fixture: its path, output rows, block and signs.
+    private typealias RotatedModule = (path: String, rows: Int, block: Int, signs: MLXArray)
+
+    /// Replaces `modules` of `module` with rotated placeholders and loads packed
+    /// weights over `inputs` columns into them: the loader's sequence.
+    private static func loadRotated(
+        _ module: Module, modules: [RotatedModule], inputs: Int
+    ) throws {
+        let manifest = HadamardQuantizedManifest(
+            modules: modules.map { .init(path: $0.path, block: $0.block) },
+            quantization: .init(groupSize: 32, bits: 2))
+        try substituteHadamardQuantizedModules(in: module, manifest: manifest)
+        var weights = [String: MLXArray]()
+        for (index, entry) in modules.enumerated() {
+            weights.merge(
+                packedWeights(
+                    path: entry.path, rows: entry.rows, columns: inputs, phase: Float(index))
+            ) { $1 }
+            weights["\(entry.path).signs"] = entry.signs
+        }
+        try module.update(
+            parameters: ModuleParameters.unflattened(weights),
+            verify: [.noUnusedKeys, .shapeMismatch])
+    }
+
+    func testStackingFoldsRotatedSiblingsThatShareTheirSigns() throws {
+        let mlp = Qwen3NextMLP(dimensions: 64, hiddenDimensions: 96)
+        let signs = Self.signs(64)
+        try Self.loadRotated(
+            mlp, modules: [("gate_proj", 96, 32, signs), ("up_proj", 96, 32, signs)], inputs: 64)
+        let x = Self.values([1, 3, 64], phase: 4).asType(.float16)
+        let before = mlp(x)
+        eval(before)
+
+        XCTAssertEqual(stackSameInputProjections(in: mlp), 1)
+
+        let stacked = try XCTUnwrap(mlp.gateUp as? HadamardQuantizedLinear)
+        XCTAssertEqual(stacked.rotation, SignedBlockHadamard(blockSize: 32))
+        XCTAssertTrue(arrayEqual(stacked.signs, signs).item(Bool.self))
+        XCTAssertEqual(stacked.shape.0, 192)
+        XCTAssertEqual(stacked.shape.1, 64)
+        XCTAssertEqual(stacked.bits, 2)
+        XCTAssertEqual(mlp.gateDimensions, 96)
+        XCTAssertTrue(type(of: mlp.gateProj) == Linear.self, "the originals are released")
+        let after = mlp(x)
+        eval(after)
+        assertBitIdentical(after, before, "stacked MLP")
+        XCTAssertEqual(stackSameInputProjections(in: mlp), 0, "stacks once")
+    }
+
+    func testStackingLeavesRotatedSiblingsWithDifferentSignsOrBlocksApart() throws {
+        let signs = Self.signs(64)
+        var flipped = signs.asArray(Float.self)
+        flipped[5] = -flipped[5]
+
+        let differentSigns = Qwen3NextMLP(dimensions: 64, hiddenDimensions: 96)
+        try Self.loadRotated(
+            differentSigns,
+            modules: [("gate_proj", 96, 32, signs), ("up_proj", 96, 32, MLXArray(flipped))],
+            inputs: 64)
+        let differentBlocks = Qwen3NextMLP(dimensions: 64, hiddenDimensions: 96)
+        try Self.loadRotated(
+            differentBlocks, modules: [("gate_proj", 96, 32, signs), ("up_proj", 96, 64, signs)],
+            inputs: 64)
+
+        for (mlp, label) in [(differentSigns, "signs"), (differentBlocks, "blocks")] {
+            let x = Self.values([2, 64], phase: 4).asType(.float16)
+            let before = mlp(x)
+            eval(before)
+            XCTAssertEqual(stackSameInputProjections(in: mlp), 0, label)
+            XCTAssertNil(mlp.gateUp, label)
+            XCTAssertTrue(mlp.gateProj is HadamardQuantizedLinear, label)
+            XCTAssertTrue(mlp.upProj is HadamardQuantizedLinear, label)
+            let after = mlp(x)
+            eval(after)
+            assertBitIdentical(after, before, label)
+        }
+
+        // A rotated layer beside a plain quantized one shares no rotation to fold.
+        let mixed = Qwen3NextMLP(dimensions: 64, hiddenDimensions: 96)
+        try Self.loadRotated(mixed, modules: [("gate_proj", 96, 32, signs)], inputs: 64)
+        quantize(model: mixed, groupSize: 32, bits: 2)
+        XCTAssertTrue(type(of: mixed.upProj) == QuantizedLinear.self)
+        XCTAssertEqual(stackSameInputProjections(in: mixed), 0)
+        XCTAssertNil(mixed.gateUp)
+    }
+
+    /// A rotated layer with random packed arrays at a checkpoint's shape.
+    private static func randomRotatedLinear(
+        inputs: Int, outputs: Int, signs: MLXArray, rotation: SignedBlockHadamard
+    ) -> HadamardQuantizedLinear {
+        let (groupSize, bits) = (128, 2)
+        return HadamardQuantizedLinear(
+            weight: MLXRandom.randInt(0 ..< Int32.max, [outputs, inputs * bits / 32])
+                .asType(.uint32),
+            scales: MLXRandom.uniform(low: 0.01, high: 0.1, [outputs, inputs / groupSize])
+                .asType(.float16),
+            biases: MLXRandom.uniform(low: -0.1, high: 0.1, [outputs, inputs / groupSize])
+                .asType(.float16),
+            signs: signs, groupSize: groupSize, bits: bits, rotation: rotation)
+    }
+
+    /// The stacked layer is bitwise the concatenation of its parts at Bonsai 2
+    /// 27B's projection shapes (q|k|v, GDN qkv|z, MLP gate|up over a 5120-wide
+    /// residual), for a decode row and a prefill block, which the kernels route
+    /// differently.
+    func testStackedRotatedProjectionMatchesItsPartsAtTheCheckpointShapes() throws {
+        let inputs = 5120
+        let rotation = SignedBlockHadamard(blockSize: 1024)
+        let signs = TurboQuantRotation.whtSigns(dim: inputs, seed: 11)
+        MLXRandom.seed(3)
+        for outputs in [[12288, 1024, 1024], [10240, 6144], [17408, 17408]] {
+            let parts = outputs.map {
+                Self.randomRotatedLinear(
+                    inputs: inputs, outputs: $0, signs: signs, rotation: rotation)
+            }
+            let stacked = try XCTUnwrap(stackedSameInputProjection(parts))
+            XCTAssertTrue(type(of: stacked) == HadamardQuantizedLinear.self)
+            XCTAssertEqual(stacked.shape.0, outputs.reduce(0, +))
+            for rows in [1, 13] {
+                let x = MLXRandom.normal([1, rows, inputs]).asType(.float16)
+                let expected = concatenated(parts.map { $0(x) }, axis: -1)
+                let actual = stacked(x)
+                eval(expected, actual)
+                assertBitIdentical(actual, expected, "\(outputs) rows \(rows)")
+            }
+        }
+    }
+
+    private static let gdnConfiguration = """
+        {
+            "model_type": "qwen3_5_text",
+            "hidden_size": 64,
+            "num_hidden_layers": 2,
+            "intermediate_size": 64,
+            "num_attention_heads": 2,
+            "num_key_value_heads": 1,
+            "head_dim": 32,
+            "linear_num_value_heads": 4,
+            "linear_num_key_heads": 2,
+            "linear_key_head_dim": 32,
+            "linear_value_head_dim": 32,
+            "linear_conv_kernel_dim": 4,
+            "vocab_size": 32,
+            "full_attention_interval": 2,
+            "num_experts": 0,
+            "num_experts_per_tok": 0
+        }
+        """
+
+    private static func gatedDeltaNet() throws -> Qwen35GatedDeltaNet {
+        Qwen35GatedDeltaNet(
+            try JSONDecoder().decode(
+                Qwen35TextConfiguration.self, from: Data(gdnConfiguration.utf8)))
+    }
+
+    /// A rotated pack stores `in_proj_b` / `in_proj_a` unquantized, so the
+    /// four-projection fusion cannot apply; `qkv|z` still stack.
+    func testGatedDeltaNetStacksRotatedQKVAndZWhenTheFusedRowCannotApply() throws {
+        let layer = try Self.gatedDeltaNet()
+        let signs = Self.signs(64)
+        try Self.loadRotated(
+            layer, modules: [("in_proj_qkv", 256, 32, signs), ("in_proj_z", 128, 32, signs)],
+            inputs: 64)
+        XCTAssertFalse(try layer.prepareFusedInputProjection())
+        let x = MLXRandom.normal([1, 5, 64]).asType(.float16)
+        let before = layer(x)
+        eval(before)
+
+        XCTAssertEqual(stackSameInputProjections(in: layer), 1)
+
+        let stacked = try XCTUnwrap(layer.qkvzStacked as? HadamardQuantizedLinear)
+        XCTAssertEqual(stacked.shape.0, 384)
+        XCTAssertTrue(type(of: layer.inProjQKV) == Linear.self)
+        XCTAssertTrue(type(of: layer.inProjB) == Linear.self, "the gates stay standalone")
+        let after = layer(x)
+        eval(after)
+        assertBitIdentical(after, before, "GDN")
+        XCTAssertEqual(stackSameInputProjections(in: layer), 0)
+    }
+
+    func testGatedDeltaNetKeepsTheFusedRowInsteadOfStacking() throws {
+        let layer = try Self.gatedDeltaNet()
+        quantize(model: layer, groupSize: 32, bits: 4)
+        XCTAssertTrue(try layer.prepareFusedInputProjection())
+        XCTAssertEqual(stackSameInputProjections(in: layer), 0)
+        XCTAssertNil(layer.qkvzStacked)
+        XCTAssertTrue(layer.hasFusedInputProjection)
     }
 }
