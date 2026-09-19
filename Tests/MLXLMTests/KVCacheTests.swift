@@ -2491,3 +2491,123 @@ func testRotatingRestoredTrimAttentionMatchesSurvivingContext(
     }
     #expect(maskArray.dim(-1) == presented.0.dim(2))
 }
+
+@Suite(.serialized) struct CacheCapacityTests {
+    private func makeCache(quantized: Bool) -> any KVCache {
+        quantized ? QuantizedKVCache(groupSize: 32, bits: 8) : KVCacheSimple()
+    }
+
+    private func append(_ count: Int, to cache: any KVCache, value: Float = 1) {
+        let rows = MLXArray.full([1, 1, count, 32], values: MLXArray(value))
+        if let quantized = cache as? QuantizedKVCache {
+            _ = quantized.updateQuantized(keys: rows, values: rows)
+        } else {
+            _ = cache.update(keys: rows, values: rows)
+        }
+        eval(cache)
+    }
+
+    private func capacity(_ cache: any KVCache) -> Int {
+        cache.innerState().first?.dim(2) ?? 0
+    }
+
+    @Test(arguments: [false, true])
+    func reservationAllocatesOnceForChunkedPrompt(quantized: Bool) {
+        let cache = makeCache(quantized: quantized)
+        cache.reserveCapacity(1001)
+        #expect(cache.offset == 0)
+        #expect(cache.state.isEmpty)
+        #expect(capacity(cache) == 0)
+        append(1, to: cache)
+        let reserved = capacity(cache)
+        #expect(reserved == 1024)
+        for _ in 0 ..< 10 {
+            append(100, to: cache)
+            #expect(capacity(cache) == reserved)
+        }
+        #expect(cache.offset == 1001)
+        #expect(cache.state.allSatisfy { $0.dim(2) == 1001 })
+    }
+
+    @Test(arguments: [false, true])
+    func growthDoublesUntilThe4096RowCap(quantized: Bool) {
+        let cache = makeCache(quantized: quantized)
+        var capacities: [Int] = []
+        for _ in 0 ..< 6 {
+            let remaining = capacity(cache) - cache.offset
+            if remaining > 0 { append(remaining, to: cache) }
+            append(1, to: cache)
+            capacities.append(capacity(cache))
+        }
+        #expect(capacities == [256, 768, 1792, 3840, 7936, 12032])
+    }
+
+    @Test(arguments: [false, true])
+    func reservationAfterRestoreKeepsLogicalStateAndMetadata(quantized: Bool) throws {
+        let cache = makeCache(quantized: quantized)
+        append(17, to: cache)
+        let before = cache.state.map { MLXArray(data: $0.asData(access: .copy)) }
+        let metadata = cache.metaState
+        var restored = makeCache(quantized: quantized)
+        restored.state = before
+        restored.metaState = metadata
+        restored.reserveCapacity(1001)
+        #expect(restored.offset == 17)
+        #expect(restored.metaState == metadata)
+        assertArraysClose(restored.state, before)
+        append(1, to: restored, value: 2)
+        let reserved = capacity(restored)
+        #expect(reserved >= 1001)
+        append(983, to: restored, value: 2)
+        #expect(capacity(restored) == reserved)
+        assertArraysClose(restored.state.map { $0[.ellipsis, ..<17, 0...] }, before)
+    }
+
+    @Test(arguments: [false, true])
+    func trimAndCopyPreserveRowsWithoutChangingSerialization(quantized: Bool) throws {
+        let cache = makeCache(quantized: quantized)
+        cache.reserveCapacity(1001)
+        append(19, to: cache)
+        #expect(cache.trim(7) == 7)
+        let before = cache.state.map { MLXArray(data: $0.asData(access: .copy)) }
+        let metadata = cache.metaState
+        let copy = cache.copy()
+        #expect(copy.offset == 12)
+        #expect(copy.metaState == metadata)
+        assertArraysClose(copy.state, before)
+        append(1, to: copy, value: 3)
+        #expect(copy.offset == 13)
+        #expect(cache.offset == 12)
+        assertArraysClose(cache.state, before)
+        let url = tempURL()
+        defer { try? FileManager.default.removeItem(at: url) }
+        try savePromptCache(url: url, cache: [cache])
+        let (loaded, _) = try loadPromptCache(url: url)
+        #expect(loaded[0].offset == 12)
+        #expect(loaded[0].metaState == metadata)
+        assertArraysClose(loaded[0].state, before)
+    }
+
+    @Test func reservationSurvivesQuantizationDuringPrefill() throws {
+        let simple = KVCacheSimple()
+        simple.reserveCapacity(1001)
+        append(11, to: simple)
+        let quantized = try simple.toQuantized(groupSize: 32, bits: 8)
+        append(1, to: quantized)
+        let reserved = capacity(quantized)
+        #expect(reserved >= 1001)
+        append(989, to: quantized)
+        #expect(capacity(quantized) == reserved)
+    }
+
+    @Test func cacheListForwardsReservationToAttentionOnly() {
+        let attention = KVCacheSimple()
+        let recurrent = ArraysCache(size: 2)
+        let cache: any KVCache = CacheList(recurrent, CacheList(attention))
+        cache.reserveCapacity(1001)
+        append(1, to: attention)
+        #expect(capacity(attention) == 1024)
+        #expect(recurrent.state.isEmpty)
+        #expect(recurrent.offset == 0)
+    }
+}
