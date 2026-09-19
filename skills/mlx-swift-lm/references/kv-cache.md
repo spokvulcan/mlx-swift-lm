@@ -164,6 +164,26 @@ let cache = makePromptCacheWithLayerCount(
 
 ## Cache Operations
 
+### Capacity Reservation
+
+`KVCache.reserveCapacity(_:)` requests a minimum **total** row capacity before
+prefill. The next update of `KVCacheSimple` or `QuantizedKVCache` allocates it;
+calling it does not change `offset`, `state`, or `metaState`. For example:
+
+```swift
+let cache = KVCacheSimple()
+cache.reserveCapacity(promptTokenCount)
+// Feed prompt chunks with update(keys:values:).
+```
+
+Repeated requests keep the largest outstanding reservation. The reservation
+survives copying and dynamic quantization until those rows have been written.
+After that, allocation increments double from 256 rows to a 4096-row cap.
+Reservation rounds using the initial granule, so a known prompt does not pay
+for a speculative output ceiling. `state` still exposes only written rows;
+allocation policy is not serialized. `CacheList` forwards reservation to its
+children; rotating, chunked and recurrent caches keep their existing policies.
+
 ### Trimming
 
 Remove tokens from the end of cache:

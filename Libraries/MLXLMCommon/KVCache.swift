@@ -56,6 +56,10 @@ public protocol KVCache: Evaluatable {
     /// update the cache with new keys and values and return all keys/values
     func update(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray)
 
+    /// Reserve at least this many total sequence rows on the next update.
+    /// Does not advance the offset. Caches without reservable storage ignore it.
+    func reserveCapacity(_ minimumCapacity: Int)
+
     /// get the current state for serialization
     var state: [MLXArray] { get set }
 
@@ -117,6 +121,8 @@ extension KVCache {
     public func prepare(lengths: MLXArray?) {}
 
     public func finalize() {}
+
+    public func reserveCapacity(_ minimumCapacity: Int) {}
 }
 
 public func withPreparedCache<Result>(
@@ -248,6 +254,8 @@ open class BaseKVCache: KVCache {
     open func prepare(lengths: MLXArray?) {}
 
     open func finalize() {}
+
+    open func reserveCapacity(_ minimumCapacity: Int) {}
 
     /// Default implementation for caches without special mask requirements
     open func makeMask(
@@ -403,12 +411,44 @@ public func createSSMMask(h: MLXArray, cache: MambaCache?) -> MLXArray? {
     return nil
 }
 
-/// Standard KV cache implementation based on Python's KVCache
-/// See https://github.com/ml-explore/mlx-examples/blob/main/llms/mlx_lm/models/base.py#L11
+private struct KVCacheGrowth {
+    var reservation = 0
+    var nextStep = 256
+
+    mutating func reserveCapacity(_ minimumCapacity: Int) {
+        precondition(minimumCapacity >= 0)
+        reservation = max(reservation, minimumCapacity)
+    }
+
+    mutating func additionalRows(offset: Int, count: Int, capacity: Int, step: Int) -> Int {
+        // Prompt reservations use the base granule; decode grows geometrically.
+        let granule = reservation > capacity ? step : nextStep
+        let needed = max(offset + count, reservation) - offset
+        let rows = needed == 0 ? 0 : ((needed - 1) / granule + 1) * granule
+        nextStep = min(nextStep * 2, 4096)
+        return rows
+    }
+
+    mutating func didWrite(offset: Int) {
+        if offset >= reservation { reservation = 0 }
+    }
+}
+
+/// Standard KV cache with reservable storage and capped geometric allocation increments.
 public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
     internal var keys: MLXArray?
     internal var values: MLXArray?
-    public var step = 256
+    public var step = 256 {
+        didSet {
+            precondition(step > 0)
+            growth.nextStep = min(step, 4096)
+        }
+    }
+    fileprivate var growth = KVCacheGrowth()
+
+    public override func reserveCapacity(_ minimumCapacity: Int) {
+        growth.reserveCapacity(minimumCapacity)
+    }
 
     public override init() {
         super.init()
@@ -421,26 +461,22 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
     public override func update(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
         let previous = self.offset
 
-        let reset =
-            if let currentKeys = self.keys, (previous + keys.dim(2)) > currentKeys.dim(2) {
-                true
-            } else {
-                self.keys == nil
-            }
-        if reset {
+        let capacity = self.keys?.dim(2) ?? 0
+        if self.keys == nil || max(previous + keys.dim(2), growth.reservation) > capacity {
             let B = keys.dim(0)
             let kvHeads = keys.dim(1)
             let kHeadDim = keys.dim(3)
             let vHeadDim = values.dim(3)
 
-            let nSteps = (step + keys.dim(2) - 1) / step
-            let kShape = [B, kvHeads, nSteps * step, kHeadDim]
-            let vShape = [B, kvHeads, nSteps * step, vHeadDim]
+            let rows = growth.additionalRows(
+                offset: previous, count: keys.dim(2), capacity: capacity, step: step)
+            let kShape = [B, kvHeads, rows, kHeadDim]
+            let vShape = [B, kvHeads, rows, vHeadDim]
             let newK = MLXArray.zeros(kShape, dtype: keys.dtype)
             let newV = MLXArray.zeros(vShape, dtype: values.dtype)
 
             if var currentKeys = self.keys, var currentValues = self.values {
-                if previous % step != 0 {
+                if previous != capacity {
                     currentKeys = currentKeys[.ellipsis, ..<previous, 0...]
                     currentValues = currentValues[.ellipsis, ..<previous, 0...]
                 }
@@ -453,6 +489,7 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
         }
 
         self.offset += keys.dim(2)
+        growth.didWrite(offset: offset)
 
         self.keys?[.ellipsis, previous ..< self.offset, 0...] = keys
         self.values?[.ellipsis, previous ..< self.offset, 0...] = values
@@ -519,6 +556,7 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
             }
             let quantizedCache = QuantizedKVCache(groupSize: effectiveGroupSize, bits: bits)
             quantizedCache.offset = self.offset
+            quantizedCache.growth = growth
 
             let quantizedKeys = quantized(
                 currentKeys, groupSize: effectiveGroupSize, bits: bits)
@@ -536,12 +574,14 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
 
         let quantizedCache = QuantizedKVCache(groupSize: groupSize, bits: bits)
         quantizedCache.offset = self.offset
+        quantizedCache.growth = growth
         return quantizedCache
     }
 
     public override func copy() -> any KVCache {
         let new = KVCacheSimple()
         new.step = self.step
+        new.growth = growth
         let s = self.state
         if !s.isEmpty {
             new.state = s.map { $0[.ellipsis] }
@@ -1003,6 +1043,12 @@ public class QuantizedKVCache: BaseKVCache, QuantizedKVCacheProtocol {
     private var keys: (MLXArray, MLXArray, MLXArray?)?
     private var values: (MLXArray, MLXArray, MLXArray?)?
     private let step: Int
+    fileprivate var growth = KVCacheGrowth()
+
+    public override func reserveCapacity(_ minimumCapacity: Int) {
+        growth.reserveCapacity(minimumCapacity)
+    }
+
     public private(set) var groupSize: Int
     public private(set) var bits: Int
     public let mode: QuantizationMode
@@ -1116,13 +1162,15 @@ public class QuantizedKVCache: BaseKVCache, QuantizedKVCacheProtocol {
         }
 
         // Check if we need to expand the cache
-        if self.keys == nil || (prev + numSteps) > self.keys!.0.dim(-2) {
-            let newSteps = ((step + numSteps - 1) / step) * step
+        let capacity = self.keys?.0.dim(-2) ?? 0
+        if self.keys == nil || max(prev + numSteps, growth.reservation) > capacity {
+            let newSteps = growth.additionalRows(
+                offset: prev, count: numSteps, capacity: capacity, step: step)
             let shape = [B, nKVHeads, newSteps]
 
             if let existingKeys = self.keys, let existingValues = self.values {
                 // Trim if needed
-                if prev % step != 0 {
+                if prev != capacity {
                     // Use tree_map equivalent to trim both keys and values
                     let (trimmedKeys, trimmedValues) = treeMapPair(
                         { array in
@@ -1144,6 +1192,7 @@ public class QuantizedKVCache: BaseKVCache, QuantizedKVCacheProtocol {
         }
 
         offset += numSteps
+        growth.didWrite(offset: offset)
 
         let quantizedKeys = quantized(keys, groupSize: groupSize, bits: bits)
         let quantizedValues = quantized(values, groupSize: groupSize, bits: bits)
@@ -1255,6 +1304,7 @@ public class QuantizedKVCache: BaseKVCache, QuantizedKVCacheProtocol {
 
     public override func copy() -> any KVCache {
         let new = QuantizedKVCache(groupSize: groupSize, bits: bits, mode: mode)
+        new.growth = growth
         let s = self.state
         if !s.isEmpty {
             new.state = s.map { $0[.ellipsis] }
@@ -1267,6 +1317,7 @@ public class QuantizedKVCache: BaseKVCache, QuantizedKVCacheProtocol {
     public func toUnquantized() -> KVCacheSimple {
         let simpleCache = KVCacheSimple()
         simpleCache.offset = self.offset
+        simpleCache.growth = growth
 
         if let keys = keys, let values = values {
             // Dequantize the current state using tree_map approach
@@ -1290,6 +1341,8 @@ public class QuantizedKVCache: BaseKVCache, QuantizedKVCacheProtocol {
 
 /// Chunked KV cache for processing large contexts in chunks
 public class ChunkedKVCache: KVCacheSimple {
+    public override func reserveCapacity(_ minimumCapacity: Int) {}
+
     private var chunkSize: Int?
     private var startPosition: Int = 0
 
@@ -1707,6 +1760,10 @@ public class CacheList: BaseKVCache {
             let leaf = KVCacheLeaf(path: childPath, cache: child)
             return transform(leaf)
         }
+    }
+
+    public override func reserveCapacity(_ minimumCapacity: Int) {
+        caches.forEach { $0.reserveCapacity(minimumCapacity) }
     }
 
     public override func prepare(lengths: [Int]?) {
