@@ -69,7 +69,8 @@ final class SiblingCycleTests: XCTestCase {
     /// destructor's cycle check never runs.
     func testUpdateInPlaceOnSiblingsReleasesInputs() {
         XCTExpectFailure(
-            "mlx-swift: MLXArray._updateInternal assigns over the old array, skipping MLX's sibling cycle break"
+            "mlx: assigning over a multi-output sibling skips the cycle break in ~array; "
+                + "fixed by ml-explore/mlx#4453 (2026-09-11), not yet in the pinned mlx"
         )
         let base = settled()
         autoreleasepool {
@@ -88,7 +89,8 @@ final class SiblingCycleTests: XCTestCase {
 
     func testCompiledSplitOfConstantReleasedOnErase() {
         XCTExpectFailure(
-            "mlx: erasing a compiled function whose tape splits a captured constant keeps the constant alive"
+            "mlx: erasing a compiled function whose tape splits a captured constant keeps the "
+                + "constant alive (ml-explore/mlx#3932, open)"
         )
         let x = MLXArray.ones([1, cols], dtype: .bfloat16)
         eval(x)
