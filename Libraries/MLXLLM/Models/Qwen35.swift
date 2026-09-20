@@ -1036,13 +1036,13 @@ final class Qwen35DecoderLayer: Module {
 
     // Every body stays inside this layer, so each trace's default state (the
     // layer's own weights) is complete.
-    private let compiledLinearLayer = CompiledTrace<Qwen35DecoderLayer>(state: {
-        [$0] + ($0.linearAttn?.fusedProjectionTraceState ?? [])
-    }) { layer, arguments in
-        let result = layer.linearLayerBody(
-            x: arguments[0], convState: arguments[1], recState: arguments[2])
-        return [result.out, result.convState, result.recState]
-    }
+    private let compiledLinearLayer = CompiledTrace<Qwen35DecoderLayer>(
+        state: { [$0] + ($0.linearAttn?.fusedProjectionTraceState ?? []) },
+        body: { layer, arguments in
+            let result = layer.linearLayerBody(
+                x: arguments[0], convState: arguments[1], recState: arguments[2])
+            return [result.out, result.convState, result.recState]
+        })
 
     private let compiledAttentionPre = CompiledTrace<Qwen35DecoderLayer> { layer, arguments in
         let (queries, gate, keys, values) = layer.attentionPreBody(
