@@ -2175,7 +2175,7 @@ public func generateTokens(
 
 /// Generates tokens asynchronously using DFlash2 speculative decoding.
 ///
-/// Parallel to ``generate(input:cache:parameters:context:mtpDrafter:blockSize:components:wiredMemoryTicket:)``
+/// Parallel to ``generate(input:cache:parameters:context:mtpDrafter:blockSize:components:wiredMemoryTicket:tools:)``
 /// for a ``DFlash2DrafterModel``: the drafter proposes a block from the
 /// target's hidden states and the target verifies it in one pass, with the
 /// next round built while that pass runs. The target must conform to
