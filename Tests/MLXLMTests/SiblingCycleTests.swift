@@ -243,14 +243,13 @@ final class SiblingCycleTests: XCTestCase {
             let owner = Owner(
                 weight: MLXArray.ones([cols], dtype: .bfloat16), constant: bigEvaluated())
             eval(owner.weight)
-            let trace = CompiledTrace<Owner>(state: {
-                [$0, StateModule(constant: $0.plain.constant)]
-            }) {
-                owner, inputs in
-                let (h, out) = rmsNormResidual(
-                    inputs[0], owner.plain.constant, weight: owner.weight, eps: 1e-6)
-                return [h, out]
-            }
+            let trace = CompiledTrace<Owner>(
+                state: { [$0, StateModule(constant: $0.plain.constant)] },
+                body: { owner, inputs in
+                    let (h, out) = rmsNormResidual(
+                        inputs[0], owner.plain.constant, weight: owner.weight, eps: 1e-6)
+                    return [h, out]
+                })
             let out = trace(owner, [x])
             eval(out)
             trace.invalidate()
