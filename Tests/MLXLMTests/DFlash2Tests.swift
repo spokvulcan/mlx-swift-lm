@@ -912,3 +912,37 @@ func testSameInputStackingSkipsQuantizedLinearSubclasses() throws {
     #expect(rotated.gateUp == nil)
     #expect(rotated.gateProj is RotateQuantizedLinear)
 }
+
+private final class StackingFixture: Module {
+    let blocks: [Qwen3NextMLP]
+    init(blocks: [Qwen3NextMLP]) {
+        self.blocks = blocks
+        super.init()
+    }
+}
+
+/// Stacking frees each block's originals before it packs the next one: the
+/// transient stays near one block, not the sum of every block in the model.
+@Test
+func testSameInputStackingReleasesEachBlockBeforeTheNext() throws {
+    let blockCount = 8
+    let fixture = StackingFixture(
+        blocks: (0 ..< blockCount).map { _ in Qwen3NextMLP(dimensions: 1024, hiddenDimensions: 4096)
+        })
+    quantize(model: fixture, groupSize: 64, bits: 4)
+    eval(fixture.parameters().flattenedValues())
+    Stream.gpu.synchronize()
+    Memory.clearCache()
+
+    let first = fixture.blocks[0]
+    let blockBytes = [first.gateProj, first.upProj]
+        .flatMap { $0.parameters().flattenedValues() }
+        .map(\.nbytes).reduce(0, +)
+    let active = Memory.activeMemory
+    GPU.resetPeakMemory()
+    #expect(stackSameInputProjections(in: fixture) == blockCount)
+    let transient = Memory.peakMemory - active
+    #expect(
+        transient <= 2 * blockBytes,
+        "stacking held \(transient) bytes above the loaded weights; one block is \(blockBytes)")
+}
