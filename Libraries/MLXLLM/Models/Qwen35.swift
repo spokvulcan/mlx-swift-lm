@@ -1524,7 +1524,7 @@ public class Qwen35TextModelInner: Module {
                 if let existing = verifyTraces[key] { return existing }
                 let trace = CompiledTrace<Qwen35TextModelInner>(
                     state: { model in
-                        var modules: [Module] = segment.layerIndices.map { model.layers[$0] }
+                        var modules = model.traceState(forLayers: segment.layerIndices)
                         if segmentIndex == 0 { modules.append(model.embedTokens) }
                         return modules
                     },
