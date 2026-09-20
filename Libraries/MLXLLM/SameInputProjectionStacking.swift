@@ -20,13 +20,13 @@ protocol SameInputProjectionStacking: Module {
 
 /// Stack every foldable projection group in `model`; returns the count.
 public func stackSameInputProjections(in model: Module) -> Int {
+    // Keep only the stacking modules: the full list also holds every
+    // projection, which would keep each block's originals alive until the
+    // loop ends instead of freeing them as the next block packs.
+    let stacking = model.modules().compactMap { $0 as? SameInputProjectionStacking }
     var stacked = 0
-    for module in model.modules() {
-        if let stacking = module as? SameInputProjectionStacking,
-            stacking.stackSameInputProjections()
-        {
-            stacked += 1
-        }
+    for module in stacking where module.stackSameInputProjections() {
+        stacked += 1
     }
     if stacked > 0 {
         model.invalidateCompiledTraces()
