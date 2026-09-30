@@ -251,6 +251,43 @@ final class LoadWeightsTests: XCTestCase {
             ["model.safetensors"])
     }
 
+    func testKeyPrefixWithoutAnIndexSelectsTheFilesWhoseHeaderNamesThePrefix() throws {
+        let directory = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        // A single-file checkpoint with a head grafted beside it and no index, plus a converted
+        // copy of the whole checkpoint that the automatic selection never reads.
+        try writeSafetensors("model.safetensors", tensors: ["model.norm.weight"], in: directory)
+        try writeSafetensors(
+            "model-mtp-head.safetensors", tensors: ["mtp.fc.weight", "mtp.norm.weight"],
+            in: directory)
+        try writeSafetensors(
+            "prepared_checkpoint.safetensors", tensors: ["model.norm.weight", "mtp.fc.weight"],
+            in: directory)
+
+        XCTAssertEqual(
+            try safetensorWeightURLs(in: directory, selection: .indexedKeyPrefix("mtp."))
+                .map(\.lastPathComponent),
+            ["model-mtp-head.safetensors"])
+        // The target still reads its own files.
+        XCTAssertEqual(
+            try safetensorWeightURLs(in: directory).map(\.lastPathComponent),
+            ["model-mtp-head.safetensors", "model.safetensors"])
+    }
+
+    func testKeyPrefixNoHeaderNamesFallsBackToTheAutomaticSelection() throws {
+        let directory = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        try writeSafetensors("model.safetensors", tensors: ["model.norm.weight"], in: directory)
+        try writeSafetensors("model-extra.safetensors", tensors: ["lm_head.weight"], in: directory)
+
+        XCTAssertEqual(
+            try safetensorWeightURLs(in: directory, selection: .indexedKeyPrefix("mtp."))
+                .map(\.lastPathComponent),
+            ["model-extra.safetensors", "model.safetensors"])
+    }
+
     func testIndexMayNameFilesInSubdirectories() throws {
         let directory = try makeTemporaryDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
@@ -520,6 +557,21 @@ final class LoadWeightsTests: XCTestCase {
         try FileManager.default.createDirectory(
             at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
         try Data().write(to: url)
+    }
+
+    /// A minimal safetensors file: the 8-byte header length, a header naming one float per
+    /// tensor, and the data.
+    private func writeSafetensors(_ name: String, tensors: [String], in directory: URL) throws {
+        var header: [String: Any] = [:]
+        for (i, tensor) in tensors.enumerated() {
+            header[tensor] = ["dtype": "F32", "shape": [1], "data_offsets": [i * 4, i * 4 + 4]]
+        }
+        let json = try JSONSerialization.data(withJSONObject: header)
+        var file = Data()
+        withUnsafeBytes(of: UInt64(json.count).littleEndian) { file.append(contentsOf: $0) }
+        file.append(json)
+        file.append(Data(count: tensors.count * 4))
+        try file.write(to: directory.appendingPathComponent(name))
     }
 
     private func writeIndex(_ weightMap: [String: String], in directory: URL) throws {
