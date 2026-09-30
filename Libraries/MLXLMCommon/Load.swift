@@ -247,15 +247,18 @@ public enum WeightFileSelection: Sendable, Equatable {
     /// extra files (see ``AdditionalWeightFilesProviding``) where that is possible.
     case allFilesPresent
 
-    /// Load only the files that `model.safetensors.index.json` maps a weight whose name starts
-    /// with `prefix` to.
+    /// Load only the files that hold a weight whose name starts with `prefix`.
     ///
     /// For a module that lives in its own shard of a larger checkpoint -- a multi-token
     /// prediction head keeps its `mtp.*` tensors in `model-mtp-head.safetensors` beside the
     /// target's shards -- this reads that shard alone instead of the whole checkpoint, whose
-    /// other tensors the module's `sanitize(weights:)` would drop after they were read. When
-    /// there is no usable index, or the index maps no weight with the prefix, the selection
-    /// falls back to ``automatic``.
+    /// other tensors the module's `sanitize(weights:)` would drop after they were read.
+    ///
+    /// The files come from `model.safetensors.index.json` when it maps a weight with the
+    /// prefix. When there is no usable index, they are the files ``automatic`` would choose
+    /// whose safetensors header names such a weight; only the headers are read. When the index
+    /// maps no weight with the prefix, or no header names one, the selection falls back to
+    /// ``automatic``.
     case indexedKeyPrefix(String)
 }
 
@@ -300,10 +303,19 @@ package func safetensorWeightURLs(
     case .automatic:
         selected = try indexedWeightURLs(in: modelDirectory) ?? conventionalWeightURLs(in: present)
     case .indexedKeyPrefix(let prefix):
-        selected =
-            try indexedWeightURLs(in: modelDirectory, keyPrefix: prefix)
+        if let indexed = try indexedWeightURLs(in: modelDirectory, keyPrefix: prefix)
             ?? indexedWeightURLs(in: modelDirectory)
-            ?? conventionalWeightURLs(in: present)
+        {
+            selected = indexed
+        } else {
+            let conventional = conventionalWeightURLs(in: present)
+            // Only the headers are read; a file that isn't safetensors holds nothing.
+            let holding = conventional.filter { url in
+                ((try? safetensorSpansInFileOrder(url: url)) ?? [])
+                    .contains { $0.name.hasPrefix(prefix) }
+            }
+            selected = holding.isEmpty ? conventional : holding
+        }
     }
 
     var seen = Set(selected.map(\.standardizedFileURL.path))
