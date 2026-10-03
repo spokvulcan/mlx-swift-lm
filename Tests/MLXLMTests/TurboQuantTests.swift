@@ -3037,12 +3037,23 @@ final class TurboQuantDecodeMicrobench: XCTestCase {
                 .expandedDimensions(axis: 1)
             let mask = columns .< (positions + 1)
             eval(q, keys, values, mask)
+            // The bf16 verify path itself: rows written at the position, then
+            // SDPA over the visible rows.
+            let plain = (0 ..< layers).map { _ -> KVCacheSimple in
+                let c = KVCacheSimple()
+                _ = c.update(
+                    keys: keys[.ellipsis, ..<tokens, 0...],
+                    values: values[.ellipsis, ..<tokens, 0...])
+                return c
+            }
+            eval(plain.flatMap { $0.innerState() })
             let sdpa = time("verify T=\(tokens) bf16 SDPA", iterations: 10) {
-                (0 ..< layers).map { _ in
-                    MLXFast.scaledDotProductAttention(
-                        queries: q, keys: keys[.ellipsis, ..<visible, 0...],
-                        values: values[.ellipsis, ..<visible, 0...], scale: scale,
-                        mask: .array(mask))
+                plain.map {
+                    $0.dflash2Attention(
+                        queries: q, keys: keys[.ellipsis, tokens ..< visible, 0...],
+                        values: values[.ellipsis, tokens ..< visible, 0...],
+                        position: MLXArray(Int32(tokens)), visibleLength: visible, mask: mask,
+                        scale: scale)
                 }
             }
             for keyBits in [8, 0] {
@@ -3080,6 +3091,67 @@ final class TurboQuantDecodeMicrobench: XCTestCase {
                 print(
                     "[DECODE-BENCH] verify T=\(tokens) turbo\(keyBits)v4: kernel \(String(format: "%.2f", kernel / sdpa))x SDPA, reference \(String(format: "%.2f", reference / sdpa))x"
                 )
+            }
+        }
+    }
+
+    /// The verify kernel alone over whole compressed buffers (no row write),
+    /// by key mode and partition count, against bf16 SDPA's attention.
+    func testVerifyKernelPartitions() {
+        let s = 8
+        let scale = 1 / Float(dim).squareRoot()
+        let codec = MSECodec(dim: dim, bits: 4, seed: 43)
+        for tokens in contexts {
+            let rows = ((tokens + s + 255) / 256) * 256
+            let visible = tokens + s
+            let q = (MLXRandom.normal([1, queryHeads, s, dim]) * 0.1).asType(.bfloat16)
+            let keys = (MLXRandom.normal([1, kvHeads, rows, dim]) * 0.5).asType(.bfloat16)
+            let values = (MLXRandom.normal([1, kvHeads, rows, dim]) * 0.5).asType(.bfloat16)
+            let (packed, norms) = TurboQuantKernelOps.fusedEncodeWHT(
+                input: values.reshaped([-1, dim]).asType(.float32), whtSigns: codec.whtSigns!,
+                boundaries: codec.boundaries, codebook: codec.codebook, bits: 4, dim: dim)
+            let valPacked = packed.reshaped([kvHeads, rows, -1])
+            let valNorms = norms.reshaped([kvHeads, rows])
+            let quantizedKeys = quantized(
+                keys.reshaped([kvHeads, rows, dim]), groupSize: 64, bits: 8)
+            let rawKeys = keys.reshaped([kvHeads, rows, dim])
+            let position = MLXArray(Int32(tokens))
+            let columns = MLXArray(Int32(0) ..< Int32(visible)).expandedDimensions(axis: 0)
+            let mask =
+                columns
+                .< (MLXArray(Int32(tokens)) + MLXArray(Int32(0) ..< Int32(s)))
+                .expandedDimensions(axis: 1) + 1
+            eval(
+                q, keys, values, valPacked, valNorms, quantizedKeys.wq, quantizedKeys.scales,
+                quantizedKeys.biases!, rawKeys, mask)
+            let sdpa = time("kernel T=\(tokens) bf16 SDPA", iterations: 10) {
+                (0 ..< layers).map { _ in
+                    MLXFast.scaledDotProductAttention(
+                        queries: q, keys: keys[.ellipsis, ..<visible, 0...],
+                        values: values[.ellipsis, ..<visible, 0...], scale: scale,
+                        mask: .array(mask))
+                }
+            }
+            let affine = TurboQuantKernelOps.GQAKeys.affine(
+                weights: quantizedKeys.wq, scales: quantizedKeys.scales,
+                biases: quantizedKeys.biases!, groupSize: 64)
+            for (label, keyStore) in [("turbo8v4", affine), ("turbo0v4", .raw(rawKeys))] {
+                for parts in [16, 32, 64, 128, 256] {
+                    let ms = time("kernel T=\(tokens) \(label) parts=\(parts)", iterations: 10) {
+                        (0 ..< layers).map { _ in
+                            TurboQuantKernelOps.turboVerifyAttention(
+                                queries: q, keys: keyStore, valPacked: valPacked,
+                                valNorms: valNorms, valCodebook: codec.codebook,
+                                valRotation: codec.rotation, position: position,
+                                visibleLength: visible, scale: scale,
+                                repeatCount: queryHeads / kvHeads, valueBits: 4, dim: dim,
+                                partitions: parts)
+                        }
+                    }
+                    print(
+                        "[DECODE-BENCH] kernel T=\(tokens) \(label) parts=\(parts): \(String(format: "%.2f", ms / sdpa))x SDPA"
+                    )
+                }
             }
         }
     }

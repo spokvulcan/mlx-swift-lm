@@ -2998,10 +2998,12 @@ enum TurboQuantKernelOps {
 
     static let verifyKernelEnabled = ProcessInfo.processInfo.environment["TURBO_VERIFY_MMA"] != "0"
 
-    /// Key partitions for the verify kernel: enough threadgroups to fill the
-    /// GPU at long contexts, few enough that short ones are not mostly merge.
+    /// Key partitions for the verify kernel. Measured on the Qwen3.8-27B
+    /// verify shape (8 rows, 24 query heads over 4 KV heads, dim 256), 16
+    /// partitions beat 32 and 64 from 2K to 32K rows and 32 beat the rest at
+    /// 64K (`TurboQuantDecodeMicrobench/testVerifyKernelPartitions`).
     static func verifyPartitions(visibleLength: Int, dim: Int) -> Int {
-        min(dim, visibleLength < 2048 ? 32 : 64)
+        min(dim, visibleLength <= 32_768 ? 16 : 32)
     }
 
     /// Multi-query attention over a raw-K or affine-K cache with turbo values.
