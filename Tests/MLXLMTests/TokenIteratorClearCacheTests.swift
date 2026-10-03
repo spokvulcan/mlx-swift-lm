@@ -31,7 +31,7 @@ final class TokenIteratorClearCacheTests: XCTestCase {
             let buffer = MLXArray.zeros([seeded], dtype: .uint8) + 1
             eval(buffer)
             // Wait for Metal completion handlers to release temporary buffers.
-            Stream.defaultStream.synchronize()
+            Stream().synchronize()
         }
         XCTAssertGreaterThanOrEqual(Memory.cacheMemory, seeded)
 
