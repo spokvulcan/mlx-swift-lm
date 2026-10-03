@@ -2264,6 +2264,32 @@ final class TurboQuantIntegrationTests: XCTestCase {
             "main cache never converted")
     }
 
+    // MARK: - Fused WHT encoder determinism
+
+    /// The fused WHT encoder gives the same codes on every run: its
+    /// cross-SIMD-group butterfly stages read both slots before writing.
+    func testFusedEncodeWHTIsDeterministic() {
+        let dim = 256
+        let codec = MSECodec(dim: dim, bits: 4, seed: 43)
+        let input = MLXRandom.normal([16_384, dim], key: MLXRandom.key(7))
+        func encode() -> (MLXArray, MLXArray) {
+            let (packed, norms) = TurboQuantKernelOps.fusedEncodeWHT(
+                input: input, whtSigns: codec.whtSigns!, boundaries: codec.boundaries,
+                codebook: codec.codebook, bits: 4, dim: dim)
+            eval(packed, norms)
+            return (packed, norms)
+        }
+        let (firstPacked, firstNorms) = encode()
+        for run in 1 ..< 20 {
+            let (packed, norms) = encode()
+            XCTAssertTrue(
+                MLX.arrayEqual(packed, firstPacked).item(Bool.self),
+                "packed codes differ on run \(run)")
+            XCTAssertTrue(
+                MLX.arrayEqual(norms, firstNorms).item(Bool.self), "norms differ on run \(run)")
+        }
+    }
+
     // MARK: - Dense (non-pow2) encode kernel parity with the reference codec
 
     func testDenseEncodeKernelMatchesCodecDim80() throws {
