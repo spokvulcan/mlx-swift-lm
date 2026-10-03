@@ -1110,11 +1110,11 @@ public class TurboQuantKVCache: BaseKVCache {
             }
 
             offset = prev + numSteps
-            affKeyW![.ellipsis, prev ..< offset, 0...] = kw
-            affKeyScales![.ellipsis, prev ..< offset, 0...] = ks
-            affKeyBiases![.ellipsis, prev ..< offset, 0...] = kb
-            valPackedMSE![.ellipsis, prev ..< offset, 0...] = valPackedShaped
-            valNorms![.ellipsis, prev ..< offset] = valNormsShaped
+            let start = MLXArray([Int32(prev)])
+            affKeyW = dynamicSliceUpdated(affKeyW!, update: kw, start: start, axes: [2])
+            affKeyScales = dynamicSliceUpdated(affKeyScales!, update: ks, start: start, axes: [2])
+            affKeyBiases = dynamicSliceUpdated(affKeyBiases!, update: kb, start: start, axes: [2])
+            appendValues(valPackedShaped, valNormsShaped, start: start)
         } else if rawKeyMode {
             // Raw-K mode: append keys to rawKeys buffer as FP16
             // Grow rawKeys buffer if needed
@@ -1144,9 +1144,9 @@ public class TurboQuantKVCache: BaseKVCache {
             }
 
             offset = prev + numSteps
-            rawKeys![.ellipsis, prev ..< offset, 0...] = keys
-            valPackedMSE![.ellipsis, prev ..< offset, 0...] = valPackedShaped
-            valNorms![.ellipsis, prev ..< offset] = valNormsShaped
+            let start = MLXArray([Int32(prev)])
+            rawKeys = dynamicSliceUpdated(rawKeys!, update: keys, start: start, axes: [2])
+            appendValues(valPackedShaped, valNormsShaped, start: start)
         } else {
             // Standard TurboQuant: encode both K and V
             guard let keyMSECodec else { return }
@@ -1192,10 +1192,12 @@ public class TurboQuantKVCache: BaseKVCache {
             }
 
             offset = prev + numSteps
-            keyPackedMSE![.ellipsis, prev ..< offset, 0...] = keyPackedShaped
-            keyNorms![.ellipsis, prev ..< offset] = keyNormsShaped
-            valPackedMSE![.ellipsis, prev ..< offset, 0...] = valPackedShaped
-            valNorms![.ellipsis, prev ..< offset] = valNormsShaped
+            let start = MLXArray([Int32(prev)])
+            keyPackedMSE = dynamicSliceUpdated(
+                keyPackedMSE!, update: keyPackedShaped, start: start, axes: [2])
+            keyNorms = dynamicSliceUpdated(
+                keyNorms!, update: keyNormsShaped, start: start, axes: [2])
+            appendValues(valPackedShaped, valNormsShaped, start: start)
         }
         // An empty cache's first call encodes here without compressRawCache.
         isCompressed = true
@@ -1206,6 +1208,25 @@ public class TurboQuantKVCache: BaseKVCache {
     /// the compressed form. No-op once compressed or when empty.
     public func compress() {
         compressRawCache(clearingBufferCache: false)
+    }
+
+    private var cachedScale: (value: Float, array: MLXArray)?
+
+    /// The softmax scale as an array, built once per cache rather than once
+    /// per decode step.
+    private func scaleArray(_ scale: Float) -> MLXArray {
+        if let cachedScale, cachedScale.value == scale { return cachedScale.array }
+        let array = MLXArray(scale)
+        cachedScale = (scale, array)
+        return array
+    }
+
+    /// Write encoded value rows at `start`. A dynamic slice update builds
+    /// its graph several times faster than a subscript assignment, which a
+    /// launch-bound decode step pays once per buffer per layer.
+    private func appendValues(_ packed: MLXArray, _ norms: MLXArray, start: MLXArray) {
+        valPackedMSE = dynamicSliceUpdated(valPackedMSE!, update: packed, start: start, axes: [2])
+        valNorms = dynamicSliceUpdated(valNorms!, update: norms, start: start, axes: [2])
     }
 
     // MARK: - Rows at a position (speculative verify)
@@ -1431,11 +1452,14 @@ public class TurboQuantKVCache: BaseKVCache {
 
         let tokenCount = offset
 
-        // Shared V slicing (used by all paths)
-        let flatValPacked = valPackedMSE![0..., 0..., ..<tokenCount, 0...]
-            .reshaped([B * nKVHeads, tokenCount, -1])
-        let flatValNorms = valNorms![0..., 0..., ..<tokenCount]
-            .reshaped([B * nKVHeads, tokenCount])
+        // V sliced to the live rows, for the paths that do not read whole
+        // buffers (built lazily: a decode step on the GQA kernel never uses it).
+        var flatValPacked: MLXArray {
+            valPackedMSE![0..., 0..., ..<tokenCount, 0...].reshaped([B * nKVHeads, tokenCount, -1])
+        }
+        var flatValNorms: MLXArray {
+            valNorms![0..., 0..., ..<tokenCount].reshaped([B * nKVHeads, tokenCount])
+        }
 
         let valRotation = valueMSECodec.rotation
         let output: MLXArray
@@ -1455,7 +1479,7 @@ public class TurboQuantKVCache: BaseKVCache {
             default: break
             }
             if L == 1, !hasArrayMaskAsym {
-                let flatQ = (queries * MLXArray(scale)).reshaped([B * nQHeads, headDim])
+                let flatQ = (queries * scaleArray(scale)).reshaped([B * nQHeads, headDim])
                 let rotated: MLXArray
                 if TurboQuantKernelOps.gqaFlashSupports(
                     dim: headDim, repeatCount: nRepeats, valueBits: valueBits,

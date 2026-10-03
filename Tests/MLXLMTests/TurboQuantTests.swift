@@ -2931,6 +2931,13 @@ final class TurboQuantDecodeMicrobench: XCTestCase {
         return ms
     }
 
+    /// `TURBOQUANT_DECODE_BENCH_DTYPE=float16` runs the activations in fp16
+    /// (a PARO checkpoint's dtype) instead of bf16.
+    private var benchDType: DType {
+        ProcessInfo.processInfo.environment["TURBOQUANT_DECODE_BENCH_DTYPE"] == "float16"
+            ? .float16 : .bfloat16
+    }
+
     private var contexts: [Int] {
         (ProcessInfo.processInfo.environment["TURBOQUANT_DECODE_BENCH_CONTEXTS"]
             ?? "8192,32768,65536")
@@ -2941,11 +2948,11 @@ final class TurboQuantDecodeMicrobench: XCTestCase {
         let codec = MSECodec(dim: dim, bits: 4, seed: 43)
         for tokens in contexts {
             let rows = ((tokens + 255) / 256) * 256
-            let q = (MLXRandom.normal([1, queryHeads, 1, dim]) * 0.1).asType(.bfloat16)
+            let q = (MLXRandom.normal([1, queryHeads, 1, dim]) * 0.1).asType(benchDType)
             let flatQ = (q.asType(.float32) / MLXArray(Float(dim).squareRoot()))
                 .reshaped([queryHeads, dim])
-            let keys = (MLXRandom.normal([1, kvHeads, rows, dim]) * 0.5).asType(.bfloat16)
-            let values = (MLXRandom.normal([1, kvHeads, rows, dim]) * 0.5).asType(.bfloat16)
+            let keys = (MLXRandom.normal([1, kvHeads, rows, dim]) * 0.5).asType(benchDType)
+            let values = (MLXRandom.normal([1, kvHeads, rows, dim]) * 0.5).asType(benchDType)
             let (packed, norms) = TurboQuantKernelOps.fusedEncodeWHT(
                 input: values.reshaped([-1, dim]).asType(.float32), whtSigns: codec.whtSigns!,
                 boundaries: codec.boundaries, codebook: codec.codebook, bits: 4, dim: dim)
@@ -3263,6 +3270,124 @@ final class TurboQuantDecodeMicrobench: XCTestCase {
     /// then attend. TurboQuant adds its value encode and key quantization.
     func testCacheStep() {
         for tokens in contexts { cacheStep(tokens: tokens) }
+    }
+
+    /// CPU time to build one decode step's attention graph for 16 layers
+    /// (no eval) against the whole step: a launch-bound model feels the first.
+    func testCacheStepCPU() {
+        for tokens in contexts {
+            let scale = 1 / Float(dim).squareRoot()
+            let keys = (MLXRandom.normal([1, kvHeads, tokens, dim]) * 0.5).asType(benchDType)
+            let values = (MLXRandom.normal([1, kvHeads, tokens, dim]) * 0.5).asType(benchDType)
+            let q = (MLXRandom.normal([1, queryHeads, 1, dim]) * 0.1).asType(benchDType)
+            let newK = (MLXRandom.normal([1, kvHeads, 1, dim]) * 0.5).asType(benchDType)
+            let newV = (MLXRandom.normal([1, kvHeads, 1, dim]) * 0.5).asType(benchDType)
+            eval(keys, values, q, newK, newV)
+            func measure(_ label: String, _ step: () -> [MLXArray]) {
+                for _ in 0 ..< 5 { eval(step()) }
+                var build = 0.0
+                let start = Date()
+                for _ in 0 ..< 50 {
+                    let t0 = Date()
+                    let out = step()
+                    build += Date().timeIntervalSince(t0)
+                    eval(out)
+                }
+                let total = Date().timeIntervalSince(start)
+                print(
+                    "[DECODE-BENCH] cpu T=\(tokens) \(label): build \(String(format: "%.3f", build * 1000 / 50)) ms, step \(String(format: "%.3f", total * 1000 / 50)) ms per \(layers) layers"
+                )
+            }
+            let simple = (0 ..< layers).map { _ -> KVCacheSimple in
+                let c = KVCacheSimple()
+                _ = c.update(keys: keys, values: values)
+                return c
+            }
+            measure("bf16") {
+                simple.map { cache in
+                    let (k, v) = cache.update(keys: newK, values: newV)
+                    return MLXFast.scaledDotProductAttention(
+                        queries: q, keys: k, values: v, scale: scale, mask: .none)
+                }
+            }
+            for keyBits in [8, 0] {
+                let turbo = (0 ..< layers).map { _ -> TurboQuantKVCache in
+                    let c = TurboQuantKVCache(bits: 4, keyBits: keyBits, valueBits: 4, seed: 42)
+                    _ = c.update(keys: keys, values: values)
+                    c.compress()
+                    return c
+                }
+                measure("turbo\(keyBits)v4") {
+                    turbo.map { cache in
+                        cache.compressedAttention(
+                            queries: q, keys: newK, values: newV, scale: scale)
+                    }
+                }
+            }
+        }
+    }
+
+    /// The graph-build CPU time of each piece of a TurboQuant decode step,
+    /// 16 calls each, no eval.
+    func testCacheStepCPUPieces() {
+        let codec = MSECodec(dim: dim, bits: 4, seed: 43)
+        let rows = 8192
+        let newK = (MLXRandom.normal([1, kvHeads, 1, dim]) * 0.5).asType(.bfloat16)
+        let newV = (MLXRandom.normal([1, kvHeads, 1, dim]) * 0.5).asType(.bfloat16)
+        let q = (MLXRandom.normal([queryHeads, dim]) * 0.1).asType(.float32)
+        let buffer = MLXArray.zeros([1, kvHeads, rows, dim / 4], dtype: .uint32)
+        let packedBuffer = MLXArray.zeros([kvHeads, rows, dim / 8], dtype: .uint32)
+        let norms = MLXArray.zeros([kvHeads, rows])
+        let quantizedKeys = quantized(
+            MLXRandom.normal([kvHeads, rows, dim]).asType(.bfloat16), groupSize: 64, bits: 8)
+        eval(newK, newV, q, buffer, packedBuffer, norms, quantizedKeys.wq)
+        func cpu(_ label: String, _ body: () -> MLXArray) {
+            for _ in 0 ..< 3 { eval(body()) }
+            var total = 0.0
+            for _ in 0 ..< 20 {
+                var outs: [MLXArray] = []
+                let t0 = Date()
+                for _ in 0 ..< layers { outs.append(body()) }
+                total += Date().timeIntervalSince(t0)
+                eval(outs)
+            }
+            print(
+                "[DECODE-BENCH] piece \(label): \(String(format: "%.3f", total * 1000 / 20)) ms per \(layers) calls"
+            )
+        }
+        cpu("value encode") {
+            TurboQuantKernelOps.fusedEncodeWHT(
+                input: newV.reshaped([-1, self.dim]), whtSigns: codec.whtSigns!,
+                boundaries: codec.boundaries, codebook: codec.codebook, bits: 4, dim: self.dim
+            ).packed
+        }
+        cpu("key quantize") { quantized(newK, groupSize: 64, bits: 8).wq }
+        cpu("slice update") {
+            var b = buffer
+            b[.ellipsis, 100 ..< 101, 0...] = MLXArray.zeros(
+                [1, self.kvHeads, 1, self.dim / 4], dtype: .uint32)
+            return b
+        }
+        cpu("GQA kernel") {
+            TurboQuantKernelOps.turboFlashGQA(
+                queries: q,
+                keys: .affine(
+                    weights: quantizedKeys.wq, scales: quantizedKeys.scales,
+                    biases: quantizedKeys.biases!, groupSize: 64),
+                valPacked: packedBuffer, valNorms: norms, valCodebook: codec.codebook,
+                valRotation: codec.rotation, tokenCount: rows,
+                repeatCount: self.queryHeads / self.kvHeads, valueBits: 4, dim: self.dim)
+        }
+        cpu("scalar array") { MLXArray([UInt32(7), UInt32(8)]) }
+        let start = MLXArray([Int32(100)])
+        let row = MLXArray.zeros([1, kvHeads, 1, dim / 4], dtype: .uint32)
+        eval(start, row)
+        cpu("dynamic slice update") {
+            dynamicSliceUpdated(buffer, update: row, start: start, axes: [2])
+        }
+        cpu("dynamic slice update, start built per call") {
+            dynamicSliceUpdated(buffer, update: row, start: MLXArray([Int32(100)]), axes: [2])
+        }
     }
 
     private func cacheStep(tokens: Int) {

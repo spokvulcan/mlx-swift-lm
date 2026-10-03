@@ -2848,6 +2848,19 @@ enum TurboQuantKernelOps {
         case affine(weights: MLXArray, scales: MLXArray, biases: MLXArray, groupSize: Int)
     }
 
+    nonisolated(unsafe) private static var blockCountArrays: [Int: MLXArray] = [:]
+
+    /// Pass 2's block count, one array per count for the process: a decode
+    /// step would otherwise build it from host memory on every call.
+    private static func blockCountArray(_ count: Int) -> MLXArray {
+        lock.lock()
+        defer { lock.unlock() }
+        if let cached = blockCountArrays[count] { return cached }
+        let array = MLXArray([UInt32(count)])
+        blockCountArrays[count] = array
+        return array
+    }
+
     /// Whether the GQA decode serves this shape. Each lane holds `dim / 32`
     /// dimensions and their packed values in one 32-bit span; an affine key
     /// group must not split a lane.
@@ -2969,7 +2982,7 @@ enum TurboQuantKernelOps {
         return merge(
             [
                 partials[0], partials[1], partials[2], f32(valRotation),
-                MLXArray([UInt32(numBlocks)]),
+                blockCountArray(numBlocks),
             ],
             template: [("Dim", dim)],
             grid: (dim, totalQ, 1),
