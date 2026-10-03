@@ -2504,6 +2504,52 @@ final class TurboQuantGQAFlashTests: XCTestCase {
         }
     }
 
+    /// Loading activation-dtype queries and scaling them in the kernel, and
+    /// writing the activation dtype from pass 2, gives the bytes the separate
+    /// scale multiply and output cast gave. The WHT encode reads a bf16 or f16
+    /// row as the float32 cast of it.
+    func testFoldedScaleAndCastsAreBitIdentical() {
+        let tokens = 1000
+        let rows = 1024
+        let scale = 1 / Float(dim).squareRoot()
+        for dtype in [DType.bfloat16, .float16] {
+            let input = inputs(rows: rows, keyDType: dtype, seed: 900)
+            let queries = (input.queries * Float(dim).squareRoot()).asType(dtype)
+            let quantizedKeys = quantized(input.keys, groupSize: 64, bits: 8)
+            for keys: TurboQuantKernelOps.GQAKeys in [
+                .raw(input.keys),
+                .affine(
+                    weights: quantizedKeys.wq, scales: quantizedKeys.scales,
+                    biases: quantizedKeys.biases!, groupSize: 64),
+            ] {
+                func run(_ q: MLXArray, _ s: Float) -> MLXArray {
+                    TurboQuantKernelOps.turboFlashGQA(
+                        queries: q, scale: s, keys: keys,
+                        valPacked: input.valPacked, valNorms: input.valNorms,
+                        valCodebook: input.codec.codebook, valRotation: input.codec.rotation,
+                        tokenCount: tokens, repeatCount: queryHeads / kvHeads, valueBits: 4,
+                        dim: dim)
+                }
+                let separate = run(queries * MLXArray(scale), 1).asType(dtype)
+                let folded = run(queries, scale)
+                XCTAssertEqual(folded.dtype, dtype)
+                XCTAssertEqual(
+                    folded.asData(access: .copy).data, separate.asData(access: .copy).data,
+                    "\(dtype)")
+            }
+
+            let codec = input.codec
+            let rowsIn = (MLXRandom.normal([64, dim], key: MLXRandom.key(901)) * 0.5).asType(dtype)
+            func encode(_ x: MLXArray) -> [Data] {
+                let (packed, norms) = TurboQuantKernelOps.fusedEncodeWHT(
+                    input: x, whtSigns: codec.whtSigns!, boundaries: codec.boundaries,
+                    codebook: codec.codebook, bits: 4, dim: dim)
+                return [packed, norms].map { $0.asData(access: .copy).data }
+            }
+            XCTAssertEqual(encode(rowsIn), encode(rowsIn.asType(.float32)), "\(dtype) encode")
+        }
+    }
+
     /// Through the cache, across a 256-row growth of the compressed buffers:
     /// every decode step stays close to exact attention over the raw K/V.
     func testCacheDecodeMatchesReferenceAtQwenShape() {
@@ -3286,16 +3332,20 @@ final class TurboQuantDecodeMicrobench: XCTestCase {
             func measure(_ label: String, _ step: () -> [MLXArray]) {
                 for _ in 0 ..< 5 { eval(step()) }
                 var build = 0.0
+                var encode = 0.0
                 let start = Date()
                 for _ in 0 ..< 50 {
                     let t0 = Date()
                     let out = step()
-                    build += Date().timeIntervalSince(t0)
+                    let t1 = Date()
+                    build += t1.timeIntervalSince(t0)
+                    asyncEval(out)
+                    encode += Date().timeIntervalSince(t1)
                     eval(out)
                 }
                 let total = Date().timeIntervalSince(start)
                 print(
-                    "[DECODE-BENCH] cpu T=\(tokens) \(label): build \(String(format: "%.3f", build * 1000 / 50)) ms, step \(String(format: "%.3f", total * 1000 / 50)) ms per \(layers) layers"
+                    "[DECODE-BENCH] cpu T=\(tokens) \(label): build \(String(format: "%.3f", build * 1000 / 50)) ms, encode \(String(format: "%.3f", encode * 1000 / 50)) ms, step \(String(format: "%.3f", total * 1000 / 50)) ms per \(layers) layers"
                 )
             }
             let simple = (0 ..< layers).map { _ -> KVCacheSimple in

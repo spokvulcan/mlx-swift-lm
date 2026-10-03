@@ -1479,7 +1479,11 @@ public class TurboQuantKVCache: BaseKVCache {
             default: break
             }
             if L == 1, !hasArrayMaskAsym {
-                let flatQ = (queries * scaleArray(scale)).reshaped([B * nQHeads, headDim])
+                // Scaled queries for the fallback kernels; the GQA kernel
+                // applies the scale as it loads the activation-dtype queries.
+                var flatQ: MLXArray {
+                    (queries * scaleArray(scale)).reshaped([B * nQHeads, headDim])
+                }
                 let rotated: MLXArray
                 if TurboQuantKernelOps.gqaFlashSupports(
                     dim: headDim, repeatCount: nRepeats, valueBits: valueBits,
@@ -1504,7 +1508,8 @@ public class TurboQuantKVCache: BaseKVCache {
                         keys = .raw(rk.reshaped([B * nKVHeads, rk.dim(2), headDim]))
                     }
                     rotated = TurboQuantKernelOps.turboFlashGQA(
-                        queries: flatQ, keys: keys,
+                        queries: queries.reshaped([B * nQHeads, headDim]), scale: scale,
+                        keys: keys,
                         valPacked: vp.reshaped([B * nKVHeads, vp.dim(2), -1]),
                         valNorms: vn.reshaped([B * nKVHeads, vn.dim(2)]),
                         valCodebook: valueMSECodec.codebook, valRotation: valRotation,
