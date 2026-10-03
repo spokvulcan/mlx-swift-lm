@@ -2863,6 +2863,26 @@ final class TurboQuantVerifyTests: XCTestCase {
         }
         """
 
+    /// `compress()` stores the raw rows the way the first decode step would.
+    func testCompressMatchesTheFirstDecodeStep() throws {
+        for keyBits in [0, 8] {
+            let a = makeCache(keyBits: keyBits, rows: 300, seed: 61)
+            let b = makeCache(keyBits: keyBits, rows: 300, seed: 61)
+            a.compress()
+            XCTAssertTrue(a.isCompressed)
+            XCTAssertEqual(a.offset, 300)
+            let one = block(1, seed: 62)
+            let outA = a.compressedAttention(
+                queries: one.q, keys: one.k, values: one.v, scale: scale, mask: .none)
+            let outB = b.compressedAttention(
+                queries: one.q, keys: one.k, values: one.v, scale: scale, mask: .none)
+            XCTAssertEqual(abs(outA - outB).max().item(Float.self), 0, "keyBits \(keyBits)")
+            let empty = makeCache(keyBits: keyBits, rows: 0, seed: 0)
+            empty.compress()
+            XCTAssertFalse(empty.isCompressed)
+        }
+    }
+
     /// The first call on an empty cache compresses as it encodes.
     func testFirstEncodeOnAnEmptyCacheMarksItCompressed() throws {
         let cache = makeCache(keyBits: 0, rows: 0, seed: 0)

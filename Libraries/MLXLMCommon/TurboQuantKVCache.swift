@@ -1178,6 +1178,13 @@ public class TurboQuantKVCache: BaseKVCache {
         isCompressed = true
     }
 
+    /// Compress a cache still in its raw prefill phase now, instead of on
+    /// its first decode step; a cache at rest (a stored prefix) then holds
+    /// the compressed form. No-op once compressed or when empty.
+    public func compress() {
+        compressRawCache()
+    }
+
     // MARK: - Rows at a position (speculative verify)
 
     /// Whether ``verifyAttention(queries:keys:values:position:visibleLength:scale:)``
