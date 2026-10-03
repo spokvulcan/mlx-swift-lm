@@ -1852,7 +1852,7 @@ enum TurboQuantMetalKernels {
 
         """
 
-    private static let verifyPass1Body = """
+    private static let verifyPass1Score = """
             threadgroup_barrier(mem_flags::mem_threadgroup);
 
             // Partial scores over this half's dims: S_half[8, BK].
@@ -1901,6 +1901,9 @@ enum TurboQuantMetalKernels {
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
 
+        """
+
+    private static let verifyStageTurboV = """
             // Values over the consumed key staging: codebook entry times norm,
             // in the rotated basis.
             constexpr uint G8 = Dim / 8;
@@ -1927,6 +1930,23 @@ enum TurboQuantMetalKernels {
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
 
+        """
+
+    private static let verifyStageRawV = """
+            // Values staged as stored, over the consumed key staging.
+            for (uint i = tix; i < BK * V4R; i += NTHREADS) {
+                const uint n = i / V4R;
+                uint4 val = uint4(0);
+                if (n0 + n < N) {
+                    val = ((const device uint4*)(v_raw + ((size_t)kvb * v_stride + n0 + n) * Dim))[i % V4R];
+                }
+                sKV4[i] = val;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        """
+
+    private static let verifyPass1Finish = """
             const float oFactor = sFactor[stripe * QL + fragRow];
             simdgroup_matrix<T, 8, 8> Pf[BK / 8];
             for (int c = 0; c < BK / 8; ++c) {
@@ -1959,10 +1979,58 @@ enum TurboQuantMetalKernels {
         """
 
     static let turboVerifyPass1RawKSource =
-        verifyPass1Prologue + verifyStageRawK + verifyPass1Body
+        verifyPass1Prologue + verifyStageRawK + verifyPass1Score + verifyStageTurboV
+        + verifyPass1Finish
 
     static let turboVerifyPass1AffineKSource =
-        verifyPass1Prologue + verifyStageAffineK + verifyPass1Body
+        verifyPass1Prologue + verifyStageAffineK + verifyPass1Score + verifyStageTurboV
+        + verifyPass1Finish
+
+    /// The same multi-query pass over full-precision keys and values: a
+    /// flash attention for head dims mlx's fused kernels do not take.
+    static let flashPass1Source =
+        verifyPass1Prologue
+        .replacingOccurrences(of: "constexpr uint VAL_LEVELS = 1u << ValueBits;\n", with: "")
+        .replacingOccurrences(of: "constexpr uint VAL_MASK = VAL_LEVELS - 1u;\n", with: "")
+        .replacingOccurrences(of: "threadgroup float cb[VAL_LEVELS];\n", with: "")
+        .replacingOccurrences(of: "if (tix < VAL_LEVELS) cb[tix] = val_codebook[tix];\n", with: "")
+        + verifyStageRawK + verifyPass1Score + verifyStageRawV + verifyPass1Finish
+
+    /// Pass 2 for full-precision values: the merge without a rotation.
+    static let flashPass2Source = """
+        const uint num_blocks = params[0];
+        constexpr uint NSIMD = Dim / 32;
+        const uint tid = thread_index_in_threadgroup;
+        const uint lane = thread_index_in_simdgroup;
+        const uint sg = simdgroup_index_in_threadgroup;
+        const uint q = threadgroup_position_in_grid.y;
+
+        threadgroup float weights[Dim];
+        threadgroup float red_max[NSIMD];
+        threadgroup float red_sum[NSIMD];
+
+        const float mb = (tid < num_blocks) ? m_partials[q * num_blocks + tid] : -INFINITY;
+        const float sg_max = simd_max(mb);
+        if (lane == 0) red_max[sg] = sg_max;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float mx = red_max[0];
+        for (uint j = 1; j < NSIMD; j++) mx = max(mx, red_max[j]);
+
+        const float w = (mb == -INFINITY) ? 0.0f : exp(mb - mx);
+        weights[tid] = w;
+        const float lb = (tid < num_blocks) ? l_partials[q * num_blocks + tid] * w : 0.0f;
+        const float sg_sum = simd_sum(lb);
+        if (lane == 0) red_sum[sg] = sg_sum;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float total = 0.0f;
+        for (uint j = 0; j < NSIMD; j++) total += red_sum[j];
+
+        float acc = 0.0f;
+        for (uint b = 0; b < num_blocks; b++) {
+            acc += o_partials[((size_t)q * num_blocks + b) * Dim + tid] * weights[b];
+        }
+        output[q * Dim + tid] = T((total > 0.0f) ? acc / total : 0.0f);
+        """
 
     // MARK: - Row dequantization (long query blocks)
 
@@ -3103,6 +3171,83 @@ enum TurboQuantKernelOps {
             threadGroup: (dim, 1, 1),
             outputShapes: [[totalRows, dim]],
             outputDTypes: [.float32]
+        )[0].reshaped([B, nQHeads, sPad, dim])
+        return sPad == S ? merged : merged[0..., 0..., ..<S, 0...]
+    }
+
+    /// Whether ``flashAttention(queries:keys:values:keyStride:valueStride:position:visibleLength:scale:repeatCount:partitions:)``
+    /// serves this shape: the multi-query MMA pass over full-precision K/V.
+    static func flashAttentionSupports(
+        dim: Int, repeatCount: Int, dtype: DType, keyDType: DType, valueDType: DType
+    ) -> Bool {
+        flashKernelEnabled && keyDType == dtype && valueDType == dtype
+            && verifyAttentionSupports(
+                dim: dim, repeatCount: repeatCount, valueBits: 4, keyGroupSize: nil,
+                queryDType: dtype, rawKeyDType: dtype)
+    }
+
+    static let flashKernelEnabled = ProcessInfo.processInfo.environment["MLX_FLASH_D256"] != "0"
+
+    /// Attention of a block of query rows over full-precision keys and values
+    /// without materializing the `[heads, rows, keys]` scores: the multi-query
+    /// MMA pass with values staged as stored and a merge without a rotation.
+    /// Query row `s` sits at `position + s` and sees the rows up to it.
+    ///
+    /// - Parameters:
+    ///   - queries: `[B, nQHeads, S, dim]`.
+    ///   - keys, values: whole buffers, `[B * nKVHeads, rows, dim]` (rows may
+    ///     exceed `visibleLength`; they are read by row stride).
+    /// - Returns: `[B, nQHeads, S, dim]` in the query dtype.
+    static func flashAttention(
+        queries: MLXArray, keys: MLXArray, values: MLXArray, position: MLXArray,
+        visibleLength: Int, scale: Float, repeatCount: Int, partitions: Int
+    ) -> MLXArray {
+        let B = queries.dim(0)
+        let nQHeads = queries.dim(1)
+        let S = queries.dim(2)
+        let dim = queries.dim(3)
+        let kvRows = B * nQHeads / repeatCount
+        let chunks = (S + 7) / 8
+        let sPad = chunks * 8
+        var q = queries
+        if sPad != S {
+            q = padded(q, widths: [0, 0, IntOrPair((0, sPad - S)), 0])
+        }
+        let totalRows = B * nQHeads * sPad
+        let parts = max(1, min(partitions, dim))
+        let kernel = gqaKernel(
+            "flash_mq_p1_\(dim)_\(repeatCount)_\(queries.dtype)",
+            inputNames: ["q_in", "k_raw", "v_raw", "position", "params", "fparams"],
+            outputNames: ["o_partials", "m_partials", "l_partials"],
+            source: TurboQuantMetalKernels.flashPass1Source)
+        let partials = kernel(
+            [
+                q.reshaped([totalRows, dim]), keys, values, position.asType(.int32).reshaped([1]),
+                MLXArray(
+                    [
+                        UInt32(visibleLength), UInt32(sPad), UInt32(parts), UInt32(keys.dim(1)),
+                        UInt32(values.dim(1)),
+                    ] as [UInt32]),
+                MLXArray([scale]),
+            ],
+            template: [("T", queries.dtype), ("Dim", dim), ("Rep", repeatCount)],
+            grid: (32 * kvRows, 2 * chunks, repeatCount * parts),
+            threadGroup: (32, 2, repeatCount),
+            outputShapes: [[totalRows * parts, dim], [totalRows, parts], [totalRows, parts]],
+            outputDTypes: [.float32, .float32, .float32]
+        )
+        let merge = gqaKernel(
+            "flash_mq_p2_\(dim)_\(queries.dtype)",
+            inputNames: ["o_partials", "m_partials", "l_partials", "params"],
+            outputNames: ["output"],
+            source: TurboQuantMetalKernels.flashPass2Source)
+        let merged = merge(
+            [partials[0], partials[1], partials[2], MLXArray([UInt32(parts)])],
+            template: [("T", queries.dtype), ("Dim", dim)],
+            grid: (dim, totalRows, 1),
+            threadGroup: (dim, 1, 1),
+            outputShapes: [[totalRows, dim]],
+            outputDTypes: [queries.dtype]
         )[0].reshaped([B, nQHeads, sPad, dim])
         return sPad == S ? merged : merged[0..., 0..., ..<S, 0...]
     }

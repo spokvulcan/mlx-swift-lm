@@ -2812,6 +2812,41 @@ final class TurboQuantVerifyTests: XCTestCase {
             abs(copy.dequantizedRows(65).keys - before).max().item(Float.self), 0)
     }
 
+    /// The full-precision flash pass matches SDPA for a causal block at the
+    /// end of the visible rows, read from a longer buffer by row stride.
+    func testFlashAttentionMatchesSDPA() throws {
+        for (rows, s) in [(1, 8), (100, 37), (2_000, 512), (5_000, 64)] {
+            let visible = rows + s
+            let capacity = visible + 77
+            let (q, k, v) = withRandomState(MLXRandom.RandomState(seed: UInt64(rows))) {
+                (
+                    MLXRandom.normal([1, queryHeads, s, dim]).asType(.bfloat16),
+                    MLXRandom.normal([1, kvHeads, capacity, dim]).asType(.bfloat16),
+                    MLXRandom.normal([1, kvHeads, capacity, dim]).asType(.bfloat16)
+                )
+            }
+            XCTAssertTrue(
+                TurboQuantKernelOps.flashAttentionSupports(
+                    dim: dim, repeatCount: queryHeads / kvHeads, dtype: .bfloat16,
+                    keyDType: .bfloat16, valueDType: .bfloat16))
+            for parts in [1, 3] {
+                let out = TurboQuantKernelOps.flashAttention(
+                    queries: q, keys: k.reshaped([kvHeads, capacity, dim]),
+                    values: v.reshaped([kvHeads, capacity, dim]), position: MLXArray(Int32(rows)),
+                    visibleLength: visible, scale: scale, repeatCount: queryHeads / kvHeads,
+                    partitions: parts)
+                let reference = MLXFast.scaledDotProductAttention(
+                    queries: q.asType(.float32),
+                    keys: k[.ellipsis, ..<visible, 0...].asType(.float32),
+                    values: v[.ellipsis, ..<visible, 0...].asType(.float32), scale: scale,
+                    mask: .causal)
+                XCTAssertEqual(out.dtype, .bfloat16)
+                XCTAssertLessThan(
+                    relativeError(out, reference), 2e-2, "rows \(rows) S \(s) parts \(parts)")
+            }
+        }
+    }
+
     /// Qwen 3.5's verify pass writes and reads TurboQuant layers through the
     /// kernel and tracks the same pass over the unquantized cache.
     func testQwen35DFlash2VerifyOverTurboQuantTracksThePlainCache() throws {
@@ -3153,6 +3188,198 @@ final class TurboQuantDecodeMicrobench: XCTestCase {
                     )
                 }
             }
+        }
+    }
+
+    /// A long causal block on the multi-query MMA kernel with few
+    /// partitions (no score matrix) against mlx's attention, which
+    /// materializes `[heads, L, T]` scores at head dim 256: time and peak.
+    func testFlashChunk() {
+        let scale = 1 / Float(dim).squareRoot()
+        let codec = MSECodec(dim: dim, bits: 4, seed: 43)
+        for tokens in contexts {
+            for chunk in [512, 1024] {
+                let visible = tokens + chunk
+                let rows = ((visible + 255) / 256) * 256
+                let q = (MLXRandom.normal([1, queryHeads, chunk, dim]) * 0.1).asType(.bfloat16)
+                let keys = (MLXRandom.normal([1, kvHeads, rows, dim]) * 0.5).asType(.bfloat16)
+                let values = (MLXRandom.normal([1, kvHeads, rows, dim]) * 0.5).asType(.bfloat16)
+                let (packed, norms) = TurboQuantKernelOps.fusedEncodeWHT(
+                    input: values.reshaped([-1, dim]).asType(.float32),
+                    whtSigns: codec.whtSigns!, boundaries: codec.boundaries,
+                    codebook: codec.codebook, bits: 4, dim: dim)
+                let valPacked = packed.reshaped([kvHeads, rows, -1])
+                let valNorms = norms.reshaped([kvHeads, rows])
+                let rawKeys = keys.reshaped([kvHeads, rows, dim])
+                eval(q, keys, values, valPacked, valNorms, rawKeys)
+                func peak(_ body: () -> [MLXArray]) -> Double {
+                    Memory.clearCache()
+                    Memory.peakMemory = 0
+                    let base = Memory.activeMemory
+                    eval(body())
+                    return Double(Memory.peakMemory - base) / 1e9
+                }
+                let sdpaBody = {
+                    (0 ..< self.layers).map { _ in
+                        MLXFast.scaledDotProductAttention(
+                            queries: q, keys: keys[.ellipsis, ..<visible, 0...],
+                            values: values[.ellipsis, ..<visible, 0...], scale: scale,
+                            mask: .causal)
+                    }
+                }
+                let sdpa = time("flash T=\(tokens) L=\(chunk) bf16 SDPA", iterations: 3, sdpaBody)
+                let sdpaPeak = peak { [sdpaBody()[0]] }
+                for parts in [1, 2, 4] {
+                    let kernelBody = {
+                        (0 ..< self.layers).map { _ in
+                            TurboQuantKernelOps.turboVerifyAttention(
+                                queries: q, keys: .raw(rawKeys), valPacked: valPacked,
+                                valNorms: valNorms, valCodebook: codec.codebook,
+                                valRotation: codec.rotation,
+                                position: MLXArray(Int32(tokens)), visibleLength: visible,
+                                scale: scale, repeatCount: self.queryHeads / self.kvHeads,
+                                valueBits: 4, dim: self.dim, partitions: parts)
+                        }
+                    }
+                    let ms = time(
+                        "flash T=\(tokens) L=\(chunk) MMA parts=\(parts)", iterations: 3, kernelBody
+                    )
+                    let kernelPeak = peak { [kernelBody()[0]] }
+                    print(
+                        "[DECODE-BENCH] flash T=\(tokens) L=\(chunk) parts=\(parts): \(String(format: "%.2f", ms / sdpa))x SDPA, peak \(String(format: "%.2f", kernelPeak)) GB vs SDPA \(String(format: "%.2f", sdpaPeak)) GB (one layer)"
+                    )
+                }
+            }
+        }
+    }
+
+    /// A prefill chunk's attention, one layer at a time as a model runs it:
+    /// mlx's SDPA (scores materialized at head dim 256) against the flash
+    /// pass. Time per 16 layers and one layer's peak.
+    func testFlashPrefill() {
+        let scale = 1 / Float(dim).squareRoot()
+        let chunks =
+            (ProcessInfo.processInfo.environment["TURBOQUANT_DECODE_BENCH_CHUNKS"]
+            ?? "512,1024,2048")
+            .split(separator: ",").compactMap { Int($0) }
+        for tokens in contexts {
+            for chunk in chunks {
+                let visible = tokens + chunk
+                let q = (MLXRandom.normal([1, queryHeads, chunk, dim]) * 0.1).asType(.bfloat16)
+                let keys = (MLXRandom.normal([1, kvHeads, visible, dim]) * 0.5).asType(.bfloat16)
+                let values = (MLXRandom.normal([1, kvHeads, visible, dim]) * 0.5).asType(.bfloat16)
+                eval(q, keys, values)
+                func measure(_ label: String, _ body: () -> MLXArray) -> Double {
+                    for _ in 0 ..< 2 { eval(body()) }
+                    Memory.clearCache()
+                    Memory.peakMemory = 0
+                    let base = Memory.activeMemory
+                    let start = Date()
+                    for _ in 0 ..< layers { eval(body()) }
+                    let ms = Date().timeIntervalSince(start) * 1000
+                    let peak = Double(Memory.peakMemory - base) / 1e9
+                    print(
+                        "[DECODE-BENCH] prefill T=\(tokens) L=\(chunk) \(label): \(String(format: "%.1f", ms)) ms per \(layers) layers, peak \(String(format: "%.2f", peak)) GB"
+                    )
+                    return ms
+                }
+                let sdpa = measure("bf16 SDPA") {
+                    MLXFast.scaledDotProductAttention(
+                        queries: q, keys: keys, values: values, scale: scale, mask: .causal)
+                }
+                for parts in [1, 2] {
+                    let ms = measure("flash parts=\(parts)") {
+                        TurboQuantKernelOps.flashAttention(
+                            queries: q, keys: keys.reshaped([self.kvHeads, visible, self.dim]),
+                            values: values.reshaped([self.kvHeads, visible, self.dim]),
+                            position: MLXArray(Int32(tokens)), visibleLength: visible,
+                            scale: scale, repeatCount: self.queryHeads / self.kvHeads,
+                            partitions: parts)
+                    }
+                    print(
+                        "[DECODE-BENCH] prefill T=\(tokens) L=\(chunk) flash parts=\(parts): \(String(format: "%.2f", ms / sdpa))x SDPA"
+                    )
+                }
+            }
+        }
+    }
+
+    /// Ablations of the flash pass (a profiling aid): the same launch with
+    /// parts of each key block removed, to see where its time goes.
+    func testFlashAblation() {
+        let scale = 1 / Float(dim).squareRoot()
+        let tokens = contexts.first ?? 16_384
+        let chunk = 1024
+        let visible = tokens + chunk
+        let q = (MLXRandom.normal([1, queryHeads, chunk, dim]) * 0.1).asType(.bfloat16)
+        let keys = (MLXRandom.normal([kvHeads, visible, dim]) * 0.5).asType(.bfloat16)
+        let values = (MLXRandom.normal([kvHeads, visible, dim]) * 0.5).asType(.bfloat16)
+        eval(q, keys, values)
+        let base = TurboQuantMetalKernels.flashPass1Source
+        func cut(_ source: String, from: String, to: String) -> String {
+            guard let a = source.range(of: from),
+                let b = source.range(of: to, range: a.upperBound ..< source.endIndex)
+            else { fatalError("marker missing: \(from)") }
+            return source.replacingCharacters(in: a.lowerBound ..< b.lowerBound, with: "")
+        }
+        let variants: [(String, String)] = [
+            ("full", base),
+            (
+                "no S MMA",
+                cut(
+                    base, from: "for (int c = 0; c < BK / 8; ++c) {\n        for (int t = 0;",
+                    to: "for (int c = 0; c < BK / 8; ++c) {\n        simdgroup_store")
+            ),
+            (
+                "no softmax",
+                cut(base, from: "// Online softmax", to: "if (dhalf == 0) {")
+                    .replacingOccurrences(
+                        of: "sPMine[smRow * BK + smCol + j] = T(sv[j]);",
+                        with: "sPMine[smRow * BK + smCol + j] = T(0.01f);"
+                    )
+                    .replacingOccurrences(
+                        of: "if ((lane & 3) == 0) sFactor[stripe * QL + smRow] = factor;",
+                        with: "if ((lane & 3) == 0) sFactor[stripe * QL + smRow] = 1.0f;")
+            ),
+            (
+                "no V stage + PV",
+                cut(
+                    base, from: "// Values staged as stored",
+                    to: "threadgroup_barrier(mem_flags::mem_threadgroup);\n}")
+            ),
+        ]
+        for (label, source) in variants {
+            let kernel = MLXFast.metalKernel(
+                name:
+                    "flash_ablation_\(label.replacingOccurrences(of: " ", with: "_").replacingOccurrences(of: "+", with: "p"))",
+                inputNames: ["q_in", "k_raw", "v_raw", "position", "params", "fparams"],
+                outputNames: ["o_partials", "m_partials", "l_partials"], source: source,
+                ensureRowContiguous: true)
+            let totalRows = queryHeads * chunk
+            func run() -> MLXArray {
+                kernel(
+                    [
+                        q.reshaped([totalRows, dim]), keys, values,
+                        MLXArray(Int32(tokens)).reshaped([1]),
+                        MLXArray(
+                            [
+                                UInt32(visible), UInt32(chunk), UInt32(1), UInt32(visible),
+                                UInt32(visible),
+                            ] as [UInt32]),
+                        MLXArray([scale]),
+                    ],
+                    template: [("T", DType.bfloat16), ("Dim", dim), ("Rep", queryHeads / kvHeads)],
+                    grid: (32 * kvHeads, 2 * chunk / 8, queryHeads / kvHeads),
+                    threadGroup: (32, 2, queryHeads / kvHeads),
+                    outputShapes: [[totalRows, dim], [totalRows, 1], [totalRows, 1]],
+                    outputDTypes: [.float32, .float32, .float32])[0]
+            }
+            for _ in 0 ..< 2 { eval(run()) }
+            let start = Date()
+            for _ in 0 ..< layers { eval(run()) }
+            print(
+                "[DECODE-BENCH] ablation T=\(tokens) L=\(chunk) \(label): \(String(format: "%.1f", Date().timeIntervalSince(start) * 1000)) ms per \(layers) layers"
+            )
         }
     }
 
