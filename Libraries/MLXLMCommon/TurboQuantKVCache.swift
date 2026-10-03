@@ -1203,7 +1203,8 @@ public class TurboQuantKVCache: BaseKVCache {
         writeRows(
             keys: newKeys, values: newValues, position: position, visibleLength: visibleLength)
         return attendRows(
-            queries: queries, position: position, visibleLength: visibleLength, scale: scale)
+            queries: queries, position: position, visibleLength: visibleLength, scale: scale,
+            causalTail: false)
     }
 
     /// The cache now holds `count` positions.
@@ -1256,10 +1257,16 @@ public class TurboQuantKVCache: BaseKVCache {
         isCompressed = true
     }
 
+    /// Query rows the multi-query MMA kernel takes per call; longer blocks
+    /// (prefill chunks) dequantize the rows once and run mlx's attention.
+    static let mmaQueryRows = 8
+
     /// Attention of a block of query rows over the first `visibleLength` rows,
-    /// row `i` sitting at `position + i`.
+    /// row `i` sitting at `position + i`. `causalTail` says the block is the
+    /// last rows of `visibleLength`, so a causal mask states the same thing.
     private func attendRows(
-        queries: MLXArray, position: MLXArray, visibleLength: Int, scale: Float
+        queries: MLXArray, position: MLXArray, visibleLength: Int, scale: Float,
+        causalTail: Bool
     ) -> MLXArray {
         let B = queries.dim(0)
         let headDim = queries.dim(-1)
@@ -1268,10 +1275,6 @@ public class TurboQuantKVCache: BaseKVCache {
         let vn = valNorms!
         let nKVHeads = vp.dim(1)
         let repeatCount = queries.dim(1) / nKVHeads
-        guard verifyKernelServes(queries) else {
-            return referenceAttention(
-                queries: queries, position: position, visibleLength: visibleLength, scale: scale)
-        }
         let keys: TurboQuantKernelOps.GQAKeys
         if affineKeyMode {
             let kw = affKeyW!
@@ -1283,6 +1286,28 @@ public class TurboQuantKVCache: BaseKVCache {
         } else {
             let rk = rawKeys!
             keys = .raw(rk.reshaped([B * nKVHeads, rk.dim(2), headDim]))
+        }
+        guard queries.dim(2) <= Self.mmaQueryRows, verifyKernelServes(queries) else {
+            let (k, rotatedValues) = TurboQuantKernelOps.turboDequantizeRows(
+                keys: keys, valPacked: vp.reshaped([B * nKVHeads, vp.dim(2), -1]),
+                valNorms: vn.reshaped([B * nKVHeads, vn.dim(2)]), valCodebook: codec.codebook,
+                rows: visibleLength, valueBits: valueBits, dim: headDim, dtype: queries.dtype)
+            let mask: MLXFast.ScaledDotProductAttentionMaskMode
+            if causalTail {
+                mask = .causal
+            } else {
+                let columns = MLXArray(Int32(0) ..< Int32(visibleLength))
+                    .expandedDimensions(axis: 0)
+                let rows = (position.asType(.int32) + MLXArray(Int32(0) ..< Int32(queries.dim(2))))
+                    .expandedDimensions(axis: 1)
+                mask = .array(columns .< (rows + 1))
+            }
+            let rotated = MLXFast.scaledDotProductAttention(
+                queries: queries,
+                keys: k.asType(queries.dtype).reshaped([B, nKVHeads, visibleLength, headDim]),
+                values: rotatedValues.reshaped([B, nKVHeads, visibleLength, headDim]),
+                scale: scale, mask: mask)
+            return matmul(rotated.asType(.float32), codec.rotation).asType(queries.dtype)
         }
         return TurboQuantKernelOps.turboVerifyAttention(
             queries: queries, keys: keys,
@@ -1302,8 +1327,8 @@ public class TurboQuantKVCache: BaseKVCache {
             rawKeyDType: rawKeyMode ? rawKeys?.dtype : nil)
     }
 
-    /// Dequantizes the first `visibleLength` rows and runs SDPA under the
-    /// position mask: the fallback for shapes the kernel does not serve.
+    /// Dequantizes the first `visibleLength` rows to float32 in the original
+    /// basis and runs SDPA under the position mask: the tests' reference.
     package func referenceAttention(
         queries: MLXArray, position: MLXArray, visibleLength: Int, scale: Float
     ) -> MLXArray {
@@ -1469,10 +1494,10 @@ public class TurboQuantKVCache: BaseKVCache {
 
             // A causal block (a prefill chunk over the compressed cache) is the
             // verify shape at the host-known position of its first row.
-            if case .causal = mask, verifyKernelServes(queries) {
+            if case .causal = mask {
                 return attendRows(
                     queries: queries, position: MLXArray([Int32(tokenCount - L)]),
-                    visibleLength: tokenCount, scale: scale)
+                    visibleLength: tokenCount, scale: scale, causalTail: true)
             }
 
             var scores: MLXArray

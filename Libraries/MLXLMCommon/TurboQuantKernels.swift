@@ -1964,6 +1964,67 @@ enum TurboQuantMetalKernels {
     static let turboVerifyPass1AffineKSource =
         verifyPass1Prologue + verifyStageAffineK + verifyPass1Body
 
+    // MARK: - Row dequantization (long query blocks)
+
+    /// Expands the first rows of an affine-K / turbo-V cache to the activation
+    /// dtype for a long query block, which then runs mlx's own attention:
+    /// keys in their stored basis, values as codebook entry times norm in the
+    /// rotated basis (the caller rotates the attention output once). One
+    /// thread writes 8 consecutive dimensions of one row.
+    private static let dequantRowsPrologue = """
+        constexpr uint G8 = Dim / 8;
+        constexpr uint VAL_MASK = (1u << ValueBits) - 1u;
+        const uint rows = params[0];
+        const uint k_stride = params[1];
+        const uint v_stride = params[2];
+        const uint g = thread_position_in_grid.x;
+        const uint n = thread_position_in_grid.y;
+        const uint kvb = thread_position_in_grid.z;
+        if (g >= G8 || n >= rows) return;
+        const size_t out_row = ((size_t)kvb * rows + n) * Dim + g * 8;
+
+        """
+
+    private static let dequantRowsAffineK = """
+        {
+            constexpr uint WPR = Dim / 4;
+            constexpr uint GPR = Dim / KGroup;
+            const size_t row = (size_t)kvb * k_stride + n;
+            const uint grp = (g * 8) / KGroup;
+            const float ks = float(k_scales[row * GPR + grp]);
+            const float kb = float(k_biases[row * GPR + grp]);
+            for (uint w = 0; w < 2; w++) {
+                const uint word = k_weights[row * WPR + g * 2 + w];
+                for (uint j = 0; j < 4; j++) {
+                    k_out[out_row + w * 4 + j] = T(float((word >> (8 * j)) & 0xFFu) * ks + kb);
+                }
+            }
+        }
+
+        """
+
+    private static let dequantRowsValues = """
+        {
+            const size_t row = (size_t)kvb * v_stride + n;
+            const device uint32_t* vp = val_packed + row * ValuePackedWidth;
+            const uint bit = g * 8 * ValueBits;
+            const uint word = bit >> 5;
+            const uint shift = bit & 31u;
+            ulong bits = vp[word];
+            if (shift + 8 * ValueBits > 32) bits |= ((ulong)vp[word + 1]) << 32;
+            bits >>= shift;
+            const float nrm = val_norms[row];
+            for (uint j = 0; j < 8; j++) {
+                v_out[out_row + j] = T(val_codebook[(uint)(bits >> (j * ValueBits)) & VAL_MASK] * nrm);
+            }
+        }
+        """
+
+    static let turboDequantRowsAffineKSource =
+        dequantRowsPrologue + dequantRowsAffineK + dequantRowsValues
+
+    static let turboDequantRowsValuesSource = dequantRowsPrologue + dequantRowsValues
+
     /// Value aggregation kernel: weighted sum of codebook-quantized values.
     ///
     /// output[d] = Σ_t weights[t] * norm[t] * codebook[val_idx[t,d]]
@@ -3042,6 +3103,60 @@ enum TurboQuantKernelOps {
             outputDTypes: [.float32]
         )[0].reshaped([B, nQHeads, sPad, dim])
         return sPad == S ? merged : merged[0..., 0..., ..<S, 0...]
+    }
+
+    /// The first `rows` rows of a raw-K or affine-K cache with turbo values,
+    /// in `dtype`: keys in their stored basis, values in the rotated basis.
+    ///
+    /// - Parameters:
+    ///   - keys, valPacked, valNorms: whole buffers, `[B * nKVHeads, rows, ...]`.
+    /// - Returns: `[B * nKVHeads, rows, dim]` keys and rotated values.
+    static func turboDequantizeRows(
+        keys: GQAKeys, valPacked: MLXArray, valNorms: MLXArray, valCodebook: MLXArray,
+        rows: Int, valueBits: Int, dim: Int, dtype: DType
+    ) -> (keys: MLXArray, rotatedValues: MLXArray) {
+        let kvRows = valPacked.dim(0)
+        let vpw = TurboQuantPacking.packedWidth(count: dim, bits: valueBits)
+        var template: [(String, any KernelTemplateArg)] = [
+            ("T", dtype), ("Dim", dim), ("ValueBits", valueBits), ("ValuePackedWidth", vpw),
+        ]
+        let grid = (dim / 8, rows, kvRows)
+        let threadGroup = (min(dim / 8, 32), 8, 1)
+        switch keys {
+        case .raw(let rawKeys):
+            let kernel = gqaKernel(
+                "turbo_dequant_rows_v_\(dim)_\(valueBits)_\(dtype)",
+                inputNames: ["val_packed", "val_norms", "val_codebook", "params"],
+                outputNames: ["v_out"],
+                source: TurboQuantMetalKernels.turboDequantRowsValuesSource)
+            let values = kernel(
+                [
+                    valPacked, f32(valNorms), f32(valCodebook),
+                    MLXArray([UInt32(rows), UInt32(rawKeys.dim(1)), UInt32(valPacked.dim(1))]),
+                ],
+                template: template, grid: grid, threadGroup: threadGroup,
+                outputShapes: [[kvRows, rows, dim]], outputDTypes: [dtype])[0]
+            return (rawKeys[0..., ..<rows, 0...], values)
+        case .affine(let weights, let scales, let biases, let groupSize):
+            template.append(("KGroup", groupSize))
+            let kernel = gqaKernel(
+                "turbo_dequant_rows_kv_\(dim)_\(valueBits)_\(groupSize)_\(dtype)_\(scales.dtype)",
+                inputNames: [
+                    "k_weights", "k_scales", "k_biases", "val_packed", "val_norms",
+                    "val_codebook", "params",
+                ],
+                outputNames: ["k_out", "v_out"],
+                source: TurboQuantMetalKernels.turboDequantRowsAffineKSource)
+            let out = kernel(
+                [
+                    weights, scales, biases, valPacked, f32(valNorms), f32(valCodebook),
+                    MLXArray([UInt32(rows), UInt32(weights.dim(1)), UInt32(valPacked.dim(1))]),
+                ],
+                template: template, grid: grid, threadGroup: threadGroup,
+                outputShapes: [[kvRows, rows, dim], [kvRows, rows, dim]],
+                outputDTypes: [dtype, dtype])
+            return (out[0], out[1])
+        }
     }
 
     static func turboFlashAttention(

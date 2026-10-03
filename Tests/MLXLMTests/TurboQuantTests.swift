@@ -3073,6 +3073,73 @@ final class TurboQuantDecodeMicrobench: XCTestCase {
         }
     }
 
+    /// A warm prefill chunk: `L` causal rows appended to a compressed cache
+    /// of `T` rows (a restored TurboQuant leaf's next turn), against the
+    /// same chunk over bf16 KV and against dequantize + SDPA.
+    func testWarmChunk() {
+        let scale = 1 / Float(dim).squareRoot()
+        let chunks =
+            (ProcessInfo.processInfo.environment["TURBOQUANT_DECODE_BENCH_CHUNKS"] ?? "64,512,1024")
+            .split(separator: ",").compactMap { Int($0) }
+        for tokens in contexts {
+            for chunk in chunks {
+                let keys = (MLXRandom.normal([1, kvHeads, tokens + chunk, dim]) * 0.5)
+                    .asType(.bfloat16)
+                let values = (MLXRandom.normal([1, kvHeads, tokens + chunk, dim]) * 0.5)
+                    .asType(.bfloat16)
+                let q = (MLXRandom.normal([1, queryHeads, chunk, dim]) * 0.1).asType(.bfloat16)
+                eval(keys, values, q)
+                let sdpa = time("warm T=\(tokens) L=\(chunk) bf16 SDPA", iterations: 5) {
+                    (0 ..< layers).map { _ in
+                        MLXFast.scaledDotProductAttention(
+                            queries: q, keys: keys, values: values, scale: scale, mask: .causal)
+                    }
+                }
+                for keyBits in [8, 0] {
+                    let newK = keys[.ellipsis, tokens..., 0...]
+                    let newV = values[.ellipsis, tokens..., 0...]
+                    func makeCaches() -> [TurboQuantKVCache] {
+                        (0 ..< layers).map { _ in
+                            let c = TurboQuantKVCache(bits: 4, keyBits: keyBits, valueBits: 4)
+                            _ = c.update(
+                                keys: keys[.ellipsis, ..<tokens, 0...],
+                                values: values[.ellipsis, ..<tokens, 0...])
+                            c.compress()
+                            return c
+                        }
+                    }
+                    var caches = makeCaches()
+                    eval(caches.flatMap(\.state))
+                    let kernel = time(
+                        "warm T=\(tokens) L=\(chunk) turbo\(keyBits)v4 kernel", iterations: 5
+                    ) {
+                        // Rewind the chunk so every iteration appends at T.
+                        caches.map {
+                            $0.trim($0.offset - tokens)
+                            return $0.compressedAttention(
+                                queries: q, keys: newK, values: newV, scale: scale, mask: .causal)
+                        }
+                    }
+                    caches = makeCaches()
+                    eval(caches.flatMap(\.state))
+                    let reference = time(
+                        "warm T=\(tokens) L=\(chunk) turbo\(keyBits)v4 dequantize + SDPA",
+                        iterations: 3
+                    ) {
+                        caches.map {
+                            $0.referenceAttention(
+                                queries: q, position: MLXArray(Int32(tokens - chunk)),
+                                visibleLength: tokens, scale: scale)
+                        }
+                    }
+                    print(
+                        "[DECODE-BENCH] warm T=\(tokens) L=\(chunk) turbo\(keyBits)v4: kernel \(String(format: "%.2f", kernel / sdpa))x SDPA, dequantize + SDPA \(String(format: "%.2f", reference / sdpa))x"
+                    )
+                }
+            }
+        }
+    }
+
     /// The one-time switch-over: 16 layers' first decode step on freshly
     /// converted caches, which compresses each layer's whole prefill.
     func testSwitchOver() {
