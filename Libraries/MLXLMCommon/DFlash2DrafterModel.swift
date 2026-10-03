@@ -268,7 +268,8 @@ public struct GatedDeltaCapture {
 /// An attention cache the verify pass drives. A pass writes its `S` rows at
 /// `position` (a `[1]` int32, possibly lazy) without moving `offset` and
 /// attends over the first `visibleLength` rows, row `i` seeing columns up to
-/// `position + i` (`mask`, `[S, visibleLength]` bool). The iterator then
+/// `position + i`. `mask` is that position mask (`[S, visibleLength]` bool);
+/// a conformer may rebuild it from `position` instead. The iterator then
 /// commits the accepted prefix with ``commitRows(count:)``.
 package protocol DFlash2AttentionCache: KVCache {
     func dflash2Attention(
