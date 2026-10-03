@@ -1026,7 +1026,7 @@ final class Qwen35DecoderLayer: Module {
             if isLinear, let mambaCache = cache as? MambaCache {
                 return decodeLinearLayer(x, cache: mambaCache)
             }
-            if !isLinear, let cache, usesPlainAttentionCacheRoute(cache) {
+            if !isLinear, let cache, supportsUntracedDecodeAttention(cache) {
                 return decodeAttentionLayer(x, mask: attentionMask, cache: cache)
             }
         }
@@ -1416,7 +1416,7 @@ public class Qwen35TextModelInner: Module {
                 else { return nil }
                 mambaCaches[i] = mambaCache
             } else {
-                guard let kv = cache[i], usesPlainAttentionCacheRoute(kv) else { return nil }
+                guard let kv = cache[i], supportsUntracedDecodeAttention(kv) else { return nil }
             }
         }
 
