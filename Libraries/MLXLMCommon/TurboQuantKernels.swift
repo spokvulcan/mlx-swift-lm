@@ -1920,22 +1920,30 @@ enum TurboQuantMetalKernels {
 
         """
 
+    /// Sixteen keys per thread step: one `uint4` of weights, one scale and
+    /// bias (a group holds at least 32 keys), four 4-wide stores.
     private static let verifyStageAffineK = """
             constexpr uint WPR = Dim / 4;
+            constexpr uint QPR = Dim / 16;
             constexpr uint GPR = Dim / KGroup;
-            for (uint i = tix; i < BK * WPR; i += NTHREADS) {
-                const uint n = i / WPR;
-                const uint w = i % WPR;
-                threadgroup T* dst = sKV + n * Dim + w * 4;
+            for (uint i = tix; i < BK * QPR; i += NTHREADS) {
+                const uint n = i / QPR;
+                const uint q = i % QPR;
+                threadgroup vec<T, 4>* dst = (threadgroup vec<T, 4>*)(sKV + n * Dim + q * 16);
                 if (n0 + n < N) {
                     const size_t row = (size_t)kvb * k_stride + n0 + n;
-                    const uint word = k_weights[row * WPR + w];
-                    const uint g = (w * 4) / KGroup;
+                    const uint4 words = ((const device uint4*)(k_weights + row * WPR))[q];
+                    const uint g = (q * 16) / KGroup;
                     const float ks = float(k_scales[row * GPR + g]);
                     const float kb = float(k_biases[row * GPR + g]);
-                    for (uint j = 0; j < 4; j++) dst[j] = T(float((word >> (8 * j)) & 0xFFu) * ks + kb);
+                    for (uint j = 0; j < 4; j++) {
+                        const uint word = words[j];
+                        dst[j] = vec<T, 4>(
+                            T(float(word & 0xFFu) * ks + kb), T(float((word >> 8) & 0xFFu) * ks + kb),
+                            T(float((word >> 16) & 0xFFu) * ks + kb), T(float(word >> 24) * ks + kb));
+                    }
                 } else {
-                    for (uint j = 0; j < 4; j++) dst[j] = T(0);
+                    for (uint j = 0; j < 4; j++) dst[j] = vec<T, 4>(T(0));
                 }
             }
 
@@ -3191,7 +3199,7 @@ enum TurboQuantKernelOps {
             (2 ... 4).contains(valueBits), queryDType == .bfloat16 || queryDType == .float16
         else { return false }
         if let rawKeyDType, rawKeyDType != queryDType { return false }
-        if let keyGroupSize, keyGroupSize % 4 != 0 || dim % keyGroupSize != 0 { return false }
+        if let keyGroupSize, keyGroupSize % 16 != 0 || dim % keyGroupSize != 0 { return false }
         // Per query head: two score halves, the probabilities and the factors.
         let bytes = repeatCount * (2 * 8 * 32 * 4 + 8 * 32 * 2 + 8 * 4) + 32 * dim * 2 + 64
         return bytes <= 32 * 1024
