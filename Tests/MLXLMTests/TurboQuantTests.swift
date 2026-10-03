@@ -2660,6 +2660,99 @@ final class TurboQuantGQAFlashTests: XCTestCase {
 
 /// Rows written at a device-side position past the committed offset, and the
 /// multi-query MMA kernel that attends over them, against dequantize + SDPA.
+/// The one-dispatch row write against the ops it replaces: the WHT value
+/// encode, mlx's `quantized` for 8-bit affine keys, and a slice write per
+/// buffer. Byte-identical, at a lazy position, into buffers of different
+/// capacities.
+final class TurboQuantRowWriteTests: XCTestCase {
+
+    private let (kvHeads, dim) = (4, 256)
+
+    private func bytes(_ a: MLXArray) -> Data { a.asData(access: .copy).data }
+
+    /// The pinned mlx fork updates `inplace_*` outputs in place, so decode
+    /// takes the one-dispatch write.
+    func testPinnedMLXUpdatesInPlaceOutputs() {
+        XCTAssertTrue(TurboQuantKernelOps.inplaceOutputsSupported)
+    }
+
+    func testRowWriteMatchesSeparateOps() throws {
+        try XCTSkipUnless(TurboQuantKernelOps.rowWriteSupports(dim: dim, keyGroupSize: 64))
+        let codec = MSECodec(dim: dim, bits: 4, seed: 43)
+        let packedWidth = TurboQuantPacking.packedWidth(count: dim, bits: 4)
+        for dtype in [DType.bfloat16, .float16] {
+            for groupSize in [32, 64, 128] {
+                for (rows, position) in [(1, 37), (8, 120), (3, 0)] {
+                    var keys =
+                        (MLXRandom.normal([1, kvHeads, rows, dim], key: MLXRandom.key(7)) * 2)
+                        .asType(dtype)
+                    // An all-negative group and an all-zero row: the edge cases
+                    // of mlx's scale and bias selection.
+                    keys[0..., 0, 0, 0 ..< groupSize] = -abs(keys[0..., 0, 0, 0 ..< groupSize])
+                    if rows > 1 { keys[0..., 1, 1, 0...] = MLXArray.zeros([dim], dtype: dtype) }
+                    let values =
+                        (MLXRandom.normal([1, kvHeads, rows, dim], key: MLXRandom.key(8)) * 0.5)
+                        .asType(dtype)
+                    let at = MLXArray([Int32(position)])
+                    // Values and keys at different capacities.
+                    let (valueCap, keyCap) = (256, 384)
+                    func buffer(_ cap: Int, _ width: Int?, _ type: DType, seed: UInt64) -> MLXArray
+                    {
+                        var shape = [1, kvHeads, cap]
+                        if let width { shape.append(width) }
+                        let noise = MLXRandom.uniform(
+                            low: 0, high: 200, shape, key: MLXRandom.key(seed))
+                        return noise.asType(type)
+                    }
+                    let vp = buffer(valueCap, packedWidth, .uint32, seed: 1)
+                    let vn = buffer(valueCap, nil, .float32, seed: 2)
+                    let kw = buffer(keyCap, dim / 4, .uint32, seed: 3)
+                    let ks = buffer(keyCap, dim / groupSize, dtype, seed: 4)
+                    let kb = buffer(keyCap, dim / groupSize, dtype, seed: 5)
+                    let raw = buffer(keyCap, dim, dtype, seed: 6)
+                    eval(keys, values, vp, vn, kw, ks, kb, raw)
+
+                    let (packed, norms) = TurboQuantKernelOps.fusedEncodeWHT(
+                        input: values.reshaped([-1, dim]), whtSigns: codec.whtSigns!,
+                        boundaries: codec.boundaries, codebook: codec.codebook, bits: 4,
+                        dim: dim)
+                    let q = quantized(keys, groupSize: groupSize, bits: 8)
+                    func put(_ buffer: MLXArray, _ update: MLXArray) -> Data {
+                        bytes(dynamicSliceUpdated(buffer, update: update, start: at, axes: [2]))
+                    }
+                    let expectedValues = [
+                        put(vp, packed.reshaped([1, kvHeads, rows, -1])),
+                        put(vn, norms.reshaped([1, kvHeads, rows])),
+                    ]
+                    let affine = TurboQuantKernelOps.writeRows(
+                        keys: keys, values: values, position: at,
+                        keyBuffers: .affine(
+                            weights: kw, scales: ks, biases: kb, groupSize: groupSize),
+                        valPacked: vp, valNorms: vn, whtSigns: codec.whtSigns!,
+                        boundaries: codec.boundaries, valueBits: 4, dim: dim)
+                    guard case .affine(let w, let sc, let bi, _) = affine.keys else {
+                        return XCTFail("key mode")
+                    }
+                    let label = "\(dtype) group \(groupSize), \(rows) rows at \(position)"
+                    XCTAssertEqual(bytes(w), put(kw, q.wq), "weights, \(label)")
+                    XCTAssertEqual(bytes(sc), put(ks, q.scales), "scales, \(label)")
+                    XCTAssertEqual(bytes(bi), put(kb, q.biases!), "biases, \(label)")
+                    XCTAssertEqual(bytes(affine.valPacked), expectedValues[0], label)
+                    XCTAssertEqual(bytes(affine.valNorms), expectedValues[1], label)
+
+                    let rawWrite = TurboQuantKernelOps.writeRows(
+                        keys: keys, values: values, position: at, keyBuffers: .raw(raw),
+                        valPacked: vp, valNorms: vn, whtSigns: codec.whtSigns!,
+                        boundaries: codec.boundaries, valueBits: 4, dim: dim)
+                    guard case .raw(let r) = rawWrite.keys else { return XCTFail("key mode") }
+                    XCTAssertEqual(bytes(r), put(raw, keys), "raw keys, \(label)")
+                    XCTAssertEqual(bytes(rawWrite.valPacked), expectedValues[0], label)
+                }
+            }
+        }
+    }
+}
+
 final class TurboQuantVerifyTests: XCTestCase {
     private let kvHeads = 4
     private let queryHeads = 24

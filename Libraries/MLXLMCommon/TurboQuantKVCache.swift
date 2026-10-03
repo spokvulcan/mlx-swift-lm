@@ -1069,6 +1069,14 @@ public class TurboQuantKVCache: BaseKVCache {
         // silently drops every new token after restore.
         ensureCodecs(headDim: headDim)
         guard let valueMSECodec else { return }
+        if affineKeyMode { resolveAffineKeyGroupSize(headDim: headDim) }
+        if rowWriteServes(headDim: headDim) {
+            writeRowsFused(
+                keys: keys, values: values, position: MLXArray([Int32(prev)]),
+                rows: prev + numSteps)
+            offset = prev + numSteps
+            return
+        }
 
         let vpw = TurboQuantPacking.packedWidth(count: headDim, bits: valueBits)
 
@@ -1081,7 +1089,6 @@ public class TurboQuantKVCache: BaseKVCache {
 
         if affineKeyMode {
             // Affine-K mode: quantize the new key chunk and append to the triplet
-            resolveAffineKeyGroupSize(headDim: headDim)
             let quantK = quantized(keys, groupSize: keyGroupSize, bits: 8)
             let (kw, ks) = (quantK.wq, quantK.scales)
             let kb = quantK.biases ?? MLXArray.zeros(ks.shape, dtype: ks.dtype)
@@ -1263,6 +1270,15 @@ public class TurboQuantKVCache: BaseKVCache {
         if !isCompressed { compressRawCache() }
         let headDim = newKeys.dim(-1)
         ensureCodecs(headDim: headDim)
+        if affineKeyMode { resolveAffineKeyGroupSize(headDim: headDim) }
+        if rowWriteServes(headDim: headDim) {
+            // Growth keeps every row: rows past the offset may be a pending
+            // round's scratch that the next pass reads.
+            writeRowsFused(
+                keys: newKeys, values: newValues, position: position.asType(.int32).reshaped([1]),
+                rows: visibleLength, keepingAllRows: true)
+            return
+        }
         let B = newKeys.dim(0)
         let H = newKeys.dim(1)
         let S = newKeys.dim(2)
@@ -1286,7 +1302,6 @@ public class TurboQuantKVCache: BaseKVCache {
         }
 
         if affineKeyMode {
-            resolveAffineKeyGroupSize(headDim: headDim)
             let quantK = quantized(newKeys, groupSize: keyGroupSize, bits: 8)
             let biases =
                 quantK.biases ?? MLXArray.zeros(quantK.scales.shape, dtype: quantK.scales.dtype)
@@ -1300,6 +1315,75 @@ public class TurboQuantKVCache: BaseKVCache {
         valPackedMSE = write(valPackedMSE, packed.reshaped([B, H, S, -1]))
         valNorms = write(valNorms, norms.reshaped([B, H, S]))
         compressedAllocSteps = valPackedMSE!.dim(2)
+        isCompressed = true
+    }
+
+    /// Whether rows go through the one-dispatch row-write kernel: a WHT
+    /// value codec over raw or 8-bit affine keys, float32 norms.
+    private func rowWriteServes(headDim: Int) -> Bool {
+        guard rawKeyMode || affineKeyMode, let codec = valueMSECodec, codec.useWHT,
+            codec.whtSigns != nil, valNorms.map({ $0.dtype == .float32 }) ?? true,
+            TurboQuantKernelOps.rowWriteSupports(
+                dim: headDim, keyGroupSize: affineKeyMode ? keyGroupSize : nil)
+        else { return false }
+        return true
+    }
+
+    /// Grows the buffers to hold `rows` rows, then encodes and writes the
+    /// new rows at `position` in one dispatch. Growth copies the first
+    /// `offset` rows, or every row when `keepingAllRows`.
+    private func writeRowsFused(
+        keys: MLXArray, values: MLXArray, position: MLXArray, rows: Int,
+        keepingAllRows: Bool = false
+    ) {
+        let codec = valueMSECodec!
+        let (b, h, headDim) = (keys.dim(0), keys.dim(1), keys.dim(-1))
+        let held =
+            [affineKeyMode ? affKeyW : rawKeys, valPackedMSE].compactMap { $0?.dim(2) }.min() ?? 0
+        let capacity = held < rows ? grownCapacity(needed: rows, capacity: held) : held
+        func sized(_ buffer: MLXArray?, width: Int?, dtype: DType) -> MLXArray {
+            if let buffer, buffer.dim(2) >= capacity { return buffer }
+            var shape = [b, h, capacity]
+            if let width { shape.append(width) }
+            let fresh = MLXArray.zeros(shape, dtype: buffer?.dtype ?? dtype)
+            let kept = keepingAllRows ? (buffer?.dim(2) ?? 0) : min(offset, buffer?.dim(2) ?? 0)
+            if let buffer, kept > 0 {
+                fresh[0..., 0..., ..<kept] = buffer[0..., 0..., ..<kept]
+            }
+            return fresh
+        }
+        let keyBuffers: TurboQuantKernelOps.RowKeyBuffers
+        if affineKeyMode {
+            let groups = headDim / keyGroupSize
+            keyBuffers = .affine(
+                weights: sized(affKeyW, width: headDim / 4, dtype: .uint32),
+                scales: sized(affKeyScales, width: groups, dtype: keys.dtype),
+                biases: sized(affKeyBiases, width: groups, dtype: keys.dtype),
+                groupSize: keyGroupSize)
+        } else {
+            keyBuffers = .raw(sized(rawKeys, width: headDim, dtype: keys.dtype))
+        }
+        let written = TurboQuantKernelOps.writeRows(
+            keys: keys, values: values, position: position, keyBuffers: keyBuffers,
+            valPacked: sized(
+                valPackedMSE,
+                width: TurboQuantPacking.packedWidth(count: headDim, bits: valueBits),
+                dtype: .uint32),
+            valNorms: sized(valNorms, width: nil, dtype: .float32),
+            whtSigns: codec.whtSigns!, boundaries: codec.boundaries,
+            valueBits: valueBits, dim: headDim)
+        switch written.keys {
+        case .raw(let raw):
+            rawKeys = raw
+            rawAllocSteps = raw.dim(2)
+        case .affine(let weights, let scales, let biases, _):
+            affKeyW = weights
+            affKeyScales = scales
+            affKeyBiases = biases
+        }
+        valPackedMSE = written.valPacked
+        valNorms = written.valNorms
+        compressedAllocSteps = written.valPacked.dim(2)
         isCompressed = true
     }
 

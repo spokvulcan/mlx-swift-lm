@@ -221,14 +221,18 @@ enum TurboQuantMetalKernels {
     /// are combined: (a, b) → (a+b, a-b).
     ///
     /// Template params: Bits, Dim, PackedWidth, LogDim (= log2(Dim))
-    static let fusedEncodeWHTSource = """
+    static func whtEncodeSource(
+        prologue: String = "", input: String = "input[row * Dim + d]",
+        packedOut: String = "packed_out[row * PackedWidth + d]", normsOut: String = "norms_out[row]"
+    ) -> String {
+        """
         constexpr uint LEVELS = 1u << Bits;
 
         uint d = thread_position_in_threadgroup.x;   // dimension index (0..Dim-1)
         uint row = thread_position_in_grid.y;         // vector index (B*H*T)
-
+        \(prologue)
         // --- Step 1: Load input value ---
-        float val = input[row * Dim + d];
+        float val = \(input);
 
         // --- Step 2: Compute L2 norm (SIMD reduction) ---
         float sq = val * val;
@@ -332,16 +336,100 @@ enum TurboQuantMetalKernels {
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         if (d < PackedWidth) {
-            packed_out[row * PackedWidth + d] = shared_packed[d];
+            \(packedOut) = shared_packed[d];
         }
 
         // --- Step 7: Store raw norm (WHT is orthogonal, no norm correction needed) ---
         // WHT preserves norms: ||WHT(x)||₂ = ||x||₂. Reconstruction norm ≈ original norm,
         // so the correction ratio ≈ 1.0. Skipping saves codebook lookup + norm + division.
         if (d == 0) {
-            norms_out[row] = norm_val;
+            \(normsOut) = norm_val;
         }
         """
+    }
+
+    static let fusedEncodeWHTSource = whtEncodeSource()
+
+    /// Writes `S` new rows per KV head at `position` straight into a cache's
+    /// buffers, which the `inplace_*` outputs update in place: the WHT value
+    /// encode above, then the key, raw or 8-bit affine. One threadgroup of
+    /// `Dim` threads per row; `keys`/`values` are `[B, H, S, Dim]`.
+    /// Each buffer is addressed at its own capacity (`*_shape[2]`): raw keys
+    /// can keep their prefill allocation while values hold another.
+    private static let rowWritePrologue = """
+        const uint new_rows = keys_shape[2];
+        const uint bh = row / new_rows;
+        const uint pos = uint(position[0]) + (row - bh * new_rows);
+        """
+
+    private static func rowWriteValues() -> String {
+        whtEncodeSource(
+            prologue: rowWritePrologue, input: "values[row * Dim + d]",
+            packedOut: "inplace_val_packed[(bh * val_packed_shape[2] + pos) * PackedWidth + d]",
+            normsOut: "inplace_val_norms[bh * val_norms_shape[2] + pos]")
+    }
+
+    /// Template params: Bits, Dim, PackedWidth, LogDim, RawT.
+    static let rowWriteRawKSource =
+        rowWriteValues() + """
+
+            inplace_k_raw[(bh * k_raw_shape[2] + pos) * Dim + d] =
+                static_cast<RawT>(float(keys[row * Dim + d]));
+            """
+
+    /// mlx's `affine_quantize` at 8 bits, one group of `KGroup` per scale:
+    /// the group's minimum and its maximum taken from 0, then
+    /// `round((w - bias) / scale)` per element, four bytes to a word.
+    ///
+    /// Template params: Bits, Dim, PackedWidth, LogDim, KGroup, ScaleT.
+    static let rowWriteAffineKSource =
+        rowWriteValues() + """
+
+            constexpr uint K_SIMDS = Dim / 32;
+            constexpr uint SIMDS_PER_GROUP = KGroup / 32;
+            const float kv = keys[row * Dim + d];
+            const float lane_min = simd_min(kv);
+            const float lane_max = simd_max(max(kv, 0.0f));
+            threadgroup float tg_kmin[K_SIMDS];
+            threadgroup float tg_kmax[K_SIMDS];
+            if (d % 32 == 0) {
+                tg_kmin[d / 32] = lane_min;
+                tg_kmax[d / 32] = lane_max;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            const uint g = d / KGroup;
+            float w_min = tg_kmin[g * SIMDS_PER_GROUP];
+            float w_max = tg_kmax[g * SIMDS_PER_GROUP];
+            for (uint j = 1; j < SIMDS_PER_GROUP; j++) {
+                w_min = min(w_min, tg_kmin[g * SIMDS_PER_GROUP + j]);
+                w_max = max(w_max, tg_kmax[g * SIMDS_PER_GROUP + j]);
+            }
+            constexpr float eps = 1e-7;
+            constexpr float n_bins = 255.0f;
+            float k_scale = max((w_max - w_min) / n_bins, eps);
+            const bool side = abs(w_min) > abs(w_max);
+            k_scale = side ? k_scale : -k_scale;
+            const float edge = side ? w_min : w_max;
+            const float q0 = round(edge / k_scale);
+            const bool at_zero = q0 == 0.0f;
+            k_scale = at_zero ? k_scale : edge / q0;
+            const float k_bias = at_zero ? 0 : edge;
+            if (d % KGroup == 0) {
+                const uint s_row = bh * k_scales_shape[2] + pos;
+                const uint b_row = bh * k_biases_shape[2] + pos;
+                inplace_k_scales[s_row * (Dim / KGroup) + g] = static_cast<ScaleT>(k_scale);
+                inplace_k_biases[b_row * (Dim / KGroup) + g] = static_cast<ScaleT>(k_bias);
+            }
+            const uint8_t q_byte = min(round((kv - k_bias) / k_scale), n_bins);
+            const uint q = q_byte;
+            const uint q1 = simd_shuffle_down(q, 1);
+            const uint q2 = simd_shuffle_down(q, 2);
+            const uint q3 = simd_shuffle_down(q, 3);
+            if (d % 4 == 0) {
+                const uint w_row = bh * k_weights_shape[2] + pos;
+                inplace_k_weights[w_row * (Dim / 4) + d / 4] = q | (q1 << 8) | (q2 << 16) | (q3 << 24);
+            }
+            """
 
     /// Quantize, pack, and norm-correct pre-rotated calibrated vectors.
     ///
@@ -2225,6 +2313,102 @@ enum TurboQuantKernelOps {
         )
 
         return (packed: results[0], norms: results[1])
+    }
+
+    /// A cache's key buffers, `[B, H, capacity, *]`.
+    enum RowKeyBuffers {
+        case raw(MLXArray)
+        case affine(weights: MLXArray, scales: MLXArray, biases: MLXArray, groupSize: Int)
+    }
+
+    /// `TURBO_FUSED_WRITE=0` writes rows through separate encode, quantize and
+    /// slice-update ops instead, as does an mlx without in-place outputs.
+    static let rowWriteEnabled =
+        ProcessInfo.processInfo.environment["TURBO_FUSED_WRITE"] != "0"
+        && inplaceOutputsSupported
+
+    /// Whether mlx updates a custom kernel's `inplace_<input>` output in that
+    /// input's buffer (tesseract's mlx fork). Elsewhere the output is a fresh
+    /// buffer, and a row write would lose every row it does not write.
+    static let inplaceOutputsSupported: Bool = {
+        let probe = MLXFast.metalKernel(
+            name: "turbo_inplace_probe", inputNames: ["buf"], outputNames: ["inplace_buf"],
+            source: "if (thread_position_in_grid.x == 0) { inplace_buf[0] = 7u; }")
+        let pattern: [UInt32] = [0xA5A5_0001, 0xA5A5_0002, 0xA5A5_0003, 0xA5A5_0004]
+        let written = probe(
+            [MLXArray(pattern)], grid: (1, 1, 1), threadGroup: (1, 1, 1),
+            outputShapes: [[pattern.count]], outputDTypes: [.uint32])[0]
+        return written.asArray(UInt32.self) == [7] + pattern.dropFirst()
+    }()
+
+    /// Whether ``writeRows(keys:values:position:keyBuffers:valPacked:valNorms:whtSigns:boundaries:valueBits:dim:)``
+    /// serves this shape: a WHT value codec and whole 32-lane key groups.
+    static func rowWriteSupports(dim: Int, keyGroupSize: Int?) -> Bool {
+        guard rowWriteEnabled, dim >= 32, dim <= 1024, dim & (dim - 1) == 0 else { return false }
+        if let keyGroupSize { return keyGroupSize % 32 == 0 && dim % keyGroupSize == 0 }
+        return true
+    }
+
+    /// Encodes `keys`/`values` (`[B, H, S, dim]`) and writes them at row
+    /// `position` (an int32 `[1]`, possibly lazy) of every buffer in one
+    /// dispatch. The returned buffers share the given ones' storage under
+    /// `MLX_DYNSLICE_INPLACE`'s rule; mlx copies a buffer it cannot alias.
+    static func writeRows(
+        keys: MLXArray, values: MLXArray, position: MLXArray, keyBuffers: RowKeyBuffers,
+        valPacked: MLXArray, valNorms: MLXArray, whtSigns: MLXArray, boundaries: MLXArray,
+        valueBits: Int, dim: Int
+    ) -> (keys: RowKeyBuffers, valPacked: MLXArray, valNorms: MLXArray) {
+        let rows = keys.dim(0) * keys.dim(1) * keys.dim(2)
+        var template: [(String, any KernelTemplateArg)] = [
+            ("Bits", valueBits), ("Dim", dim),
+            ("PackedWidth", TurboQuantPacking.packedWidth(count: dim, bits: valueBits)),
+            ("LogDim", Int(log2(Double(dim)))),
+        ]
+        var inputs = [keys, values, f32(whtSigns), f32(boundaries), position]
+        let kernel: MLXFast.MLXFastKernel
+        let keyOutputs: Int
+        switch keyBuffers {
+        case .raw(let raw):
+            kernel = gqaKernel(
+                "turbo_write_rows_rawk_\(dim)_\(valueBits)_\(keys.dtype)_\(values.dtype)_\(raw.dtype)",
+                inputNames: [
+                    "keys", "values", "wht_signs", "boundaries", "position", "k_raw",
+                    "val_packed", "val_norms",
+                ],
+                outputNames: ["inplace_k_raw", "inplace_val_packed", "inplace_val_norms"],
+                source: TurboQuantMetalKernels.rowWriteRawKSource)
+            template.append(("RawT", raw.dtype))
+            inputs.append(raw)
+            keyOutputs = 1
+        case .affine(let weights, let scales, let biases, let groupSize):
+            kernel = gqaKernel(
+                "turbo_write_rows_affk_\(dim)_\(valueBits)_\(groupSize)_\(keys.dtype)_\(values.dtype)_\(scales.dtype)",
+                inputNames: [
+                    "keys", "values", "wht_signs", "boundaries", "position", "k_weights",
+                    "k_scales", "k_biases", "val_packed", "val_norms",
+                ],
+                outputNames: [
+                    "inplace_k_weights", "inplace_k_scales", "inplace_k_biases",
+                    "inplace_val_packed", "inplace_val_norms",
+                ],
+                source: TurboQuantMetalKernels.rowWriteAffineKSource)
+            template += [("KGroup", groupSize), ("ScaleT", scales.dtype)]
+            inputs += [weights, scales, biases]
+            keyOutputs = 3
+        }
+        inputs += [valPacked, valNorms]
+        let buffers = Array(inputs[5...])
+        let out = kernel(
+            inputs, template: template,
+            grid: (dim, rows, 1), threadGroup: (dim, 1, 1),
+            outputShapes: buffers.map(\.shape), outputDTypes: buffers.map(\.dtype))
+        let written: RowKeyBuffers
+        switch keyBuffers {
+        case .raw: written = .raw(out[0])
+        case .affine(_, _, _, let groupSize):
+            written = .affine(weights: out[0], scales: out[1], biases: out[2], groupSize: groupSize)
+        }
+        return (written, out[keyOutputs], out[keyOutputs + 1])
     }
 
     // Flash attention kernel caches
