@@ -35,7 +35,11 @@ public struct DFlash2SpeculativeTokenIterator: TokenIteratorProtocol {
     let target: any DFlash2TargetModel
     let drafter: any DFlash2DrafterModel
 
-    var cache: [KVCache]
+    /// The target's cache. A KV scheme in the parameters converts its
+    /// attention layers when the prompt prefill ends, replacing entries, so a
+    /// caller that keeps the cache reads it back from here.
+    public private(set) var cache: [KVCache]
+    let kvCachePlan: KVCachePlan
     var drafterState: DFlash2DrafterState
 
     var processor: LogitProcessor?
@@ -129,11 +133,22 @@ public struct DFlash2SpeculativeTokenIterator: TokenIteratorProtocol {
         guard target.dflash2SupportsCache(cache) else {
             throw DFlash2SpeculationError.unsupportedCache
         }
+        let kvCachePlan = try parameters.kvCachePlan()
+        // The verify pass writes TurboQuant rows with raw or 8-bit affine
+        // keys; 2-bit values would protect the boundary layers as affine.
+        switch kvCachePlan.configuration?.strategy.storage {
+        case nil, .fullPrecision: break
+        case .turboQuant(let turbo)
+        where [0, 8].contains(turbo.keyPrecision.bitWidth) && turbo.valuePrecision.bitWidth > 2:
+            break
+        default: throw DFlash2SpeculationError.unsupportedCache
+        }
         try components.validate(parameters: parameters)
 
         self.target = target
         self.drafter = drafter
         self.cache = cache
+        self.kvCachePlan = kvCachePlan
         self.drafterState = drafter.makeState()
         self.processor = components.logitProcessor(parameters: parameters)
         self.sampler = parameters.sampler()
@@ -180,6 +195,10 @@ public struct DFlash2SpeculativeTokenIterator: TokenIteratorProtocol {
         var start = prefilledPrefixTokens
         while start < promptLength {
             let remaining = promptLength - start
+            if remaining == 1 {
+                // Prefill ran unquantized; the final position compresses it.
+                kvCachePlan.apply(to: &cache)
+            }
             let end = start + (remaining == 1 ? 1 : Swift.min(stepSize, remaining - 1))
             let chunk = promptTokens[start ..< end].expandedDimensions(axis: 0)
             let result = target.dflash2Prefill(
@@ -319,7 +338,7 @@ public struct DFlash2SpeculativeTokenIterator: TokenIteratorProtocol {
         // 5. Commit.
         let committed = anchorPosition + accepted + 1
         for entry in cache {
-            if let attention = entry as? KVCacheSimple {
+            if let attention = entry as? DFlash2AttentionCache {
                 attention.commitRows(count: committed)
             } else if let recurrent = entry as? MambaCache {
                 recurrent.offset = committed

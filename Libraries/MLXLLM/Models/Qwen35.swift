@@ -1560,13 +1560,11 @@ public class Qwen35TextModelInner: Module {
 
             pendingAttention = []
             if let pre = segment.attentionPreLayer {
-                let kvCache = cache[pre] as! KVCacheSimple
-                let (keys, values) = kvCache.writeRows(
-                    keys: outputs[next + 2], values: outputs[next + 3],
-                    position: request.position, visibleLength: visibleLength)
-                let attention = MLXFast.scaledDotProductAttention(
-                    queries: outputs[next], keys: keys, values: values,
-                    scale: layers[pre].selfAttn!.kernelScale, mask: .array(mask))
+                let kvCache = cache[pre] as! DFlash2AttentionCache
+                let attention = kvCache.dflash2Attention(
+                    queries: outputs[next], keys: outputs[next + 2], values: outputs[next + 3],
+                    position: request.position, visibleLength: visibleLength, mask: mask,
+                    scale: layers[pre].selfAttn!.kernelScale)
                 pendingAttention = [attention, outputs[next + 1]]
             }
         }
@@ -1737,6 +1735,9 @@ extension Qwen35TextModel: DFlash2TargetModel {
             && zip(model.layers, cache).allSatisfy { layer, entry in
                 if layer.isLinear {
                     return entry is MambaCache
+                }
+                if let turbo = entry as? TurboQuantKVCache {
+                    return turbo.supportsPositionedRows
                 }
                 return entry is KVCacheSimple && usesPlainAttentionCacheRoute(entry)
             }

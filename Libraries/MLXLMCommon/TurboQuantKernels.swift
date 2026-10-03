@@ -1739,6 +1739,231 @@ enum TurboQuantMetalKernels {
         output[q * Dim + tid] = out;
         """
 
+    // MARK: - Multi-query verify (raw-K and affine-K with turbo V)
+
+    /// Multi-query attention, pass 1, for a block of query rows at a device-side
+    /// position: speculative verify, and prefill chunks over a compressed cache.
+    /// Shaped like mlx's GQA-packed MMA verify kernel. One threadgroup per
+    /// (KV head, 8-row query chunk, key partition) carries every query head of
+    /// the KV head as an 8-row stripe (`thread_position_in_threadgroup.z`), split
+    /// into two halves of the head dimension (`.y`). Each 32-key block is
+    /// dequantized once into threadgroup memory, keys and then values (in the
+    /// rotated value basis), and every dot product runs on simdgroup MMA.
+    /// Row `r` of chunk `c` sits at `position + 8c + r` and sees keys up to it.
+    private static let verifyPass1Prologue = """
+        constexpr int BK = 32;
+        constexpr int QL = 8;
+        constexpr int H2 = Dim / 2;
+        constexpr int NT = H2 / 8;
+        constexpr uint VAL_LEVELS = 1u << ValueBits;
+        constexpr uint VAL_MASK = VAL_LEVELS - 1u;
+        constexpr float NEG = -3.402823466e+38f;
+
+        const uint N = params[0];
+        const uint s_pad = params[1];
+        const uint parts = params[2];
+        const uint k_stride = params[3];
+        const uint v_stride = params[4];
+        const float scale = fparams[0];
+        const int pos0 = position[0];
+
+        const uint lane = thread_index_in_simdgroup;
+        const uint dhalf = thread_position_in_threadgroup.y;
+        const uint stripe = thread_position_in_threadgroup.z;
+        const uint kvb = threadgroup_position_in_grid.x;
+        const uint chunk = threadgroup_position_in_grid.y;
+        const uint part = threadgroup_position_in_grid.z;
+        const uint qbh = kvb * Rep + stripe;
+        const uint tix = (stripe * 2 + dhalf) * 32 + lane;
+        constexpr uint NTHREADS = Rep * 64;
+
+        threadgroup float sS[2 * Rep * QL * BK];
+        threadgroup T sP[Rep * QL * BK];
+        threadgroup float sFactor[Rep * QL];
+        threadgroup uint4 sKV4[BK * Dim * 2 / 16];
+        threadgroup T* sKV = (threadgroup T*)sKV4;
+        threadgroup float cb[VAL_LEVELS];
+        if (tix < VAL_LEVELS) cb[tix] = val_codebook[tix];
+
+        const uint span = ((N + parts * BK - 1) / (parts * BK)) * BK;
+        const uint p0 = part * span;
+        const uint pEnd = min(p0 + span, N);
+        // A partition wholly past the chunk's last row contributes nothing.
+        const int chunkLast = pos0 + int(chunk * QL + QL - 1);
+        const uint loopEnd = (int(p0) > chunkLast) ? p0 : pEnd;
+
+        simdgroup_matrix<T, 8, 8> Qf[NT];
+        const device T* qBase = q_in + (size_t)(qbh * s_pad + chunk * QL) * Dim;
+        for (int t = 0; t < NT; ++t) {
+            simdgroup_load(Qf[t], qBase, Dim, ulong2(dhalf * H2 + t * 8, 0));
+        }
+
+        // The C-fragment row of this lane's thread_elements, and the row and
+        // column quarter it owns in the scalar softmax.
+        const int fragRow = int(((lane >> 2) & 4) + ((lane >> 1) & 3));
+        const int smRow = int(lane >> 2);
+        const int smCol = int(lane & 3) * (BK / 4);
+        const int rowPos = pos0 + int(chunk * QL) + smRow;
+
+        simdgroup_matrix<float, 8, 8> O[NT];
+        for (int t = 0; t < NT; ++t) O[t] = simdgroup_matrix<float, 8, 8>(0);
+        float mRun = NEG;
+        float lRun = 0.0f;
+
+        threadgroup float* sSMine = sS + (dhalf * Rep + stripe) * (QL * BK);
+        threadgroup float* sSOther = sS + ((1 - dhalf) * Rep + stripe) * (QL * BK);
+        threadgroup T* sPMine = sP + stripe * (QL * BK);
+
+        for (uint n0 = p0; n0 < loopEnd; n0 += BK) {
+
+        """
+
+    private static let verifyStageRawK = """
+            constexpr uint V4R = Dim * 2 / 16;
+            for (uint i = tix; i < BK * V4R; i += NTHREADS) {
+                const uint n = i / V4R;
+                uint4 val = uint4(0);
+                if (n0 + n < N) {
+                    val = ((const device uint4*)(k_raw + ((size_t)kvb * k_stride + n0 + n) * Dim))[i % V4R];
+                }
+                sKV4[i] = val;
+            }
+
+        """
+
+    private static let verifyStageAffineK = """
+            constexpr uint WPR = Dim / 4;
+            constexpr uint GPR = Dim / KGroup;
+            for (uint i = tix; i < BK * WPR; i += NTHREADS) {
+                const uint n = i / WPR;
+                const uint w = i % WPR;
+                threadgroup T* dst = sKV + n * Dim + w * 4;
+                if (n0 + n < N) {
+                    const size_t row = (size_t)kvb * k_stride + n0 + n;
+                    const uint word = k_weights[row * WPR + w];
+                    const uint g = (w * 4) / KGroup;
+                    const float ks = float(k_scales[row * GPR + g]);
+                    const float kb = float(k_biases[row * GPR + g]);
+                    for (uint j = 0; j < 4; j++) dst[j] = T(float((word >> (8 * j)) & 0xFFu) * ks + kb);
+                } else {
+                    for (uint j = 0; j < 4; j++) dst[j] = T(0);
+                }
+            }
+
+        """
+
+    private static let verifyPass1Body = """
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            // Partial scores over this half's dims: S_half[8, BK].
+            simdgroup_matrix<float, 8, 8> Sc[BK / 8];
+            for (int c = 0; c < BK / 8; ++c) Sc[c] = simdgroup_matrix<float, 8, 8>(0);
+            for (int c = 0; c < BK / 8; ++c) {
+                for (int t = 0; t < NT; ++t) {
+                    simdgroup_matrix<T, 8, 8> Kf;
+                    simdgroup_load(Kf, sKV, (ulong)Dim, ulong2(dhalf * H2 + t * 8, c * 8), true);
+                    simdgroup_multiply_accumulate(Sc[c], Qf[t], Kf, Sc[c]);
+                }
+            }
+            for (int c = 0; c < BK / 8; ++c) {
+                simdgroup_store(Sc[c], sSMine, (ulong)BK, ulong2(c * 8, 0));
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            // Online softmax on row smRow, both halves redundantly.
+            float sv[BK / 4];
+            float rowMax = NEG;
+            for (int j = 0; j < BK / 4; ++j) {
+                const int c = smCol + j;
+                const uint kpos = n0 + uint(c);
+                const float s = (sSMine[smRow * BK + c] + sSOther[smRow * BK + c]) * scale;
+                const bool masked = kpos >= pEnd || int(kpos) > rowPos;
+                sv[j] = masked ? NEG : s;
+                rowMax = max(rowMax, sv[j]);
+            }
+            rowMax = max(rowMax, simd_shuffle_xor(rowMax, 1));
+            rowMax = max(rowMax, simd_shuffle_xor(rowMax, 2));
+            const float mNew = max(mRun, rowMax);
+            const float factor = mRun == NEG ? 1.0f : fast::exp(mRun - mNew);
+            float rowSum = 0.0f;
+            for (int j = 0; j < BK / 4; ++j) {
+                const float p = sv[j] == NEG ? 0.0f : fast::exp(sv[j] - mNew);
+                sv[j] = p;
+                rowSum += p;
+            }
+            rowSum += simd_shuffle_xor(rowSum, 1);
+            rowSum += simd_shuffle_xor(rowSum, 2);
+            lRun = lRun * factor + rowSum;
+            mRun = mNew;
+            if (dhalf == 0) {
+                if ((lane & 3) == 0) sFactor[stripe * QL + smRow] = factor;
+                for (int j = 0; j < BK / 4; ++j) sPMine[smRow * BK + smCol + j] = T(sv[j]);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            // Values over the consumed key staging: codebook entry times norm,
+            // in the rotated basis.
+            constexpr uint G8 = Dim / 8;
+            for (uint i = tix; i < BK * G8; i += NTHREADS) {
+                const uint n = i / G8;
+                const uint g = i % G8;
+                threadgroup T* dst = sKV + n * Dim + g * 8;
+                if (n0 + n < N) {
+                    const size_t row = (size_t)kvb * v_stride + n0 + n;
+                    const device uint32_t* vp = val_packed + row * ValuePackedWidth;
+                    const uint bit = g * 8 * ValueBits;
+                    const uint word = bit >> 5;
+                    const uint shift = bit & 31u;
+                    ulong bits = vp[word];
+                    if (shift + 8 * ValueBits > 32) bits |= ((ulong)vp[word + 1]) << 32;
+                    bits >>= shift;
+                    const float nrm = val_norms[row];
+                    for (uint j = 0; j < 8; j++) {
+                        dst[j] = T(cb[(uint)(bits >> (j * ValueBits)) & VAL_MASK] * nrm);
+                    }
+                } else {
+                    for (uint j = 0; j < 8; j++) dst[j] = T(0);
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            const float oFactor = sFactor[stripe * QL + fragRow];
+            simdgroup_matrix<T, 8, 8> Pf[BK / 8];
+            for (int c = 0; c < BK / 8; ++c) {
+                simdgroup_load(Pf[c], sPMine, (ulong)BK, ulong2(c * 8, 0));
+            }
+            for (int t = 0; t < NT; ++t) {
+                O[t].thread_elements()[0] *= oFactor;
+                O[t].thread_elements()[1] *= oFactor;
+                for (int c = 0; c < BK / 8; ++c) {
+                    simdgroup_matrix<T, 8, 8> Vf;
+                    simdgroup_load(Vf, sKV, (ulong)Dim, ulong2(dhalf * H2 + t * 8, c * 8));
+                    simdgroup_multiply_accumulate(O[t], Pf[c], Vf, O[t]);
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        // Unnormalized partials with each row's max and exp-sum, the contract
+        // the GQA decode's pass 2 merges.
+        const size_t row0 = (size_t)qbh * s_pad + chunk * QL;
+        device float* oBase = o_partials + (row0 * parts + part) * Dim;
+        for (int t = 0; t < NT; ++t) {
+            simdgroup_store(O[t], oBase, (ulong)(parts * Dim), ulong2(dhalf * H2 + t * 8, 0));
+        }
+        if (dhalf == 0 && (lane & 3) == 0) {
+            const size_t r = row0 + smRow;
+            m_partials[r * parts + part] = mRun == NEG ? -INFINITY : mRun;
+            l_partials[r * parts + part] = lRun;
+        }
+        """
+
+    static let turboVerifyPass1RawKSource =
+        verifyPass1Prologue + verifyStageRawK + verifyPass1Body
+
+    static let turboVerifyPass1AffineKSource =
+        verifyPass1Prologue + verifyStageAffineK + verifyPass1Body
+
     /// Value aggregation kernel: weighted sum of codebook-quantized values.
     ///
     /// output[d] = Σ_t weights[t] * norm[t] * codebook[val_idx[t,d]]
@@ -2691,6 +2916,132 @@ enum TurboQuantKernelOps {
             outputShapes: [[totalQ, dim]],
             outputDTypes: [.float32]
         )[0]
+    }
+
+    /// Whether the multi-query verify kernel serves this shape: every query
+    /// head of a KV head fits one threadgroup's 32 KB, and the staged K/V use
+    /// the 2-byte activation dtype.
+    static func verifyAttentionSupports(
+        dim: Int, repeatCount: Int, valueBits: Int, keyGroupSize: Int?,
+        queryDType: DType, rawKeyDType: DType?
+    ) -> Bool {
+        guard verifyKernelEnabled, dim == 128 || dim == 256, repeatCount >= 1,
+            (2 ... 4).contains(valueBits), queryDType == .bfloat16 || queryDType == .float16
+        else { return false }
+        if let rawKeyDType, rawKeyDType != queryDType { return false }
+        if let keyGroupSize, keyGroupSize % 4 != 0 || dim % keyGroupSize != 0 { return false }
+        // Per query head: two score halves, the probabilities and the factors.
+        let bytes = repeatCount * (2 * 8 * 32 * 4 + 8 * 32 * 2 + 8 * 4) + 32 * dim * 2 + 64
+        return bytes <= 32 * 1024
+    }
+
+    static let verifyKernelEnabled = ProcessInfo.processInfo.environment["TURBO_VERIFY_MMA"] != "0"
+
+    /// Key partitions for the verify kernel: enough threadgroups to fill the
+    /// GPU at long contexts, few enough that short ones are not mostly merge.
+    static func verifyPartitions(visibleLength: Int, dim: Int) -> Int {
+        min(dim, visibleLength < 2048 ? 32 : 64)
+    }
+
+    /// Multi-query attention over a raw-K or affine-K cache with turbo values.
+    /// Query row `s` sits at `position + s` and sees the cache rows up to it,
+    /// so rows written past the committed offset (a verify pass in flight)
+    /// are visible only to the queries that follow them.
+    ///
+    /// - Parameters:
+    ///   - queries: `[B, nQHeads, S, dim]` in the activation dtype, unscaled.
+    ///   - keys, valPacked, valNorms: whole buffers, `[B * nKVHeads, rows, ...]`.
+    ///   - position: `[1]` int32, possibly lazy: the position of query row 0.
+    ///   - visibleLength: rows the pass may read; at least `position + S`.
+    /// - Returns: `[B, nQHeads, S, dim]` float32 in the original value space.
+    static func turboVerifyAttention(
+        queries: MLXArray, keys: GQAKeys,
+        valPacked: MLXArray, valNorms: MLXArray,
+        valCodebook: MLXArray, valRotation: MLXArray,
+        position: MLXArray, visibleLength: Int, scale: Float,
+        repeatCount: Int, valueBits: Int, dim: Int, partitions: Int? = nil
+    ) -> MLXArray {
+        let B = queries.dim(0)
+        let nQHeads = queries.dim(1)
+        let S = queries.dim(2)
+        let kvRows = B * nQHeads / repeatCount
+        let chunks = (S + 7) / 8
+        let sPad = chunks * 8
+        var q = queries
+        if sPad != S {
+            q = padded(q, widths: [0, 0, IntOrPair((0, sPad - S)), 0])
+        }
+        let totalRows = B * nQHeads * sPad
+        let parts = min(partitions ?? verifyPartitions(visibleLength: visibleLength, dim: dim), dim)
+        let vpw = TurboQuantPacking.packedWidth(count: dim, bits: valueBits)
+
+        let kernel: MLXFast.MLXFastKernel
+        var inputs: [MLXArray] = [q.reshaped([totalRows, dim])]
+        var template: [(String, any KernelTemplateArg)] = [
+            ("T", queries.dtype), ("Dim", dim), ("Rep", repeatCount),
+            ("ValueBits", valueBits), ("ValuePackedWidth", vpw),
+        ]
+        let keyRows: Int
+        switch keys {
+        case .raw(let rawKeys):
+            kernel = gqaKernel(
+                "turbo_verify_p1_rawk_\(dim)_\(repeatCount)_\(valueBits)_\(queries.dtype)",
+                inputNames: [
+                    "q_in", "k_raw", "val_packed", "val_norms", "val_codebook", "position",
+                    "params", "fparams",
+                ],
+                outputNames: ["o_partials", "m_partials", "l_partials"],
+                source: TurboQuantMetalKernels.turboVerifyPass1RawKSource)
+            inputs.append(rawKeys)
+            keyRows = rawKeys.dim(1)
+        case .affine(let weights, let scales, let biases, let groupSize):
+            kernel = gqaKernel(
+                "turbo_verify_p1_affk_\(dim)_\(repeatCount)_\(valueBits)_\(groupSize)_\(queries.dtype)_\(scales.dtype)_\(biases.dtype)",
+                inputNames: [
+                    "q_in", "k_weights", "k_scales", "k_biases", "val_packed", "val_norms",
+                    "val_codebook", "position", "params", "fparams",
+                ],
+                outputNames: ["o_partials", "m_partials", "l_partials"],
+                source: TurboQuantMetalKernels.turboVerifyPass1AffineKSource)
+            inputs += [weights, scales, biases]
+            template.append(("KGroup", groupSize))
+            keyRows = weights.dim(1)
+        }
+        let params = MLXArray(
+            [
+                UInt32(visibleLength), UInt32(sPad), UInt32(parts), UInt32(keyRows),
+                UInt32(valPacked.dim(1)),
+            ] as [UInt32])
+        inputs += [
+            valPacked, f32(valNorms), f32(valCodebook), position.asType(.int32).reshaped([1]),
+            params, MLXArray([scale]),
+        ]
+        let partials = kernel(
+            inputs,
+            template: template,
+            grid: (32 * kvRows, 2 * chunks, repeatCount * parts),
+            threadGroup: (32, 2, repeatCount),
+            outputShapes: [[totalRows * parts, dim], [totalRows, parts], [totalRows, parts]],
+            outputDTypes: [.float32, .float32, .float32]
+        )
+
+        let merge = gqaKernel(
+            "turbo_flash_gqa_p2_\(dim)",
+            inputNames: ["o_partials", "m_partials", "l_partials", "val_rotation", "params"],
+            outputNames: ["output"],
+            source: TurboQuantMetalKernels.turboFlashGQAPass2Source)
+        let merged = merge(
+            [
+                partials[0], partials[1], partials[2], f32(valRotation),
+                MLXArray([UInt32(parts)]),
+            ],
+            template: [("Dim", dim)],
+            grid: (dim, totalRows, 1),
+            threadGroup: (dim, 1, 1),
+            outputShapes: [[totalRows, dim]],
+            outputDTypes: [.float32]
+        )[0].reshaped([B, nQHeads, sPad, dim])
+        return sPad == S ? merged : merged[0..., 0..., ..<S, 0...]
     }
 
     static func turboFlashAttention(

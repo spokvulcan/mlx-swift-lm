@@ -726,6 +726,36 @@ public class TurboQuantKVCache: BaseKVCache {
 
     override public var isTrimmable: Bool { true }
 
+    override public func innerState() -> [MLXArray] {
+        [
+            rawKeys, rawValues, affKeyW, affKeyScales, affKeyBiases, keyPackedMSE, keyNorms,
+            valPackedMSE, valNorms,
+        ].compactMap { $0 }
+    }
+
+    override public func copy() -> any KVCache {
+        let new = TurboQuantKVCache(
+            bits: bits, keyBits: keyBits, valueBits: valueBits, seed: seed,
+            keyGroupSize: keyGroupSize)
+        new.offset = offset
+        new.isCompressed = isCompressed
+        new.keyMSECodec = keyMSECodec
+        new.valueMSECodec = valueMSECodec
+        new.rawKeys = rawKeys?[.ellipsis]
+        new.rawValues = rawValues?[.ellipsis]
+        new.rawAllocSteps = rawAllocSteps
+        new.affKeyW = affKeyW?[.ellipsis]
+        new.affKeyScales = affKeyScales?[.ellipsis]
+        new.affKeyBiases = affKeyBiases?[.ellipsis]
+        new.keyPackedMSE = keyPackedMSE?[.ellipsis]
+        new.keyNorms = keyNorms?[.ellipsis]
+        new.valPackedMSE = valPackedMSE?[.ellipsis]
+        new.valNorms = valNorms?[.ellipsis]
+        new.compressedAllocSteps = compressedAllocSteps
+        new.keyCalibScale = keyCalibScale
+        return new
+    }
+
     // MARK: - Shared Codec Cache
 
     /// Shared codec cache: all layers with the same (dim, bits, seed) reuse the same codec.
@@ -1144,6 +1174,160 @@ public class TurboQuantKVCache: BaseKVCache {
             valPackedMSE![.ellipsis, prev ..< offset, 0...] = valPackedShaped
             valNorms![.ellipsis, prev ..< offset] = valNormsShaped
         }
+        // An empty cache's first call encodes here without compressRawCache.
+        isCompressed = true
+    }
+
+    // MARK: - Rows at a position (speculative verify)
+
+    /// Whether ``verifyAttention(queries:keys:values:position:visibleLength:scale:)``
+    /// serves this cache: raw or 8-bit affine keys.
+    package var supportsPositionedRows: Bool { rawKeyMode || affineKeyMode }
+
+    /// Writes `S` rows at `position` (a `[1]` int32, possibly lazy) without
+    /// moving `offset`, then attends: query row `i` sees the first
+    /// `visibleLength` rows up to `position + i`. Rows past the committed
+    /// offset are scratch that a later write at a smaller position overwrites,
+    /// so growth keeps every row. Commit with ``commitRows(count:)``.
+    package func verifyAttention(
+        queries: MLXArray, keys newKeys: MLXArray, values newValues: MLXArray,
+        position: MLXArray, visibleLength: Int, scale: Float
+    ) -> MLXArray {
+        writeRows(
+            keys: newKeys, values: newValues, position: position, visibleLength: visibleLength)
+        return attendRows(
+            queries: queries, position: position, visibleLength: visibleLength, scale: scale)
+    }
+
+    /// The cache now holds `count` positions.
+    package func commitRows(count: Int) {
+        offset = count
+    }
+
+    private func writeRows(
+        keys newKeys: MLXArray, values newValues: MLXArray, position: MLXArray, visibleLength: Int
+    ) {
+        precondition(supportsPositionedRows, "positioned rows need raw or 8-bit affine keys")
+        if !isCompressed { compressRawCache() }
+        let headDim = newKeys.dim(-1)
+        ensureCodecs(headDim: headDim)
+        let B = newKeys.dim(0)
+        let H = newKeys.dim(1)
+        let S = newKeys.dim(2)
+        let (packed, norms) = fusedEncodeDispatch(
+            input: newValues.reshaped([B * H * S, headDim]), codec: valueMSECodec!,
+            headDim: headDim)
+        let start = position.asType(.int32).reshaped([1])
+        let capacity = (visibleLength + step - 1) / step * step
+
+        func write(_ buffer: MLXArray?, _ rows: MLXArray) -> MLXArray {
+            var grown = buffer
+            if (buffer?.dim(2) ?? 0) < visibleLength {
+                var shape = rows.shape
+                shape[2] = capacity - (buffer?.dim(2) ?? 0)
+                let zeros = MLXArray.zeros(shape, dtype: buffer?.dtype ?? rows.dtype)
+                grown = buffer.map { concatenated([$0, zeros], axis: 2) } ?? zeros
+            }
+            return dynamicSliceUpdated(grown!, update: rows, start: start, axes: [2])
+        }
+
+        if affineKeyMode {
+            resolveAffineKeyGroupSize(headDim: headDim)
+            let quantK = quantized(newKeys, groupSize: keyGroupSize, bits: 8)
+            let biases =
+                quantK.biases ?? MLXArray.zeros(quantK.scales.shape, dtype: quantK.scales.dtype)
+            affKeyW = write(affKeyW, quantK.wq)
+            affKeyScales = write(affKeyScales, quantK.scales)
+            affKeyBiases = write(affKeyBiases, biases)
+        } else {
+            rawKeys = write(rawKeys, newKeys)
+            rawAllocSteps = rawKeys!.dim(2)
+        }
+        valPackedMSE = write(valPackedMSE, packed.reshaped([B, H, S, -1]))
+        valNorms = write(valNorms, norms.reshaped([B, H, S]))
+        compressedAllocSteps = valPackedMSE!.dim(2)
+        isCompressed = true
+    }
+
+    /// Attention of a block of query rows over the first `visibleLength` rows,
+    /// row `i` sitting at `position + i`.
+    private func attendRows(
+        queries: MLXArray, position: MLXArray, visibleLength: Int, scale: Float
+    ) -> MLXArray {
+        let B = queries.dim(0)
+        let headDim = queries.dim(-1)
+        let codec = valueMSECodec!
+        let vp = valPackedMSE!
+        let vn = valNorms!
+        let nKVHeads = vp.dim(1)
+        let repeatCount = queries.dim(1) / nKVHeads
+        guard verifyKernelServes(queries) else {
+            return referenceAttention(
+                queries: queries, position: position, visibleLength: visibleLength, scale: scale)
+        }
+        let keys: TurboQuantKernelOps.GQAKeys
+        if affineKeyMode {
+            let kw = affKeyW!
+            keys = .affine(
+                weights: kw.reshaped([B * nKVHeads, kw.dim(2), -1]),
+                scales: affKeyScales!.reshaped([B * nKVHeads, kw.dim(2), -1]),
+                biases: affKeyBiases!.reshaped([B * nKVHeads, kw.dim(2), -1]),
+                groupSize: keyGroupSize)
+        } else {
+            let rk = rawKeys!
+            keys = .raw(rk.reshaped([B * nKVHeads, rk.dim(2), headDim]))
+        }
+        return TurboQuantKernelOps.turboVerifyAttention(
+            queries: queries, keys: keys,
+            valPacked: vp.reshaped([B * nKVHeads, vp.dim(2), -1]),
+            valNorms: vn.reshaped([B * nKVHeads, vn.dim(2)]),
+            valCodebook: codec.codebook, valRotation: codec.rotation,
+            position: position, visibleLength: visibleLength, scale: scale,
+            repeatCount: repeatCount, valueBits: valueBits, dim: headDim
+        ).asType(queries.dtype)
+    }
+
+    private func verifyKernelServes(_ queries: MLXArray) -> Bool {
+        guard let vp = valPackedMSE else { return false }
+        return TurboQuantKernelOps.verifyAttentionSupports(
+            dim: queries.dim(-1), repeatCount: queries.dim(1) / vp.dim(1), valueBits: valueBits,
+            keyGroupSize: affineKeyMode ? keyGroupSize : nil, queryDType: queries.dtype,
+            rawKeyDType: rawKeyMode ? rawKeys?.dtype : nil)
+    }
+
+    /// Dequantizes the first `visibleLength` rows and runs SDPA under the
+    /// position mask: the fallback for shapes the kernel does not serve.
+    package func referenceAttention(
+        queries: MLXArray, position: MLXArray, visibleLength: Int, scale: Float
+    ) -> MLXArray {
+        let (keys, values) = dequantizedRows(visibleLength)
+        let columns = MLXArray(Int32(0) ..< Int32(visibleLength)).expandedDimensions(axis: 0)
+        let rows = (position.asType(.int32) + MLXArray(Int32(0) ..< Int32(queries.dim(2))))
+            .expandedDimensions(axis: 1)
+        return MLXFast.scaledDotProductAttention(
+            queries: queries, keys: keys.asType(queries.dtype),
+            values: values.asType(queries.dtype), scale: scale, mask: .array(columns .< (rows + 1)))
+    }
+
+    /// The first `rows` keys and values in the original basis, float32.
+    package func dequantizedRows(_ rows: Int) -> (keys: MLXArray, values: MLXArray) {
+        precondition(isCompressed && supportsPositionedRows)
+        let keys: MLXArray
+        if affineKeyMode {
+            keys = dequantized(
+                affKeyW![.ellipsis, ..<rows, 0...], scales: affKeyScales![.ellipsis, ..<rows, 0...],
+                biases: affKeyBiases![.ellipsis, ..<rows, 0...], groupSize: keyGroupSize, bits: 8
+            ).asType(.float32)
+        } else {
+            keys = rawKeys![.ellipsis, ..<rows, 0...].asType(.float32)
+        }
+        let codec = valueMSECodec!
+        let values = codec.decode(
+            MSECodecState(
+                norms: valNorms![.ellipsis, ..<rows],
+                packedIndices: valPackedMSE![.ellipsis, ..<rows, 0...],
+                tokenCount: rows, dim: codec.dim, bits: valueBits))
+        return (keys, values)
     }
 
     /// Compressed-domain attention via Metal kernels.
@@ -1274,6 +1458,14 @@ public class TurboQuantKVCache: BaseKVCache {
                 }
                 let out = rotated.reshaped([B, nQHeads, 1, headDim])
                 return out.dtype == queries.dtype ? out : out.asType(queries.dtype)
+            }
+
+            // A causal block (a prefill chunk over the compressed cache) is the
+            // verify shape at the host-known position of its first row.
+            if case .causal = mask, verifyKernelServes(queries) {
+                return attendRows(
+                    queries: queries, position: MLXArray([Int32(tokenCount - L)]),
+                    visibleLength: tokenCount, scale: scale)
             }
 
             var scores: MLXArray
@@ -1512,7 +1704,7 @@ public class TurboQuantKVCache: BaseKVCache {
                         kw[0..., 0..., ..<offset, 0...],
                         ks[0..., 0..., ..<offset, 0...],
                         kb[0..., 0..., ..<offset, 0...],
-                        vpm[0..., 0..., ..<offset, 0...], vn[0..., 0..., ..<offset],
+                        vpm[0..., 0..., ..<offset, 0...], Self.rowState(vn, offset),
                     ]
                 } else if rawKeyMode {
                     // Raw-K mode compressed: [rawKeys, valPacked, valNorms]
@@ -1522,7 +1714,7 @@ public class TurboQuantKVCache: BaseKVCache {
                     else { return [] }
                     return [
                         rk[0..., 0..., ..<offset, 0...],
-                        vpm[0..., 0..., ..<offset, 0...], vn[0..., 0..., ..<offset],
+                        vpm[0..., 0..., ..<offset, 0...], Self.rowState(vn, offset),
                     ]
                 } else {
                     // Standard compressed: [keyPacked, keyNorms, valPacked, valNorms]
@@ -1532,8 +1724,8 @@ public class TurboQuantKVCache: BaseKVCache {
                         offset > 0
                     else { return [] }
                     var arrays = [
-                        kpm[0..., 0..., ..<offset, 0...], kn[0..., 0..., ..<offset],
-                        vpm[0..., 0..., ..<offset, 0...], vn[0..., 0..., ..<offset],
+                        kpm[0..., 0..., ..<offset, 0...], Self.rowState(kn, offset),
+                        vpm[0..., 0..., ..<offset, 0...], Self.rowState(vn, offset),
                     ]
                     if let keyCalibScale {
                         arrays.append(keyCalibScale)
@@ -1552,7 +1744,7 @@ public class TurboQuantKVCache: BaseKVCache {
                 affKeyScales = newValue[1]
                 affKeyBiases = newValue[2]
                 valPackedMSE = newValue[3]
-                valNorms = newValue[4]
+                valNorms = Self.rowStorage(newValue[4])
                 offset = newValue[0].dim(2)
                 compressedAllocSteps = offset
                 isCompressed = true
@@ -1561,7 +1753,7 @@ public class TurboQuantKVCache: BaseKVCache {
                 rawKeys = newValue[0]
                 rawAllocSteps = newValue[0].dim(2)
                 valPackedMSE = newValue[1]
-                valNorms = newValue[2]
+                valNorms = Self.rowStorage(newValue[2])
                 offset = newValue[0].dim(2)
                 compressedAllocSteps = newValue[1].dim(2)
                 isCompressed = true
@@ -1569,9 +1761,9 @@ public class TurboQuantKVCache: BaseKVCache {
                 // Standard compressed state with key calibration:
                 // [keyPacked, keyNorms, valPacked, valNorms, keyCalibScale]
                 keyPackedMSE = newValue[0]
-                keyNorms = newValue[1]
+                keyNorms = Self.rowStorage(newValue[1])
                 valPackedMSE = newValue[2]
-                valNorms = newValue[3]
+                valNorms = Self.rowStorage(newValue[3])
                 keyCalibScale = newValue[4]
                 offset = newValue[0].dim(2)
                 compressedAllocSteps = offset
@@ -1579,9 +1771,9 @@ public class TurboQuantKVCache: BaseKVCache {
             } else if newValue.count == 4 {
                 // Standard compressed state: [keyPacked, keyNorms, valPacked, valNorms]
                 keyPackedMSE = newValue[0]
-                keyNorms = newValue[1]
+                keyNorms = Self.rowStorage(newValue[1])
                 valPackedMSE = newValue[2]
-                valNorms = newValue[3]
+                valNorms = Self.rowStorage(newValue[3])
                 offset = newValue[0].dim(2)
                 compressedAllocSteps = offset
                 isCompressed = true
@@ -1596,15 +1788,32 @@ public class TurboQuantKVCache: BaseKVCache {
         }
     }
 
+    /// Per-row norms in state carry a trailing unit axis, so every
+    /// token-indexed state array is `[B, H, T, n]` and slices on axis -2.
+    private static func rowState(_ norms: MLXArray, _ rows: Int) -> MLXArray {
+        norms[0..., 0..., ..<rows].expandedDimensions(axis: -1)
+    }
+
+    /// Accepts norms with or without the trailing axis (older prompt caches).
+    private static func rowStorage(_ norms: MLXArray) -> MLXArray {
+        norms.ndim == 4 ? norms.squeezed(axis: -1) : norms
+    }
+
     override public var metaState: [String] {
         get {
-            ["\(offset)", "\(bits)", "\(keyBits)", "\(valueBits)", "\(seed)"]
+            [
+                "\(offset)", "\(bits)", "\(keyBits)", "\(valueBits)", "\(seed)",
+                "\(keyGroupSize)",
+            ]
         }
         set {
             guard newValue.count >= 5,
                 let o = Int(newValue[0])
             else { return }
             offset = o
+            if newValue.count >= 6, let groupSize = Int(newValue[5]) {
+                keyGroupSize = groupSize
+            }
         }
     }
 

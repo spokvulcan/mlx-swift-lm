@@ -2610,6 +2610,270 @@ final class TurboQuantGQAFlashTests: XCTestCase {
     }
 }
 
+// MARK: - Positioned rows and multi-query verify
+
+/// Rows written at a device-side position past the committed offset, and the
+/// multi-query MMA kernel that attends over them, against dequantize + SDPA.
+final class TurboQuantVerifyTests: XCTestCase {
+    private let kvHeads = 4
+    private let queryHeads = 24
+    private let dim = 256
+    private let scale = Float(1) / Float(256).squareRoot()
+
+    private func makeCache(keyBits: Int, rows: Int, seed: UInt64) -> TurboQuantKVCache {
+        let cache = TurboQuantKVCache(bits: 4, keyBits: keyBits, valueBits: 4)
+        if rows > 0 {
+            let (k, v) = withRandomState(MLXRandom.RandomState(seed: seed)) {
+                (
+                    MLXRandom.normal([1, kvHeads, rows, dim]).asType(.bfloat16),
+                    MLXRandom.normal([1, kvHeads, rows, dim]).asType(.bfloat16)
+                )
+            }
+            _ = cache.update(keys: k, values: v)
+        }
+        return cache
+    }
+
+    private func block(_ rows: Int, seed: UInt64) -> (q: MLXArray, k: MLXArray, v: MLXArray) {
+        withRandomState(MLXRandom.RandomState(seed: seed)) {
+            (
+                MLXRandom.normal([1, queryHeads, rows, dim]).asType(.bfloat16),
+                MLXRandom.normal([1, kvHeads, rows, dim]).asType(.bfloat16),
+                MLXRandom.normal([1, kvHeads, rows, dim]).asType(.bfloat16)
+            )
+        }
+    }
+
+    /// Max abs error relative to the reference's max magnitude.
+    private func relativeError(_ a: MLXArray, _ b: MLXArray) -> Float {
+        let a = a.asType(.float32)
+        let b = b.asType(.float32)
+        return (abs(a - b).max() / maximum(abs(b).max(), MLXArray(Float(1e-6)))).item(Float.self)
+    }
+
+    func testVerifyKernelMatchesDequantizedReference() throws {
+        for keyBits in [0, 8] {
+            for (rows, s) in [(1, 8), (31, 8), (32, 8), (33, 5), (200, 8), (1000, 13), (4100, 8)] {
+                let cache = makeCache(keyBits: keyBits, rows: rows, seed: UInt64(rows))
+                let (q, k, v) = block(s, seed: UInt64(rows + 7))
+                // A lazy position, and three rows of slack past the block.
+                let position = MLXArray(Int32(rows - 1)) + MLXArray(Int32(1))
+                let visible = rows + s + 3
+                let out = cache.verifyAttention(
+                    queries: q, keys: k, values: v, position: position, visibleLength: visible,
+                    scale: scale)
+                let reference = cache.referenceAttention(
+                    queries: q.asType(.float32), position: position, visibleLength: visible,
+                    scale: scale)
+                XCTAssertEqual(out.shape, [1, queryHeads, s, dim])
+                XCTAssertEqual(out.dtype, .bfloat16)
+                XCTAssertEqual(cache.offset, rows, "a positioned write leaves the offset")
+                let error = relativeError(out, reference)
+                XCTAssertLessThan(error, 2e-2, "keyBits \(keyBits) rows \(rows) S \(s)")
+            }
+        }
+    }
+
+    /// A pass sees the rows an earlier, uncommitted pass wrote before its own
+    /// position, and never the ones after its rows.
+    func testScratchRowsAreVisibleOnlyBelowEachRow() throws {
+        for keyBits in [0, 8] {
+            let rows = 300
+            let a = makeCache(keyBits: keyBits, rows: rows, seed: 3)
+            let b = makeCache(keyBits: keyBits, rows: rows, seed: 3)
+            let first = block(8, seed: 4)
+            let second = block(8, seed: 5)
+            // a: two rounds in flight; the first commits three rows.
+            _ = a.verifyAttention(
+                queries: first.q, keys: first.k, values: first.v,
+                position: MLXArray(Int32(rows)), visibleLength: rows + 8, scale: scale)
+            a.commitRows(count: rows + 3)
+            let outA = a.verifyAttention(
+                queries: second.q, keys: second.k, values: second.v,
+                position: MLXArray(Int32(rows + 3)), visibleLength: rows + 11, scale: scale)
+            // b: only the three accepted rows, then the same second round.
+            _ = b.verifyAttention(
+                queries: first.q[0..., 0..., ..<3, 0...], keys: first.k[0..., 0..., ..<3, 0...],
+                values: first.v[0..., 0..., ..<3, 0...],
+                position: MLXArray(Int32(rows)), visibleLength: rows + 3, scale: scale)
+            b.commitRows(count: rows + 3)
+            let outB = b.verifyAttention(
+                queries: second.q, keys: second.k, values: second.v,
+                position: MLXArray(Int32(rows + 3)), visibleLength: rows + 11, scale: scale)
+            XCTAssertEqual(
+                (outA.asType(.float32) - outB.asType(.float32)).abs().max().item(Float.self), 0,
+                "keyBits \(keyBits)")
+        }
+    }
+
+    /// Growth past the allocation keeps rows written past the offset.
+    func testGrowthKeepsRowsPastTheOffset() throws {
+        for keyBits in [0, 8] {
+            let cache = makeCache(keyBits: keyBits, rows: 250, seed: 9)
+            let first = block(4, seed: 10)
+            _ = cache.verifyAttention(
+                queries: first.q, keys: first.k, values: first.v,
+                position: MLXArray(Int32(250)), visibleLength: 254, scale: scale)
+            // In flight: rows 250 ..< 254 are written, nothing is committed.
+            let second = block(8, seed: 11)
+            _ = cache.verifyAttention(
+                queries: second.q, keys: second.k, values: second.v,
+                position: MLXArray(Int32(254)), visibleLength: 262, scale: scale)
+            cache.commitRows(count: 262)
+            let (keys, _) = cache.dequantizedRows(262)
+            let written = keys[0..., 0..., 250 ..< 254, 0...]
+            let error = relativeError(written, first.k)
+            XCTAssertLessThan(error, 2e-2, "keyBits \(keyBits)")
+        }
+    }
+
+    /// A causal prefill chunk over a compressed cache takes the kernel.
+    func testCausalChunkOverCompressedCacheMatchesReference() throws {
+        for keyBits in [0, 8] {
+            let cache = makeCache(keyBits: keyBits, rows: 700, seed: 21)
+            let one = block(1, seed: 22)
+            _ = cache.compressedAttention(
+                queries: one.q, keys: one.k, values: one.v, scale: scale, mask: .none)
+            XCTAssertTrue(cache.isCompressed)
+            let chunk = block(37, seed: 23)
+            let out = cache.compressedAttention(
+                queries: chunk.q, keys: chunk.k, values: chunk.v, scale: scale, mask: .causal)
+            XCTAssertEqual(cache.offset, 738)
+            let reference = cache.referenceAttention(
+                queries: chunk.q.asType(.float32), position: MLXArray(Int32(701)),
+                visibleLength: 738, scale: scale)
+            XCTAssertLessThan(relativeError(out, reference), 2e-2, "keyBits \(keyBits)")
+        }
+    }
+
+    func testStateSlicesOnTheTokenAxisAndRoundTrips() throws {
+        for keyBits in [0, 8] {
+            let cache = makeCache(keyBits: keyBits, rows: 100, seed: 31)
+            let one = block(1, seed: 32)
+            _ = cache.compressedAttention(
+                queries: one.q, keys: one.k, values: one.v, scale: scale, mask: .none)
+            let state = cache.state
+            XCTAssertEqual(state.count, keyBits == 8 ? 5 : 3)
+            for array in state {
+                XCTAssertEqual(array.ndim, 4)
+                XCTAssertEqual(array.dim(-2), 101)
+            }
+            XCTAssertEqual(cache.metaState.count, 6)
+
+            let restored = TurboQuantKVCache(bits: 4, keyBits: keyBits, valueBits: 4)
+            restored.state = state
+            restored.metaState = cache.metaState
+            XCTAssertEqual(restored.offset, 101)
+            XCTAssertEqual(restored.keyGroupSize, cache.keyGroupSize)
+            // Older prompt caches stored norms without the trailing axis.
+            let legacy = TurboQuantKVCache(bits: 4, keyBits: keyBits, valueBits: 4)
+            legacy.state = state.dropLast() + [state.last!.squeezed(axis: -1)]
+            let next = block(8, seed: 33)
+            var outputs: [MLXArray] = []
+            for c in [cache, restored, legacy] {
+                outputs.append(
+                    c.verifyAttention(
+                        queries: next.q, keys: next.k, values: next.v,
+                        position: MLXArray(Int32(101)), visibleLength: 109, scale: scale))
+            }
+            XCTAssertEqual(abs(outputs[0] - outputs[1]).max().item(Float.self), 0)
+            XCTAssertEqual(abs(outputs[0] - outputs[2]).max().item(Float.self), 0)
+        }
+    }
+
+    func testCopyIsIndependent() throws {
+        let cache = makeCache(keyBits: 8, rows: 64, seed: 41)
+        let one = block(1, seed: 42)
+        _ = cache.compressedAttention(
+            queries: one.q, keys: one.k, values: one.v, scale: scale, mask: .none)
+        let before = cache.dequantizedRows(65).keys
+        let copy = cache.copy() as! TurboQuantKVCache
+        XCTAssertFalse(cache.innerState().isEmpty)
+        let more = block(8, seed: 43)
+        _ = copy.verifyAttention(
+            queries: more.q, keys: more.k, values: more.v, position: MLXArray(Int32(60)),
+            visibleLength: 68, scale: scale)
+        copy.commitRows(count: 68)
+        XCTAssertEqual(cache.offset, 65)
+        XCTAssertEqual(
+            abs(cache.dequantizedRows(65).keys - before).max().item(Float.self), 0)
+        XCTAssertGreaterThan(
+            abs(copy.dequantizedRows(65).keys - before).max().item(Float.self), 0)
+    }
+
+    /// Qwen 3.5's verify pass writes and reads TurboQuant layers through the
+    /// kernel and tracks the same pass over the unquantized cache.
+    func testQwen35DFlash2VerifyOverTurboQuantTracksThePlainCache() throws {
+        let configuration = try JSONDecoder().decode(
+            Qwen35TextConfiguration.self, from: Data(Self.tinyQwen35.utf8))
+        let model = withRandomState(MLXRandom.RandomState(seed: 29)) {
+            Qwen35TextModel(configuration)
+        }
+        try model.update(
+            parameters: model.parameters().mapValues { $0.asType(.bfloat16) }, verify: [])
+        for keyBits in [0, 8] {
+            var cache = try model.newCache(parameters: nil)
+            let prompt = MLXArray((0 ..< 300).map { Int32($0 % 97) }).reshaped(1, 300)
+            eval(model(prompt, cache: cache))
+            let plain = cache.map { $0.copy() }
+            _ = try applyKVCacheConfiguration(
+                cache: &cache,
+                configuration: KVCacheConfiguration(
+                    strategy: .turboQuant(
+                        try TurboQuantKVCacheConfiguration(
+                            keyPrecision: keyBits == 8 ? .affineEightBit : .fp16,
+                            valuePrecision: .fourBit)),
+                    compatibility: .requireAllLayers))
+            XCTAssertTrue(model.dflash2SupportsCache(cache))
+            let step = MLXArray([Int32(5)]).reshaped(1, 1)
+            eval(model(step, cache: cache), model(step, cache: plain))
+
+            let request = DFlash2VerifyRequest(
+                tokens: MLXArray((0 ..< 8).map { Int32($0 * 7 % 97) }).reshaped(1, 8),
+                position: MLXArray([Int32(301)]), positionUpperBound: 303, captureLayers: [1, 2])
+            let turbo = model.dflash2Verify(request, cache: cache)
+            let reference = model.dflash2Verify(request, cache: plain)
+            eval(turbo.logits, reference.logits)
+            XCTAssertEqual(cache.map(\.offset), plain.map(\.offset))
+            for row in 0 ..< 8 {
+                let a = turbo.logits[0, row].asType(.float32)
+                let r = reference.logits[0, row].asType(.float32)
+                let cos = ((a * r).sum() / (sqrt((a * a).sum()) * sqrt((r * r).sum()) + 1e-9))
+                    .item(Float.self)
+                XCTAssertGreaterThan(cos, 0.95, "keyBits \(keyBits) row \(row): cos \(cos)")
+            }
+        }
+        let standard = TurboQuantKVCache(bits: 4)
+        var cache = try model.newCache(parameters: nil)
+        cache[1] = standard
+        XCTAssertFalse(model.dflash2SupportsCache(cache), "4-bit keys have no positioned rows")
+    }
+
+    static let tinyQwen35 = """
+        {
+            "model_type": "qwen3_5",
+            "hidden_size": 64, "num_hidden_layers": 4, "intermediate_size": 128,
+            "num_attention_heads": 2, "num_key_value_heads": 1, "head_dim": 128,
+            "linear_num_value_heads": 2, "linear_num_key_heads": 1,
+            "linear_key_head_dim": 16, "linear_value_head_dim": 16,
+            "linear_conv_kernel_dim": 4, "vocab_size": 128,
+            "full_attention_interval": 2,
+            "num_experts": 0, "num_experts_per_tok": 0,
+            "moe_intermediate_size": 16, "shared_expert_intermediate_size": 16
+        }
+        """
+
+    /// The first call on an empty cache compresses as it encodes.
+    func testFirstEncodeOnAnEmptyCacheMarksItCompressed() throws {
+        let cache = makeCache(keyBits: 0, rows: 0, seed: 0)
+        let one = block(1, seed: 51)
+        _ = cache.compressedAttention(
+            queries: one.q, keys: one.k, values: one.v, scale: scale, mask: .none)
+        XCTAssertTrue(cache.isCompressed)
+        XCTAssertEqual(cache.state.count, 3)
+    }
+}
+
 // MARK: - Decode microbenchmark (opt-in)
 
 /// One attention layer's decode step at the Qwen3.8-27B shape, TurboQuant
@@ -2721,6 +2985,70 @@ final class TurboQuantDecodeMicrobench: XCTestCase {
                         }
                     }
                 }
+            }
+        }
+    }
+
+    /// One DFlash2 verify pass's attention (an 8-row block at the end of the
+    /// context, under the position mask): bf16 SDPA over the plain cache
+    /// against the TurboQuant kernel and its dequantize + SDPA reference.
+    func testVerifyAttention() {
+        let s = 8
+        let scale = 1 / Float(dim).squareRoot()
+        for tokens in contexts {
+            let rows = ((tokens + s + 255) / 256) * 256
+            let q = (MLXRandom.normal([1, queryHeads, s, dim]) * 0.1).asType(.bfloat16)
+            let keys = (MLXRandom.normal([1, kvHeads, rows, dim]) * 0.5).asType(.bfloat16)
+            let values = (MLXRandom.normal([1, kvHeads, rows, dim]) * 0.5).asType(.bfloat16)
+            let visible = tokens + s
+            let columns = MLXArray(Int32(0) ..< Int32(visible)).expandedDimensions(axis: 0)
+            let positions = (MLXArray(Int32(tokens)) + MLXArray(Int32(0) ..< Int32(s)))
+                .expandedDimensions(axis: 1)
+            let mask = columns .< (positions + 1)
+            eval(q, keys, values, mask)
+            let sdpa = time("verify T=\(tokens) bf16 SDPA", iterations: 10) {
+                (0 ..< layers).map { _ in
+                    MLXFast.scaledDotProductAttention(
+                        queries: q, keys: keys[.ellipsis, ..<visible, 0...],
+                        values: values[.ellipsis, ..<visible, 0...], scale: scale,
+                        mask: .array(mask))
+                }
+            }
+            for keyBits in [8, 0] {
+                let caches = (0 ..< layers).map { _ -> TurboQuantKVCache in
+                    let c = TurboQuantKVCache(bits: 4, keyBits: keyBits, valueBits: 4)
+                    _ = c.update(
+                        keys: keys[.ellipsis, ..<tokens, 0...],
+                        values: values[.ellipsis, ..<tokens, 0...])
+                    return c
+                }
+                let newK = keys[.ellipsis, tokens ..< visible, 0...]
+                let newV = values[.ellipsis, tokens ..< visible, 0...]
+                let position = MLXArray(Int32(tokens))
+                eval(
+                    caches.map {
+                        $0.verifyAttention(
+                            queries: q, keys: newK, values: newV, position: position,
+                            visibleLength: visible, scale: scale)
+                    })
+                let kernel = time("verify T=\(tokens) turbo\(keyBits)v4 kernel", iterations: 10) {
+                    caches.map {
+                        $0.verifyAttention(
+                            queries: q, keys: newK, values: newV, position: position,
+                            visibleLength: visible, scale: scale)
+                    }
+                }
+                let reference = time(
+                    "verify T=\(tokens) turbo\(keyBits)v4 dequantize + SDPA", iterations: 3
+                ) {
+                    caches.map {
+                        $0.referenceAttention(
+                            queries: q, position: position, visibleLength: visible, scale: scale)
+                    }
+                }
+                print(
+                    "[DECODE-BENCH] verify T=\(tokens) turbo\(keyBits)v4: kernel \(String(format: "%.2f", kernel / sdpa))x SDPA, reference \(String(format: "%.2f", reference / sdpa))x"
+                )
             }
         }
     }

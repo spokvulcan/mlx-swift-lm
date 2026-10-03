@@ -154,7 +154,7 @@ public protocol DFlash2TargetModel: LanguageModel {
     /// LM head the drafter borrows; nil when tied to the embedding.
     var dflash2Head: Linear? { get }
 
-    /// Whether the verify pass can drive this cache: plain `KVCacheSimple`
+    /// Whether the verify pass can drive this cache: ``DFlash2AttentionCache``
     /// attention entries and `MambaCache` recurrent entries.
     func dflash2SupportsCache(_ cache: [KVCache]) -> Bool
 
@@ -264,6 +264,43 @@ public struct GatedDeltaCapture {
 }
 
 // MARK: - Attention cache rows
+
+/// An attention cache the verify pass drives. A pass writes its `S` rows at
+/// `position` (a `[1]` int32, possibly lazy) without moving `offset` and
+/// attends over the first `visibleLength` rows, row `i` seeing columns up to
+/// `position + i` (`mask`, `[S, visibleLength]` bool). The iterator then
+/// commits the accepted prefix with ``commitRows(count:)``.
+package protocol DFlash2AttentionCache: KVCache {
+    func dflash2Attention(
+        queries: MLXArray, keys: MLXArray, values: MLXArray, position: MLXArray,
+        visibleLength: Int, mask: MLXArray, scale: Float
+    ) -> MLXArray
+
+    func commitRows(count: Int)
+}
+
+extension KVCacheSimple: DFlash2AttentionCache {
+    package func dflash2Attention(
+        queries: MLXArray, keys newKeys: MLXArray, values newValues: MLXArray,
+        position: MLXArray, visibleLength: Int, mask: MLXArray, scale: Float
+    ) -> MLXArray {
+        let (keys, values) = writeRows(
+            keys: newKeys, values: newValues, position: position, visibleLength: visibleLength)
+        return MLXFast.scaledDotProductAttention(
+            queries: queries, keys: keys, values: values, scale: scale, mask: .array(mask))
+    }
+}
+
+extension TurboQuantKVCache: DFlash2AttentionCache {
+    package func dflash2Attention(
+        queries: MLXArray, keys newKeys: MLXArray, values newValues: MLXArray,
+        position: MLXArray, visibleLength: Int, mask: MLXArray, scale: Float
+    ) -> MLXArray {
+        verifyAttention(
+            queries: queries, keys: newKeys, values: newValues, position: position,
+            visibleLength: visibleLength, scale: scale)
+    }
+}
 
 extension KVCacheSimple {
     /// Write `S` rows at `position` (a `[1]` int32 array, possibly lazy)

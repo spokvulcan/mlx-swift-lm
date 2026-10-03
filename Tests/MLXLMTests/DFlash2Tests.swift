@@ -672,6 +672,79 @@ func testDFlash2IteratorFinalizeRewindsUndrainedDrafts() throws {
     #expect(try run(draining: 4) == (6, 6))
 }
 
+/// The iterator drives a Qwen 3.5 target whose attention layers are
+/// TurboQuant: rounds write at lazy positions, commits move every layer's
+/// offset, and finalize rewinds them together.
+@Test(.serialized, arguments: [0, 8])
+func testDFlash2IteratorOverTurboQuantCache(keyBits: Int) throws {
+    let configuration = try JSONDecoder().decode(
+        Qwen35TextConfiguration.self, from: Data(TurboQuantVerifyTests.tinyQwen35.utf8))
+    let model = withRandomState(MLXRandom.RandomState(seed: 29)) {
+        Qwen35TextModel(configuration)
+    }
+    try model.update(parameters: model.parameters().mapValues { $0.asType(.bfloat16) }, verify: [])
+    let prompt = MLXArray((0 ..< 200).map { Int32($0 % 97) })
+    var parameters = GenerateParameters(maxTokens: 30)
+    parameters.temperature = 0
+
+    func run(turbo: Bool) throws -> (tokens: [Int], cache: [KVCache]) {
+        var cache = try model.newCache(parameters: nil)
+        eval(model(prompt[..<199].reshaped(1, 199), cache: cache))
+        if turbo {
+            _ = try applyKVCacheConfiguration(
+                cache: &cache,
+                configuration: KVCacheConfiguration(
+                    strategy: .turboQuant(
+                        try TurboQuantKVCacheConfiguration(
+                            keyPrecision: keyBits == 8 ? .affineEightBit : .fp16,
+                            valuePrecision: .fourBit)),
+                    compatibility: .requireAllLayers))
+        }
+        var iterator = try DFlash2SpeculativeTokenIterator(
+            input: LMInput(tokens: prompt), mainModel: model,
+            drafter: MockDrafter(missEvery: 3), mainCache: cache, prefilledPrefixTokens: 199,
+            parameters: parameters)
+        var tokens: [Int] = []
+        while let token = iterator.next() { tokens.append(token) }
+        iterator.finalizeGeneration()
+        return (tokens, cache)
+    }
+
+    let plain = try run(turbo: false)
+    let turbo = try run(turbo: true)
+    // The same scheme as a parameter: the iterator converts after its
+    // prefill and hands back the converted cache.
+    var schemeParameters = parameters
+    schemeParameters.kvScheme = keyBits == 8 ? "turbo8v4" : "turbo0v4"
+    let cache = try model.newCache(parameters: nil)
+    eval(model(prompt[..<199].reshaped(1, 199), cache: cache))
+    var converting = try DFlash2SpeculativeTokenIterator(
+        input: LMInput(tokens: prompt), mainModel: model,
+        drafter: MockDrafter(missEvery: 3), mainCache: cache, prefilledPrefixTokens: 199,
+        parameters: schemeParameters)
+    var converted: [Int] = []
+    while let token = converting.next() { converted.append(token) }
+    #expect(converted == turbo.tokens)
+    #expect(converting.cache.compactMap { $0 as? TurboQuantKVCache }.count == 2)
+    #expect(cache.allSatisfy { !($0 is TurboQuantKVCache) }, "the caller's array is not rewritten")
+    for scheme in ["turbo4", "turbo8v2"] {
+        var unsupported = parameters
+        unsupported.kvScheme = scheme
+        #expect(throws: DFlash2SpeculationError.unsupportedCache) {
+            _ = try DFlash2SpeculativeTokenIterator(
+                input: LMInput(tokens: prompt), mainModel: model,
+                drafter: MockDrafter(), parameters: unsupported)
+        }
+    }
+    #expect(turbo.tokens.count == 30)
+    let turboLayers = turbo.cache.compactMap { $0 as? TurboQuantKVCache }
+    #expect(turboLayers.count == 2)
+    #expect(turboLayers.allSatisfy { $0.isCompressed })
+    // Every layer holds the prompt and all emitted tokens but the last.
+    #expect(turbo.cache.allSatisfy { $0.offset == 200 + 29 })
+    #expect(plain.cache.allSatisfy { $0.offset == 200 + 29 })
+}
+
 @Test
 func testDFlash2IteratorRejectsUnsupportedInputs() throws {
     let target = MockTarget()
