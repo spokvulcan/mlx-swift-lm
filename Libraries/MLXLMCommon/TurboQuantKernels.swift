@@ -1536,6 +1536,7 @@ enum TurboQuantMetalKernels {
         const uint num_blocks = params[2];
         const uint k_stride = params[3];
         const uint v_stride = params[4];
+        const float q_scale = as_type<float>(params[5]);
         constexpr uint DPL = Dim / 32;
         constexpr uint VAL_LEVELS = 1u << ValueBits;
         constexpr uint VAL_MASK = VAL_LEVELS - 1u;
@@ -1557,11 +1558,11 @@ enum TurboQuantMetalKernels {
         float qv[HPS][DPL];
         float qsum[HPS];
         for (uint r = 0; r < HPS; r++) {
-            const device float* qp = q_in + (q_base + r) * Dim + lane * DPL;
+            auto qp = q_in + (q_base + r) * Dim + lane * DPL;
             qsum[r] = 0.0f;
             for (uint i = 0; i < DPL; i++) {
-                qv[r][i] = qp[i];
-                qsum[r] += qp[i];
+                qv[r][i] = float(qp[i]) * q_scale;
+                qsum[r] += qv[r][i];
             }
         }
         float m[HPS];
@@ -1738,7 +1739,7 @@ enum TurboQuantMetalKernels {
 
         float out = 0.0f;
         for (uint j = 0; j < Dim; j++) out += merged[j] * val_rotation[j * Dim + tid];
-        output[q * Dim + tid] = out;
+        output[q * Dim + tid] = static_cast<OutT>(out);
         """
 
     // MARK: - Multi-query verify (raw-K and affine-K with turbo V)
@@ -2171,7 +2172,7 @@ enum TurboQuantKernelOps {
     /// Codebook is NOT passed to the kernel (saves one buffer bind + GPU transfer).
     ///
     /// - Parameters:
-    ///   - input: Raw vectors [numRows, D] float32
+    ///   - input: Raw vectors [numRows, D], float32, bfloat16 or float16
     ///   - whtSigns: Random ±1 signs [D] float32
     ///   - boundaries: Codebook boundaries [2^bits - 1] float32
     ///   - codebook: Centroids [2^bits] float32 (unused by kernel, kept in API for caller convenience)
@@ -2188,7 +2189,7 @@ enum TurboQuantKernelOps {
     ) -> (packed: MLXArray, norms: MLXArray) {
         let pw = TurboQuantPacking.packedWidth(count: dim, bits: bits)
         let logDim = Int(log2(Double(dim)))
-        let key = "encode_wht_\(bits)_\(dim)"
+        let key = "encode_wht_\(bits)_\(dim)_\(input.dtype)"
 
         let kernel: MLXFast.MLXFastKernel
         lock.lock()
@@ -2198,7 +2199,7 @@ enum TurboQuantKernelOps {
         } else {
             lock.unlock()
             let k = MLXFast.metalKernel(
-                name: "turbo_fused_encode_wht_\(bits)_\(dim)",
+                name: "turbo_fused_encode_wht_\(bits)_\(dim)_\(input.dtype)",
                 inputNames: ["input", "wht_signs", "boundaries"],
                 outputNames: ["packed_out", "norms_out"],
                 source: TurboQuantMetalKernels.fusedEncodeWHTSource,
@@ -2213,8 +2214,9 @@ enum TurboQuantKernelOps {
         let numRows = input.dim(0)
 
         // NOTE: codebook no longer passed, WHT kernel stores raw norms (no norm correction)
+        // The kernel loads `input` as float, so a bf16 or f16 row needs no cast.
         let results = kernel(
-            [f32(input), f32(whtSigns), f32(boundaries)],
+            [input, f32(whtSigns), f32(boundaries)],
             template: [
                 ("Bits", bits), ("Dim", dim), ("PackedWidth", pw), ("LogDim", logDim),
             ],
@@ -2903,16 +2905,18 @@ enum TurboQuantKernelOps {
     /// scoring every query head of a KV head from one decode of its block.
     ///
     /// - Parameters:
-    ///   - queries: `[B * nQHeads, dim]`, already scaled.
+    ///   - queries: `[B * nQHeads, dim]` in the activation dtype; the kernel
+    ///     applies `scale` as it loads them.
     ///   - valPacked: whole value buffer, `[B * nKVHeads, rows, packedWidth]`.
     ///   - valNorms: whole norm buffer, `[B * nKVHeads, rows]`.
     ///   - valRotation: `[dim, dim]` inverse value rotation.
     ///   - simdGroups, maxBlocks, headsPerGroup: overrides for tests and
     ///     benchmarks; `maxBlocks` is capped at `dim`, and a `headsPerGroup`
     ///     that does not divide `repeatCount` becomes `repeatCount`.
-    /// - Returns: `[B * nQHeads, dim]` float32 in the original value space.
+    /// - Returns: `[B * nQHeads, dim]` in the queries' dtype, in the original
+    ///   value space.
     static func turboFlashGQA(
-        queries: MLXArray, keys: GQAKeys,
+        queries: MLXArray, scale: Float = 1, keys: GQAKeys,
         valPacked: MLXArray, valNorms: MLXArray,
         valCodebook: MLXArray, valRotation: MLXArray,
         tokenCount: Int, repeatCount: Int, valueBits: Int, dim: Int,
@@ -2931,7 +2935,7 @@ enum TurboQuantKernelOps {
         let numBlocks = max(1, (tokenCount + tokensPerBlock - 1) / tokensPerBlock)
 
         let kernel: MLXFast.MLXFastKernel
-        var inputs: [MLXArray] = [f32(queries)]
+        var inputs: [MLXArray] = [queries]
         var template: [(String, any KernelTemplateArg)] = [
             ("Dim", dim), ("Rep", repeatCount), ("HPS", hps), ("ValueBits", valueBits),
             ("NSG", nsg), ("ValuePackedWidth", vpw),
@@ -2940,7 +2944,7 @@ enum TurboQuantKernelOps {
         switch keys {
         case .raw(let rawKeys):
             kernel = gqaKernel(
-                "turbo_flash_gqa_p1_rawk_\(dim)_\(repeatCount)_\(hps)_\(valueBits)_\(nsg)_\(rawKeys.dtype)",
+                "turbo_flash_gqa_p1_rawk_\(dim)_\(repeatCount)_\(hps)_\(valueBits)_\(nsg)_\(rawKeys.dtype)_\(queries.dtype)",
                 inputNames: [
                     "q_in", "k_raw", "val_packed", "val_norms", "val_codebook", "params",
                 ],
@@ -2950,7 +2954,7 @@ enum TurboQuantKernelOps {
             keyRows = rawKeys.dim(1)
         case .affine(let weights, let scales, let biases, let groupSize):
             kernel = gqaKernel(
-                "turbo_flash_gqa_p1_affk_\(dim)_\(repeatCount)_\(hps)_\(valueBits)_\(nsg)_\(groupSize)_\(scales.dtype)_\(biases.dtype)",
+                "turbo_flash_gqa_p1_affk_\(dim)_\(repeatCount)_\(hps)_\(valueBits)_\(nsg)_\(groupSize)_\(scales.dtype)_\(biases.dtype)_\(queries.dtype)",
                 inputNames: [
                     "q_in", "k_weights", "k_scales", "k_biases",
                     "val_packed", "val_norms", "val_codebook", "params",
@@ -2964,7 +2968,7 @@ enum TurboQuantKernelOps {
         let params = MLXArray(
             [
                 UInt32(tokenCount), UInt32(tokensPerBlock), UInt32(numBlocks),
-                UInt32(keyRows), UInt32(valPacked.dim(1)),
+                UInt32(keyRows), UInt32(valPacked.dim(1)), scale.bitPattern,
             ] as [UInt32])
         inputs += [valPacked, f32(valNorms), f32(valCodebook), params]
         let partials = kernel(
@@ -2986,11 +2990,11 @@ enum TurboQuantKernelOps {
                 partials[0], partials[1], partials[2], f32(valRotation),
                 blockCountArray(numBlocks),
             ],
-            template: [("Dim", dim)],
+            template: [("Dim", dim), ("OutT", queries.dtype)],
             grid: (dim, totalQ, 1),
             threadGroup: (dim, 1, 1),
             outputShapes: [[totalQ, dim]],
-            outputDTypes: [.float32]
+            outputDTypes: [queries.dtype]
         )[0]
     }
 
@@ -3111,9 +3115,9 @@ enum TurboQuantKernelOps {
         let merged = merge(
             [
                 partials[0], partials[1], partials[2], f32(valRotation),
-                MLXArray([UInt32(parts)]),
+                blockCountArray(parts),
             ],
-            template: [("Dim", dim)],
+            template: [("Dim", dim), ("OutT", DType.float32)],
             grid: (dim, totalRows, 1),
             threadGroup: (dim, 1, 1),
             outputShapes: [[totalRows, dim]],
