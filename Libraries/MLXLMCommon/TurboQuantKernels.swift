@@ -1510,6 +1510,225 @@ enum TurboQuantMetalKernels {
         }
         """
 
+    // MARK: - GQA flash decode (raw-K and affine-K with turbo V)
+
+    /// GQA flash decode, pass 1. One threadgroup per (KV head, group of `HPS`
+    /// query heads, token block); `NSG` SIMD groups split the block's tokens.
+    /// Each token's K and V are decoded once and scored against every head in
+    /// the group. Each lane owns `Dim / 32` contiguous dimensions (at most 32
+    /// value bits). `k_stride` and `v_stride` are the rows allocated per KV
+    /// head, so the caches are read in place.
+    private static let gqaPass1Prologue = """
+        const uint token_count = params[0];
+        const uint tokens_per_block = params[1];
+        const uint num_blocks = params[2];
+        const uint k_stride = params[3];
+        const uint v_stride = params[4];
+        constexpr uint DPL = Dim / 32;
+        constexpr uint VAL_LEVELS = 1u << ValueBits;
+        constexpr uint VAL_MASK = VAL_LEVELS - 1u;
+        constexpr uint LANE_BITS = DPL * ValueBits;
+
+        constexpr uint HEAD_GROUPS = Rep / HPS;
+
+        const uint lane = thread_index_in_simdgroup;
+        const uint sg = simdgroup_index_in_threadgroup;
+        const uint tid = thread_index_in_threadgroup;
+        const uint kv = threadgroup_position_in_grid.y / HEAD_GROUPS;
+        const uint q_base = kv * Rep + (threadgroup_position_in_grid.y % HEAD_GROUPS) * HPS;
+        const uint block = threadgroup_position_in_grid.z;
+
+        threadgroup float cb[VAL_LEVELS];
+        if (tid < VAL_LEVELS) cb[tid] = val_codebook[tid];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        float qv[HPS][DPL];
+        float qsum[HPS];
+        for (uint r = 0; r < HPS; r++) {
+            const device float* qp = q_in + (q_base + r) * Dim + lane * DPL;
+            qsum[r] = 0.0f;
+            for (uint i = 0; i < DPL; i++) {
+                qv[r][i] = qp[i];
+                qsum[r] += qp[i];
+            }
+        }
+        float m[HPS];
+        float l[HPS];
+        float o[HPS][DPL];
+        for (uint r = 0; r < HPS; r++) {
+            m[r] = -INFINITY;
+            l[r] = 0.0f;
+            for (uint i = 0; i < DPL; i++) o[r][i] = 0.0f;
+        }
+
+        const uint t_begin = block * tokens_per_block;
+        const uint t_end = min(t_begin + tokens_per_block, token_count);
+        const uint lane_bit = lane * LANE_BITS;
+        const uint lane_shift = lane_bit & 31u;
+        const device uint32_t* v_head =
+            val_packed + (size_t)kv * v_stride * ValuePackedWidth + (lane_bit >> 5);
+        const device float* n_head = val_norms + (size_t)kv * v_stride;
+
+        for (uint t = t_begin + sg; t < t_end; t += NSG) {
+            float s[HPS];
+
+        """
+
+    private static let gqaPass1RawKScore = """
+            auto kp = k_raw + ((size_t)kv * k_stride + t) * Dim + lane * DPL;
+            float kf[DPL];
+            for (uint i = 0; i < DPL; i++) kf[i] = float(kp[i]);
+            for (uint r = 0; r < HPS; r++) {
+                float acc = 0.0f;
+                for (uint i = 0; i < DPL; i++) acc += qv[r][i] * kf[i];
+                s[r] = simd_sum(acc);
+            }
+
+        """
+
+    /// 8-bit affine keys: one group per lane (`KGroup % DPL == 0`), so the
+    /// lane's partial dot is `scale · Σ q·w + bias · Σ q`.
+    private static let gqaPass1AffineKScore = """
+            const size_t k_row = (size_t)kv * k_stride + t;
+            const device uint32_t* kw = k_weights + k_row * (Dim / 4) + lane * (DPL / 4);
+            const uint k_group = (lane * DPL) / KGroup;
+            const float k_scale = float(k_scales[k_row * (Dim / KGroup) + k_group]);
+            const float k_bias = float(k_biases[k_row * (Dim / KGroup) + k_group]);
+            float kf[DPL];
+            for (uint wi = 0; wi < DPL / 4; wi++) {
+                const uint w = kw[wi];
+                for (uint j = 0; j < 4; j++) kf[wi * 4 + j] = float((w >> (8 * j)) & 0xFFu);
+            }
+            for (uint r = 0; r < HPS; r++) {
+                float acc = 0.0f;
+                for (uint i = 0; i < DPL; i++) acc += qv[r][i] * kf[i];
+                s[r] = simd_sum(k_scale * acc + k_bias * qsum[r]);
+            }
+
+        """
+
+    private static let gqaPass1Epilogue = """
+            const device uint32_t* vp = v_head + (size_t)t * ValuePackedWidth;
+            ulong v_bits = vp[0];
+            if (lane_shift + LANE_BITS > 32) v_bits |= ((ulong)vp[1]) << 32;
+            v_bits >>= lane_shift;
+            const float v_norm = n_head[t];
+            float vv[DPL];
+            for (uint i = 0; i < DPL; i++) {
+                vv[i] = cb[(uint)(v_bits >> (i * ValueBits)) & VAL_MASK] * v_norm;
+            }
+            // The maximum rarely moves: the common step pays one exp and no rescale.
+            for (uint r = 0; r < HPS; r++) {
+                if (s[r] > m[r]) {
+                    const float f = exp(m[r] - s[r]);
+                    m[r] = s[r];
+                    l[r] = l[r] * f + 1.0f;
+                    for (uint i = 0; i < DPL; i++) o[r][i] = o[r][i] * f + vv[i];
+                } else {
+                    const float p = fast::exp(s[r] - m[r]);
+                    l[r] += p;
+                    for (uint i = 0; i < DPL; i++) o[r][i] += p * vv[i];
+                }
+            }
+        }
+
+        // Merge the SIMD groups' states, then write one partial per query head.
+        threadgroup float tg_m[NSG * HPS];
+        threadgroup float tg_l[NSG * HPS];
+        threadgroup float tg_o[HPS * Dim];
+        if (lane == 0) {
+            for (uint r = 0; r < HPS; r++) {
+                tg_m[sg * HPS + r] = m[r];
+                tg_l[sg * HPS + r] = l[r];
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float merged_m[HPS];
+        for (uint r = 0; r < HPS; r++) {
+            merged_m[r] = -INFINITY;
+            for (uint j = 0; j < NSG; j++) merged_m[r] = max(merged_m[r], tg_m[j * HPS + r]);
+        }
+        for (uint j = 0; j < NSG; j++) {
+            if (sg == j) {
+                for (uint r = 0; r < HPS; r++) {
+                    const float scale = (m[r] == -INFINITY) ? 0.0f : exp(m[r] - merged_m[r]);
+                    for (uint i = 0; i < DPL; i++) {
+                        const uint idx = r * Dim + lane * DPL + i;
+                        const float val = o[r][i] * scale;
+                        tg_o[idx] = (j == 0) ? val : tg_o[idx] + val;
+                    }
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        for (uint idx = tid; idx < HPS * Dim; idx += NSG * 32) {
+            const uint r = idx / Dim;
+            const uint d = idx - r * Dim;
+            o_partials[((size_t)(q_base + r) * num_blocks + block) * Dim + d] = tg_o[idx];
+        }
+        if (tid < HPS) {
+            const float mx = merged_m[tid];
+            float ls = 0.0f;
+            for (uint j = 0; j < NSG; j++) {
+                const float mj = tg_m[j * HPS + tid];
+                if (mj != -INFINITY) ls += tg_l[j * HPS + tid] * exp(mj - mx);
+            }
+            m_partials[(q_base + tid) * num_blocks + block] = mx;
+            l_partials[(q_base + tid) * num_blocks + block] = ls;
+        }
+        """
+
+    static let turboFlashGQAPass1RawKSource =
+        gqaPass1Prologue + gqaPass1RawKScore + gqaPass1Epilogue
+
+    static let turboFlashGQAPass1AffineKSource =
+        gqaPass1Prologue + gqaPass1AffineKScore + gqaPass1Epilogue
+
+    /// GQA flash decode, pass 2. One threadgroup of `Dim` threads per query
+    /// head: thread b weighs block b (`num_blocks <= Dim`), thread d merges
+    /// output dimension d, then the threadgroup applies the inverse value
+    /// rotation (`output = merged · Π_val`).
+    static let turboFlashGQAPass2Source = """
+        const uint num_blocks = params[0];
+        constexpr uint NSIMD = Dim / 32;
+        const uint tid = thread_index_in_threadgroup;
+        const uint lane = thread_index_in_simdgroup;
+        const uint sg = simdgroup_index_in_threadgroup;
+        const uint q = threadgroup_position_in_grid.y;
+
+        threadgroup float weights[Dim];
+        threadgroup float red_max[NSIMD];
+        threadgroup float red_sum[NSIMD];
+        threadgroup float merged[Dim];
+
+        const float mb = (tid < num_blocks) ? m_partials[q * num_blocks + tid] : -INFINITY;
+        const float sg_max = simd_max(mb);
+        if (lane == 0) red_max[sg] = sg_max;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float mx = red_max[0];
+        for (uint j = 1; j < NSIMD; j++) mx = max(mx, red_max[j]);
+
+        const float w = (mb == -INFINITY) ? 0.0f : exp(mb - mx);
+        weights[tid] = w;
+        const float lb = (tid < num_blocks) ? l_partials[q * num_blocks + tid] * w : 0.0f;
+        const float sg_sum = simd_sum(lb);
+        if (lane == 0) red_sum[sg] = sg_sum;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float total = 0.0f;
+        for (uint j = 0; j < NSIMD; j++) total += red_sum[j];
+
+        float acc = 0.0f;
+        for (uint b = 0; b < num_blocks; b++) {
+            acc += o_partials[((size_t)q * num_blocks + b) * Dim + tid] * weights[b];
+        }
+        merged[tid] = (total > 0.0f) ? acc / total : 0.0f;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        float out = 0.0f;
+        for (uint j = 0; j < Dim; j++) out += merged[j] * val_rotation[j * Dim + tid];
+        output[q * Dim + tid] = out;
+        """
+
     /// Value aggregation kernel: weighted sum of codebook-quantized values.
     ///
     /// output[d] = Σ_t weights[t] * norm[t] * codebook[val_idx[t,d]]
@@ -2296,6 +2515,172 @@ enum TurboQuantKernelOps {
         return dispatchFlashPass2(
             oPartials: o, mPartials: m, lPartials: l, dim: dim, numBlocks: numBlocks,
             totalQ: totalQ, valRotation: valRotation)
+    }
+
+    // MARK: - GQA flash decode
+
+    nonisolated(unsafe) private static var gqaFlashKernels: [String: MLXFast.MLXFastKernel] = [:]
+
+    /// `TURBO_FLASH_GQA=0` keeps the per-query-head kernels, for A/B runs.
+    private static let gqaFlashEnabled =
+        ProcessInfo.processInfo.environment["TURBO_FLASH_GQA"] != "0"
+
+    // Defaults measured on an M3 Max at head dim 256, 24 over 4 heads,
+    // 8K–64K tokens (TurboQuantDecodeMicrobench).
+
+    /// SIMD groups per pass-1 threadgroup.
+    static let gqaFlashSimdGroups = 2
+
+    /// Fewest tokens a pass-1 threadgroup scores.
+    static let gqaFlashMinTokensPerBlock = 64
+
+    /// Most pass-1 blocks per query head (pass 2 reads them all).
+    static let gqaFlashMaxBlocks = 64
+
+    /// Query heads one pass-1 threadgroup scores: the largest divisor of the
+    /// GQA repeat up to 3. Each group decodes the block again, but six heads'
+    /// queries and accumulators in one lane cost more in registers (about
+    /// 1.9x the time of three at 64K) than the second decode does.
+    static func gqaFlashHeadsPerGroup(repeatCount: Int) -> Int {
+        (1 ... min(3, repeatCount)).last { repeatCount % $0 == 0 } ?? 1
+    }
+
+    /// Key storage the GQA decode reads in place: whole buffers shaped
+    /// `[B * nKVHeads, allocatedRows, ...]`.
+    enum GQAKeys {
+        case raw(MLXArray)
+        case affine(weights: MLXArray, scales: MLXArray, biases: MLXArray, groupSize: Int)
+    }
+
+    /// Whether the GQA decode serves this shape. Each lane holds `dim / 32`
+    /// dimensions and their packed values in one 32-bit span; an affine key
+    /// group must not split a lane.
+    static func gqaFlashSupports(
+        dim: Int, repeatCount: Int, valueBits: Int, keyGroupSize: Int?
+    ) -> Bool {
+        guard gqaFlashEnabled, dim % 32 == 0, dim >= 128, (1 ... 8).contains(repeatCount),
+            (2 ... 4).contains(valueBits)
+        else { return false }
+        let dimsPerLane = dim / 32
+        guard dimsPerLane * valueBits <= 32 else { return false }
+        if let keyGroupSize {
+            guard dimsPerLane % 4 == 0, keyGroupSize % dimsPerLane == 0, dim % keyGroupSize == 0
+            else { return false }
+        }
+        return true
+    }
+
+    private static func gqaKernel(
+        _ key: String, inputNames: [String], outputNames: [String], source: String
+    ) -> MLXFast.MLXFastKernel {
+        lock.lock()
+        if let cached = gqaFlashKernels[key] {
+            lock.unlock()
+            return cached
+        }
+        lock.unlock()
+        let kernel = MLXFast.metalKernel(
+            name: key, inputNames: inputNames, outputNames: outputNames, source: source,
+            ensureRowContiguous: true)
+        lock.lock()
+        gqaFlashKernels[key] = kernel
+        lock.unlock()
+        return kernel
+    }
+
+    /// Flash decode (L=1) for raw-K and affine-K caches with turbo values,
+    /// scoring every query head of a KV head from one decode of its block.
+    ///
+    /// - Parameters:
+    ///   - queries: `[B * nQHeads, dim]`, already scaled.
+    ///   - valPacked: whole value buffer, `[B * nKVHeads, rows, packedWidth]`.
+    ///   - valNorms: whole norm buffer, `[B * nKVHeads, rows]`.
+    ///   - valRotation: `[dim, dim]` inverse value rotation.
+    ///   - simdGroups, maxBlocks, headsPerGroup: overrides for tests and
+    ///     benchmarks; `maxBlocks` is capped at `dim`, and a `headsPerGroup`
+    ///     that does not divide `repeatCount` becomes `repeatCount`.
+    /// - Returns: `[B * nQHeads, dim]` float32 in the original value space.
+    static func turboFlashGQA(
+        queries: MLXArray, keys: GQAKeys,
+        valPacked: MLXArray, valNorms: MLXArray,
+        valCodebook: MLXArray, valRotation: MLXArray,
+        tokenCount: Int, repeatCount: Int, valueBits: Int, dim: Int,
+        simdGroups: Int? = nil, maxBlocks: Int? = nil, headsPerGroup: Int? = nil
+    ) -> MLXArray {
+        let vpw = TurboQuantPacking.packedWidth(count: dim, bits: valueBits)
+        let totalQ = queries.dim(0)
+        let kvHeads = totalQ / repeatCount
+        let nsg = simdGroups ?? gqaFlashSimdGroups
+        var hps = headsPerGroup ?? gqaFlashHeadsPerGroup(repeatCount: repeatCount)
+        if hps < 1 || repeatCount % hps != 0 { hps = repeatCount }
+        // Pass 2 weighs one block per thread, so blocks stay <= dim.
+        let targetBlocks = min(maxBlocks ?? gqaFlashMaxBlocks, dim)
+        let tokensPerBlock = max(
+            gqaFlashMinTokensPerBlock, (tokenCount + targetBlocks - 1) / targetBlocks)
+        let numBlocks = max(1, (tokenCount + tokensPerBlock - 1) / tokensPerBlock)
+
+        let kernel: MLXFast.MLXFastKernel
+        var inputs: [MLXArray] = [f32(queries)]
+        var template: [(String, any KernelTemplateArg)] = [
+            ("Dim", dim), ("Rep", repeatCount), ("HPS", hps), ("ValueBits", valueBits),
+            ("NSG", nsg), ("ValuePackedWidth", vpw),
+        ]
+        let keyRows: Int
+        switch keys {
+        case .raw(let rawKeys):
+            kernel = gqaKernel(
+                "turbo_flash_gqa_p1_rawk_\(dim)_\(repeatCount)_\(hps)_\(valueBits)_\(nsg)_\(rawKeys.dtype)",
+                inputNames: [
+                    "q_in", "k_raw", "val_packed", "val_norms", "val_codebook", "params",
+                ],
+                outputNames: ["o_partials", "m_partials", "l_partials"],
+                source: TurboQuantMetalKernels.turboFlashGQAPass1RawKSource)
+            inputs.append(rawKeys)
+            keyRows = rawKeys.dim(1)
+        case .affine(let weights, let scales, let biases, let groupSize):
+            kernel = gqaKernel(
+                "turbo_flash_gqa_p1_affk_\(dim)_\(repeatCount)_\(hps)_\(valueBits)_\(nsg)_\(groupSize)_\(scales.dtype)_\(biases.dtype)",
+                inputNames: [
+                    "q_in", "k_weights", "k_scales", "k_biases",
+                    "val_packed", "val_norms", "val_codebook", "params",
+                ],
+                outputNames: ["o_partials", "m_partials", "l_partials"],
+                source: TurboQuantMetalKernels.turboFlashGQAPass1AffineKSource)
+            inputs += [weights, scales, biases]
+            template.append(("KGroup", groupSize))
+            keyRows = weights.dim(1)
+        }
+        let params = MLXArray(
+            [
+                UInt32(tokenCount), UInt32(tokensPerBlock), UInt32(numBlocks),
+                UInt32(keyRows), UInt32(valPacked.dim(1)),
+            ] as [UInt32])
+        inputs += [valPacked, f32(valNorms), f32(valCodebook), params]
+        let partials = kernel(
+            inputs,
+            template: template,
+            grid: (32 * nsg, kvHeads * (repeatCount / hps), numBlocks),
+            threadGroup: (32 * nsg, 1, 1),
+            outputShapes: [[totalQ * numBlocks, dim], [totalQ, numBlocks], [totalQ, numBlocks]],
+            outputDTypes: [.float32, .float32, .float32]
+        )
+
+        let merge = gqaKernel(
+            "turbo_flash_gqa_p2_\(dim)",
+            inputNames: ["o_partials", "m_partials", "l_partials", "val_rotation", "params"],
+            outputNames: ["output"],
+            source: TurboQuantMetalKernels.turboFlashGQAPass2Source)
+        return merge(
+            [
+                partials[0], partials[1], partials[2], f32(valRotation),
+                MLXArray([UInt32(numBlocks)]),
+            ],
+            template: [("Dim", dim)],
+            grid: (dim, totalQ, 1),
+            threadGroup: (dim, 1, 1),
+            outputShapes: [[totalQ, dim]],
+            outputDTypes: [.float32]
+        )[0]
     }
 
     static func turboFlashAttention(

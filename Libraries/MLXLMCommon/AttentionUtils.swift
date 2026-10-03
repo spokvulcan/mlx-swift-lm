@@ -9,6 +9,12 @@ package func usesPlainAttentionCacheRoute(_ cache: KVCache) -> Bool {
     !(cache is QuantizedKVCacheProtocol) && !(cache is TurboQuantKVCache)
 }
 
+/// Whether single-token decode can run attention untraced between compiled
+/// segments: plain caches, and TurboQuant through `compressedAttention`.
+package func supportsUntracedDecodeAttention(_ cache: KVCache) -> Bool {
+    usesPlainAttentionCacheRoute(cache) || cache is TurboQuantKVCache
+}
+
 /// Attention utilities that match Python mlx-lm's interface
 ///
 /// This provides a single function that automatically routes to quantized or regular
