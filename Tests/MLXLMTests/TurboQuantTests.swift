@@ -2620,8 +2620,10 @@ final class TurboQuantVerifyTests: XCTestCase {
     private let dim = 256
     private let scale = Float(1) / Float(256).squareRoot()
 
-    private func makeCache(keyBits: Int, rows: Int, seed: UInt64) -> TurboQuantKVCache {
-        let cache = TurboQuantKVCache(bits: 4, keyBits: keyBits, valueBits: 4)
+    private func makeCache(
+        keyBits: Int, rows: Int, seed: UInt64, valueBits: Int = 4
+    ) -> TurboQuantKVCache {
+        let cache = TurboQuantKVCache(bits: 4, keyBits: keyBits, valueBits: valueBits)
         if rows > 0 {
             let (k, v) = withRandomState(MLXRandom.RandomState(seed: seed)) {
                 (
@@ -2652,9 +2654,17 @@ final class TurboQuantVerifyTests: XCTestCase {
     }
 
     func testVerifyKernelMatchesDequantizedReference() throws {
-        for keyBits in [0, 8] {
+        for (keyBits, valueBits) in [(0, 4), (8, 4), (0, 3), (8, 3)] {
+            // Blocks up to eight rows run on the MMA kernel; longer ones
+            // dequantize once and run SDPA.
+            XCTAssertTrue(
+                TurboQuantKernelOps.verifyAttentionSupports(
+                    dim: dim, repeatCount: queryHeads / kvHeads, valueBits: valueBits,
+                    keyGroupSize: keyBits == 8 ? 64 : nil, queryDType: .bfloat16,
+                    rawKeyDType: keyBits == 0 ? .bfloat16 : nil))
             for (rows, s) in [(1, 8), (31, 8), (32, 8), (33, 5), (200, 8), (1000, 13), (4100, 8)] {
-                let cache = makeCache(keyBits: keyBits, rows: rows, seed: UInt64(rows))
+                let cache = makeCache(
+                    keyBits: keyBits, rows: rows, seed: UInt64(rows), valueBits: valueBits)
                 let (q, k, v) = block(s, seed: UInt64(rows + 7))
                 // A lazy position, and three rows of slack past the block.
                 let position = MLXArray(Int32(rows - 1)) + MLXArray(Int32(1))
@@ -2669,7 +2679,8 @@ final class TurboQuantVerifyTests: XCTestCase {
                 XCTAssertEqual(out.dtype, .bfloat16)
                 XCTAssertEqual(cache.offset, rows, "a positioned write leaves the offset")
                 let error = relativeError(out, reference)
-                XCTAssertLessThan(error, 2e-2, "keyBits \(keyBits) rows \(rows) S \(s)")
+                XCTAssertLessThan(
+                    error, 2e-2, "keyBits \(keyBits) valueBits \(valueBits) rows \(rows) S \(s)")
             }
         }
     }

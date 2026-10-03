@@ -736,6 +736,23 @@ func testDFlash2IteratorOverTurboQuantCache(keyBits: Int) throws {
                 drafter: MockDrafter(), parameters: unsupported)
         }
     }
+    // A drafter replaying the plain run's tokens gets drafts accepted, so
+    // rounds commit several rows; draining part of the stream then makes
+    // finalize rewind TurboQuant and recurrent layers together.
+    let oracle = (0 ..< 8).map { round in
+        (1 ... 3).map { plain.tokens[min(4 * round + $0, plain.tokens.count - 1)] }
+            .map(Int32.init)
+    }
+    let cacheForOracle = try model.newCache(parameters: nil)
+    eval(model(prompt[..<199].reshaped(1, 199), cache: cacheForOracle))
+    var oracleIterator = try DFlash2SpeculativeTokenIterator(
+        input: LMInput(tokens: prompt), mainModel: model, drafter: MockDrafter(script: oracle),
+        mainCache: cacheForOracle, prefilledPrefixTokens: 199, parameters: schemeParameters)
+    for _ in 0 ..< 9 { _ = oracleIterator.next() }
+    oracleIterator.finalizeGeneration()
+    #expect(oracleIterator.acceptedCount > 0)
+    let offsets = Set(oracleIterator.cache.map(\.offset))
+    #expect(offsets.count == 1, "every layer rewinds to one offset: \(offsets)")
     #expect(turbo.tokens.count == 30)
     let turboLayers = turbo.cache.compactMap { $0 as? TurboQuantKVCache }
     #expect(turboLayers.count == 2)

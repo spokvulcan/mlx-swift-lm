@@ -136,13 +136,17 @@ public struct DFlash2SpeculativeTokenIterator: TokenIteratorProtocol {
         let kvCachePlan = try parameters.kvCachePlan()
         // The verify pass writes TurboQuant rows with raw or 8-bit affine
         // keys; 2-bit values would protect the boundary layers as affine.
+        // The scheme applies once, when the prompt prefill ends: a later
+        // compression start would leave rounds in flight to convert.
         switch kvCachePlan.configuration?.strategy.storage {
         case nil, .fullPrecision: break
         case .turboQuant(let turbo)
-        where [0, 8].contains(turbo.keyPrecision.bitWidth) && turbo.valuePrecision.bitWidth > 2:
+        where [0, 8].contains(turbo.keyPrecision.bitWidth) && turbo.valuePrecision.bitWidth > 2
+            && turbo.compressionStart == 0:
             break
         default: throw DFlash2SpeculationError.unsupportedCache
         }
+        _ = try kvCachePlan.validated(cache)
         try components.validate(parameters: parameters)
 
         self.target = target

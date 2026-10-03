@@ -692,6 +692,24 @@ public class TurboQuantKVCache: BaseKVCache {
 
     private let step = 256
 
+    /// Rows a caller reserved (a prompt about to prefill over a restored
+    /// cache), granted in one growth; later growths add increments that
+    /// double from `step` to 4,096 rows, as `KVCacheSimple`'s do.
+    private var reservedRows = 0
+    private var growthStep = 256
+
+    override public func reserveCapacity(_ minimumCapacity: Int) {
+        reservedRows = max(reservedRows, minimumCapacity)
+    }
+
+    /// Capacity for `needed` rows over buffers of `capacity` rows.
+    private func grownCapacity(needed: Int, capacity: Int) -> Int {
+        let target = max(needed, reservedRows)
+        let granule = reservedRows > capacity ? step : growthStep
+        growthStep = min(growthStep * 2, 4096)
+        return capacity + (target - capacity + granule - 1) / granule * granule
+    }
+
     public init(
         bits: Int = 4, keyBits: Int? = nil, valueBits: Int? = nil, seed: UInt64 = 42,
         keyGroupSize: Int = 64
@@ -753,6 +771,8 @@ public class TurboQuantKVCache: BaseKVCache {
         new.valNorms = valNorms?[.ellipsis]
         new.compressedAllocSteps = compressedAllocSteps
         new.keyCalibScale = keyCalibScale
+        new.reservedRows = reservedRows
+        new.growthStep = growthStep
         return new
     }
 
@@ -922,7 +942,7 @@ public class TurboQuantKVCache: BaseKVCache {
     ///
     /// In rawKeyMode: only compress values. Keys stay as raw FP16 in rawKeys buffer.
     /// This is the highest-quality TurboQuant+ mode, K precision dominates quality.
-    private func compressRawCache() {
+    private func compressRawCache(clearingBufferCache: Bool = true) {
         guard !isCompressed, let rk = rawKeys, let rv = rawValues, offset > 0 else { return }
         let allKeys = rk[.ellipsis, ..<offset, 0...]
         let allValues = rv[.ellipsis, ..<offset, 0...]
@@ -944,7 +964,7 @@ public class TurboQuantKVCache: BaseKVCache {
             rawAllocSteps = 0
         }
         isCompressed = true
-        MLX.Memory.clearCache()
+        if clearingBufferCache { MLX.Memory.clearCache() }
     }
 
     /// Compress given raw K/V arrays into packed format.
@@ -1067,7 +1087,8 @@ public class TurboQuantKVCache: BaseKVCache {
             let kb = quantK.biases ?? MLXArray.zeros(ks.shape, dtype: ks.dtype)
 
             if (prev + numSteps) > compressedAllocSteps {
-                let newAlloc = ((prev + numSteps + step - 1) / step) * step
+                let newAlloc = grownCapacity(
+                    needed: prev + numSteps, capacity: compressedAllocSteps)
                 let newKW = MLXArray.zeros([B, H, newAlloc, kw.dim(-1)], dtype: kw.dtype)
                 let newKS = MLXArray.zeros([B, H, newAlloc, ks.dim(-1)], dtype: ks.dtype)
                 let newKB = MLXArray.zeros([B, H, newAlloc, kb.dim(-1)], dtype: kb.dtype)
@@ -1098,7 +1119,7 @@ public class TurboQuantKVCache: BaseKVCache {
             // Raw-K mode: append keys to rawKeys buffer as FP16
             // Grow rawKeys buffer if needed
             if (prev + numSteps) > rawAllocSteps {
-                let newAlloc = ((prev + numSteps + step - 1) / step) * step
+                let newAlloc = grownCapacity(needed: prev + numSteps, capacity: rawAllocSteps)
                 let newRK = MLXArray.zeros([B, H, newAlloc, headDim], dtype: keys.dtype)
                 if prev > 0, let rk = rawKeys {
                     newRK[.ellipsis, ..<prev, 0...] = rk[.ellipsis, ..<prev, 0...]
@@ -1109,7 +1130,8 @@ public class TurboQuantKVCache: BaseKVCache {
 
             // Grow compressed (value) storage
             if (prev + numSteps) > compressedAllocSteps {
-                let newAlloc = ((prev + numSteps + step - 1) / step) * step
+                let newAlloc = grownCapacity(
+                    needed: prev + numSteps, capacity: compressedAllocSteps)
                 let newVP = MLXArray.zeros([B, H, newAlloc, vpw], dtype: .uint32)
                 let newVN = MLXArray.zeros([B, H, newAlloc])
                 if prev > 0 {
@@ -1150,7 +1172,8 @@ public class TurboQuantKVCache: BaseKVCache {
 
             // Grow compressed storage using concatenated growth
             if (prev + numSteps) > compressedAllocSteps {
-                let newAlloc = ((prev + numSteps + step - 1) / step) * step
+                let newAlloc = grownCapacity(
+                    needed: prev + numSteps, capacity: compressedAllocSteps)
                 let newKP = MLXArray.zeros([B, H, newAlloc, kpw], dtype: .uint32)
                 let newKN = MLXArray.zeros([B, H, newAlloc])
                 let newVP = MLXArray.zeros([B, H, newAlloc, vpw], dtype: .uint32)
@@ -1182,7 +1205,7 @@ public class TurboQuantKVCache: BaseKVCache {
     /// its first decode step; a cache at rest (a stored prefix) then holds
     /// the compressed form. No-op once compressed or when empty.
     public func compress() {
-        compressRawCache()
+        compressRawCache(clearingBufferCache: false)
     }
 
     // MARK: - Rows at a position (speculative verify)
@@ -1226,13 +1249,15 @@ public class TurboQuantKVCache: BaseKVCache {
             input: newValues.reshaped([B * H * S, headDim]), codec: valueMSECodec!,
             headDim: headDim)
         let start = position.asType(.int32).reshaped([1])
-        let capacity = (visibleLength + step - 1) / step * step
+        let held = [affKeyW, rawKeys, valPackedMSE].compactMap { $0?.dim(2) }.min() ?? 0
+        let capacity =
+            held < visibleLength ? grownCapacity(needed: visibleLength, capacity: held) : held
 
         func write(_ buffer: MLXArray?, _ rows: MLXArray) -> MLXArray {
             var grown = buffer
             if (buffer?.dim(2) ?? 0) < visibleLength {
                 var shape = rows.shape
-                shape[2] = capacity - (buffer?.dim(2) ?? 0)
+                shape[2] = max(capacity, visibleLength) - (buffer?.dim(2) ?? 0)
                 let zeros = MLXArray.zeros(shape, dtype: buffer?.dtype ?? rows.dtype)
                 grown = buffer.map { concatenated([$0, zeros], axis: 2) } ?? zeros
             }
@@ -1273,6 +1298,7 @@ public class TurboQuantKVCache: BaseKVCache {
         let codec = valueMSECodec!
         let vp = valPackedMSE!
         let vn = valNorms!
+        precondition(vn.dim(2) == vp.dim(2), "the kernels read norms at the values' row stride")
         let nKVHeads = vp.dim(1)
         let repeatCount = queries.dim(1) / nKVHeads
         let keys: TurboQuantKernelOps.GQAKeys
@@ -2018,13 +2044,14 @@ public func maybeTurboQuantizeKVCache(
         let turbo = TurboQuantKVCache(
             bits: max(keyBits, valueBits), keyBits: keyBits, valueBits: valueBits,
             keyGroupSize: resolvedKeyGroupSize)
-        // Transfer existing KV data, trimmed to the live offset (the simple
-        // cache over-allocates in steps).
+        // Hand over the rows without copying them (the simple cache
+        // over-allocates in steps, so take only the live offset): the first
+        // compression reads them once and drops the full-precision buffers.
         let offset = simple.offset
         if state.count >= 2, offset > 0 {
-            let keys = state[0][.ellipsis, ..<offset, 0...]
-            let values = state[1][.ellipsis, ..<offset, 0...]
-            _ = turbo.update(keys: keys, values: values)
+            turbo.state = [
+                state[0][.ellipsis, ..<offset, 0...], state[1][.ellipsis, ..<offset, 0...],
+            ]
         }
         return turbo
     }
