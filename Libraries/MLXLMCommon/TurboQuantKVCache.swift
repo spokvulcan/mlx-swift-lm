@@ -1215,7 +1215,36 @@ public class TurboQuantKVCache: BaseKVCache {
             if L == 1, !hasArrayMaskAsym {
                 let flatQ = (queries * MLXArray(scale)).reshaped([B * nQHeads, headDim])
                 let rotated: MLXArray
-                if affineKeyMode {
+                if TurboQuantKernelOps.gqaFlashSupports(
+                    dim: headDim, repeatCount: nRepeats, valueBits: valueBits,
+                    keyGroupSize: affineKeyMode ? keyGroupSize : nil),
+                    let vp = valPackedMSE, let vn = valNorms
+                {
+                    // Whole buffers, read in place by row stride: a `..<T`
+                    // slice of a step-padded buffer is not row-contiguous
+                    // and would be copied on every step.
+                    let keys: TurboQuantKernelOps.GQAKeys
+                    if affineKeyMode {
+                        guard let kw = affKeyW, let ks = affKeyScales, let kb = affKeyBiases else {
+                            return queries
+                        }
+                        keys = .affine(
+                            weights: kw.reshaped([B * nKVHeads, kw.dim(2), -1]),
+                            scales: ks.reshaped([B * nKVHeads, ks.dim(2), -1]),
+                            biases: kb.reshaped([B * nKVHeads, kb.dim(2), -1]),
+                            groupSize: keyGroupSize)
+                    } else {
+                        guard let rk = rawKeys else { return queries }
+                        keys = .raw(rk.reshaped([B * nKVHeads, rk.dim(2), headDim]))
+                    }
+                    rotated = TurboQuantKernelOps.turboFlashGQA(
+                        queries: flatQ, keys: keys,
+                        valPacked: vp.reshaped([B * nKVHeads, vp.dim(2), -1]),
+                        valNorms: vn.reshaped([B * nKVHeads, vn.dim(2)]),
+                        valCodebook: valueMSECodec.codebook, valRotation: valRotation,
+                        tokenCount: tokenCount, repeatCount: nRepeats,
+                        valueBits: valueBits, dim: headDim)
+                } else if affineKeyMode {
                     guard let kw = affKeyW, let ks = affKeyScales, let kb = affKeyBiases else {
                         return queries
                     }

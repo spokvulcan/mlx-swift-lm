@@ -2,11 +2,11 @@
 
 import Foundation
 import MLX
-import MLXLLM
 import MLXNN
 import Testing
 import XCTest
 
+@testable import MLXLLM
 @testable import MLXLMCommon
 
 // MARK: - Codebook Tests
@@ -2396,4 +2396,409 @@ final class TurboQuantIntegrationTests: XCTestCase {
         }
     }
 
+}
+
+// MARK: - GQA flash decode (XCTest)
+
+final class TurboQuantGQAFlashTests: XCTestCase {
+
+    // Qwen3.8-27B attention: head dim 256, 24 query heads over 4 KV heads.
+    private let (queryHeads, kvHeads, dim) = (24, 4, 256)
+
+    private struct Inputs {
+        let queries: MLXArray
+        let keys: MLXArray
+        let valPacked: MLXArray
+        let valNorms: MLXArray
+        let codec: MSECodec
+    }
+
+    /// Whole buffers of `rows` random rows per KV head, so a kernel that reads
+    /// past the token count disagrees with the sliced per-head reference.
+    private func inputs(rows: Int, keyDType: DType, seed: UInt64) -> Inputs {
+        let codec = MSECodec(dim: dim, bits: 4, seed: 43)
+        let values = MLXRandom.normal([kvHeads * rows, dim], key: MLXRandom.key(seed)) * 0.5
+        let (packed, norms) = TurboQuantKernelOps.fusedEncodeWHT(
+            input: values, whtSigns: codec.whtSigns!, boundaries: codec.boundaries,
+            codebook: codec.codebook, bits: 4, dim: dim)
+        let keys = (MLXRandom.normal([kvHeads, rows, dim], key: MLXRandom.key(seed + 1)) * 0.5)
+            .asType(keyDType)
+        let queries =
+            MLXRandom.normal([queryHeads, dim], key: MLXRandom.key(seed + 2))
+            / MLXArray(Float(dim).squareRoot())
+        return Inputs(
+            queries: queries, keys: keys,
+            valPacked: packed.reshaped([kvHeads, rows, -1]),
+            valNorms: norms.reshaped([kvHeads, rows]), codec: codec)
+    }
+
+    private func assertClose(
+        _ actual: MLXArray, _ expected: MLXArray, _ label: String,
+        file: StaticString = #filePath, line: UInt = #line
+    ) {
+        let bound = expected.abs().max().item(Float.self)
+        let diff = (actual - expected).abs().max().item(Float.self)
+        XCTAssertFalse(MLX.isNaN(actual).any().item(Bool.self), label, file: file, line: line)
+        XCTAssertLessThanOrEqual(
+            diff, 1e-4 * bound + 1e-6, "\(label): max diff \(diff) over max \(bound)",
+            file: file, line: line)
+    }
+
+    private let tokenCounts = [1, 5, 63, 64, 65, 200, 1000, 4100, 20_000]
+
+    /// The GQA kernel computes what the per-query-head kernel computes, from
+    /// whole step-padded buffers instead of `..<T` slices.
+    func testRawKeyGQAMatchesPerHeadKernel() {
+        for (index, tokens) in tokenCounts.enumerated() {
+            let rows = ((tokens + 255) / 256) * 256
+            let input = inputs(rows: rows, keyDType: .bfloat16, seed: UInt64(300 + 10 * index))
+            let perHead = TurboQuantKernelOps.turboFlashRawK(
+                rotatedQueries: input.queries,
+                rawKeys: input.keys[0..., ..<tokens, 0...],
+                valPacked: input.valPacked[0..., ..<tokens, 0...],
+                valNorms: input.valNorms[0..., ..<tokens],
+                valCodebook: input.codec.codebook,
+                tokenCount: tokens, repeatCount: queryHeads / kvHeads, valueBits: 4, dim: dim,
+                valRotation: input.codec.rotation)
+            for headsPerGroup in [1, 2, 3, 6] {
+                let gqa = TurboQuantKernelOps.turboFlashGQA(
+                    queries: input.queries, keys: .raw(input.keys),
+                    valPacked: input.valPacked, valNorms: input.valNorms,
+                    valCodebook: input.codec.codebook, valRotation: input.codec.rotation,
+                    tokenCount: tokens, repeatCount: queryHeads / kvHeads, valueBits: 4, dim: dim,
+                    headsPerGroup: headsPerGroup)
+                assertClose(
+                    gqa, perHead, "raw K, \(tokens) tokens, \(headsPerGroup) heads per group")
+            }
+        }
+    }
+
+    func testAffineKeyGQAMatchesPerHeadKernel() {
+        for (index, tokens) in tokenCounts.enumerated() {
+            let rows = ((tokens + 255) / 256) * 256
+            let input = inputs(rows: rows, keyDType: .bfloat16, seed: UInt64(500 + 10 * index))
+            let quantizedKeys = quantized(input.keys, groupSize: 64, bits: 8)
+            let (weights, scales) = (quantizedKeys.wq, quantizedKeys.scales)
+            let biases = quantizedKeys.biases!
+            let perHead = TurboQuantKernelOps.turboFlashAffineK(
+                rotatedQueries: input.queries,
+                kWeights: weights[0..., ..<tokens, 0...],
+                kScales: scales[0..., ..<tokens, 0...],
+                kBiases: biases[0..., ..<tokens, 0...],
+                valPacked: input.valPacked[0..., ..<tokens, 0...],
+                valNorms: input.valNorms[0..., ..<tokens],
+                valCodebook: input.codec.codebook,
+                tokenCount: tokens, repeatCount: queryHeads / kvHeads, valueBits: 4, dim: dim,
+                kGroup: 64, valRotation: input.codec.rotation)
+            for headsPerGroup in [1, 2, 3, 6] {
+                let gqa = TurboQuantKernelOps.turboFlashGQA(
+                    queries: input.queries,
+                    keys: .affine(weights: weights, scales: scales, biases: biases, groupSize: 64),
+                    valPacked: input.valPacked, valNorms: input.valNorms,
+                    valCodebook: input.codec.codebook, valRotation: input.codec.rotation,
+                    tokenCount: tokens, repeatCount: queryHeads / kvHeads, valueBits: 4, dim: dim,
+                    headsPerGroup: headsPerGroup)
+                assertClose(
+                    gqa, perHead, "affine K, \(tokens) tokens, \(headsPerGroup) heads per group")
+            }
+        }
+    }
+
+    /// Through the cache, across a 256-row growth of the compressed buffers:
+    /// every decode step stays close to exact attention over the raw K/V.
+    func testCacheDecodeMatchesReferenceAtQwenShape() {
+        let scale = 1.0 / Float(dim).squareRoot()
+        for keyBits in [0, 8] {
+            let prefill = 250
+            let keys = (MLXRandom.normal([1, kvHeads, prefill, dim], key: MLXRandom.key(81)) * 0.5)
+                .asType(.bfloat16)
+            let values =
+                (MLXRandom.normal([1, kvHeads, prefill, dim], key: MLXRandom.key(82)) * 0.5)
+                .asType(.bfloat16)
+            let cache = TurboQuantKVCache(bits: 4, keyBits: keyBits, valueBits: 4, seed: 42)
+            _ = cache.update(keys: keys, values: values)
+            var allKeys = keys
+            var allValues = values
+            for step in 0 ..< 12 {
+                let q = MLXRandom.normal(
+                    [1, queryHeads, 1, dim], key: MLXRandom.key(UInt64(90 + step))
+                ).asType(.bfloat16)
+                let newK =
+                    (MLXRandom.normal(
+                        [1, kvHeads, 1, dim], key: MLXRandom.key(UInt64(110 + step))) * 0.5)
+                    .asType(.bfloat16)
+                let newV =
+                    (MLXRandom.normal(
+                        [1, kvHeads, 1, dim], key: MLXRandom.key(UInt64(130 + step))) * 0.5)
+                    .asType(.bfloat16)
+                let out = cache.compressedAttention(
+                    queries: q, keys: newK, values: newV, scale: scale)
+                allKeys = concatenated([allKeys, newK], axis: 2)
+                allValues = concatenated([allValues, newV], axis: 2)
+
+                let reference = MLXFast.scaledDotProductAttention(
+                    queries: q.asType(.float32), keys: allKeys.asType(.float32),
+                    values: allValues.asType(.float32), scale: scale, mask: .none)
+                let a = out.asType(.float32).reshaped([-1])
+                let r = reference.reshaped([-1])
+                let cos = ((a * r).sum() / (sqrt((a * a).sum()) * sqrt((r * r).sum()) + 1e-9))
+                    .item(Float.self)
+                XCTAssertGreaterThan(
+                    cos, 0.97,
+                    "keyBits \(keyBits) step \(step) (offset \(cache.offset)): cos \(cos)")
+            }
+            XCTAssertEqual(cache.offset, prefill + 12)
+        }
+    }
+
+    /// TurboQuant caches take Qwen 3.5's compiled decode segments (attention
+    /// runs untraced between them through `compressedAttention`) and decode
+    /// close to the same prompt continued on the unquantized cache.
+    func testQwen35TurboQuantDecodeUsesCompiledSegments() throws {
+        let json = """
+            {
+                "model_type": "qwen3_5",
+                "hidden_size": 64, "num_hidden_layers": 4, "intermediate_size": 128,
+                "num_attention_heads": 2, "num_key_value_heads": 1, "head_dim": 128,
+                "linear_num_value_heads": 2, "linear_num_key_heads": 1,
+                "linear_key_head_dim": 16, "linear_value_head_dim": 16,
+                "linear_conv_kernel_dim": 4, "vocab_size": 32,
+                "full_attention_interval": 2,
+                "num_experts": 0, "num_experts_per_tok": 0,
+                "moe_intermediate_size": 16, "shared_expert_intermediate_size": 16
+            }
+            """
+        let configuration = try JSONDecoder().decode(
+            Qwen35TextConfiguration.self, from: Data(json.utf8))
+        let model = withRandomState(MLXRandom.RandomState(seed: 29)) {
+            Qwen35TextModel(configuration)
+        }
+        var cache = try model.newCache(parameters: nil)
+        let prompt = MLXArray((0 ..< 300).map { Int32($0 % 32) }).reshaped(1, 300)
+        eval(model(prompt, cache: cache))
+        let unquantized = cache.map { $0.copy() }
+        let applied = try applyKVCacheConfiguration(
+            cache: &cache,
+            configuration: KVCacheConfiguration(
+                strategy: .turboQuant(
+                    try TurboQuantKVCacheConfiguration(
+                        keyPrecision: .affineEightBit, valuePrecision: .fourBit)),
+                compatibility: .requireAllLayers))
+        XCTAssertEqual(applied.convertedLayerCount, 2)
+        XCTAssertEqual(model.model.compiledDecodeSegmentCount, 0)
+
+        var turboLogits: [MLXArray] = []
+        for token in Int32(1) ... 6 {
+            let logits = model(MLXArray([token]).reshaped(1, 1), cache: cache)
+            eval(logits)
+            turboLogits.append(logits)
+        }
+        XCTAssertGreaterThan(
+            model.model.compiledDecodeSegmentCount, 0,
+            "TurboQuant decode left the compiled segments")
+        XCTAssertTrue(cache.compactMap { $0 as? TurboQuantKVCache }.allSatisfy(\.isCompressed))
+
+        for (step, token) in (Int32(1) ... 6).enumerated() {
+            let reference = model(MLXArray([token]).reshaped(1, 1), cache: unquantized)
+            let a = turboLogits[step].reshaped([-1])
+            let r = reference.reshaped([-1])
+            XCTAssertFalse(MLX.isNaN(a).any().item(Bool.self))
+            let cos = ((a * r).sum() / (sqrt((a * a).sum()) * sqrt((r * r).sum()) + 1e-9))
+                .item(Float.self)
+            XCTAssertGreaterThan(cos, 0.95, "step \(step): cos \(cos)")
+        }
+    }
+}
+
+// MARK: - Decode microbenchmark (opt-in)
+
+/// One attention layer's decode step at the Qwen3.8-27B shape, TurboQuant
+/// against bf16 SDPA. Opt-in: `TEST_RUNNER_TURBOQUANT_DECODE_BENCH=1`;
+/// `TEST_RUNNER_TURBOQUANT_DECODE_BENCH_CONTEXTS=8192,32768` picks the
+/// contexts. Each timed iteration runs one call per attention layer and one eval.
+final class TurboQuantDecodeMicrobench: XCTestCase {
+
+    private let (queryHeads, kvHeads, dim) = (24, 4, 256)
+    private let layers = 16
+
+    override func setUpWithError() throws {
+        try XCTSkipUnless(
+            ProcessInfo.processInfo.environment["TURBOQUANT_DECODE_BENCH"] == "1",
+            "set TEST_RUNNER_TURBOQUANT_DECODE_BENCH=1")
+    }
+
+    private func time(_ label: String, iterations: Int = 20, _ body: () -> [MLXArray]) -> Double {
+        for _ in 0 ..< 3 { eval(body()) }
+        let start = Date()
+        for _ in 0 ..< iterations { eval(body()) }
+        let ms = Date().timeIntervalSince(start) * 1000 / Double(iterations)
+        print("[DECODE-BENCH] \(label): \(String(format: "%.3f", ms)) ms per \(layers) layers")
+        return ms
+    }
+
+    private var contexts: [Int] {
+        (ProcessInfo.processInfo.environment["TURBOQUANT_DECODE_BENCH_CONTEXTS"]
+            ?? "8192,32768,65536")
+            .split(separator: ",").compactMap { Int($0) }
+    }
+
+    func testAttentionKernels() {
+        let codec = MSECodec(dim: dim, bits: 4, seed: 43)
+        for tokens in contexts {
+            let rows = ((tokens + 255) / 256) * 256
+            let q = (MLXRandom.normal([1, queryHeads, 1, dim]) * 0.1).asType(.bfloat16)
+            let flatQ = (q.asType(.float32) / MLXArray(Float(dim).squareRoot()))
+                .reshaped([queryHeads, dim])
+            let keys = (MLXRandom.normal([1, kvHeads, rows, dim]) * 0.5).asType(.bfloat16)
+            let values = (MLXRandom.normal([1, kvHeads, rows, dim]) * 0.5).asType(.bfloat16)
+            let (packed, norms) = TurboQuantKernelOps.fusedEncodeWHT(
+                input: values.reshaped([-1, dim]).asType(.float32), whtSigns: codec.whtSigns!,
+                boundaries: codec.boundaries, codebook: codec.codebook, bits: 4, dim: dim)
+            let valPacked = packed.reshaped([kvHeads, rows, -1])
+            let valNorms = norms.reshaped([kvHeads, rows])
+            let quantizedKeys = quantized(
+                keys.reshaped([kvHeads, rows, dim]), groupSize: 64, bits: 8)
+            let rawKeys = keys.reshaped([kvHeads, rows, dim])
+            eval(
+                q, flatQ, keys, values, valPacked, valNorms, quantizedKeys.wq,
+                quantizedKeys.scales, quantizedKeys.biases!)
+
+            let sdpa = time("T=\(tokens) bf16 SDPA") {
+                (0 ..< layers).map { _ in
+                    MLXFast.scaledDotProductAttention(
+                        queries: q, keys: keys[.ellipsis, ..<tokens, 0...],
+                        values: values[.ellipsis, ..<tokens, 0...],
+                        scale: 1 / Float(dim).squareRoot(), mask: .none)
+                }
+            }
+            func gqa(
+                _ keys: TurboQuantKernelOps.GQAKeys, nsg: Int? = nil, maxBlocks: Int? = nil,
+                hps: Int? = nil
+            ) -> [MLXArray] {
+                (0 ..< layers).map { _ in
+                    TurboQuantKernelOps.turboFlashGQA(
+                        queries: flatQ, keys: keys, valPacked: valPacked, valNorms: valNorms,
+                        valCodebook: codec.codebook, valRotation: codec.rotation,
+                        tokenCount: tokens, repeatCount: queryHeads / kvHeads, valueBits: 4,
+                        dim: dim, simdGroups: nsg, maxBlocks: maxBlocks, headsPerGroup: hps)
+                }
+            }
+            let affine = TurboQuantKernelOps.GQAKeys.affine(
+                weights: quantizedKeys.wq, scales: quantizedKeys.scales,
+                biases: quantizedKeys.biases!, groupSize: 64)
+            let gqa8 = time("T=\(tokens) turbo8v4 GQA") { gqa(affine) }
+            let gqa0 = time("T=\(tokens) turbo0v4 GQA") { gqa(.raw(rawKeys)) }
+            let legacy8 = time("T=\(tokens) turbo8v4 per-head (sliced)") {
+                (0 ..< layers).map { _ in
+                    TurboQuantKernelOps.turboFlashAffineK(
+                        rotatedQueries: flatQ,
+                        kWeights: quantizedKeys.wq[0..., ..<tokens, 0...],
+                        kScales: quantizedKeys.scales[0..., ..<tokens, 0...],
+                        kBiases: quantizedKeys.biases![0..., ..<tokens, 0...],
+                        valPacked: valPacked[0..., ..<tokens, 0...],
+                        valNorms: valNorms[0..., ..<tokens], valCodebook: codec.codebook,
+                        tokenCount: tokens, repeatCount: queryHeads / kvHeads, valueBits: 4,
+                        dim: dim, kGroup: 64, valRotation: codec.rotation)
+                }
+            }
+            print(
+                "[DECODE-BENCH] T=\(tokens) ratio vs SDPA: turbo8v4 GQA \(String(format: "%.2f", gqa8 / sdpa))x, turbo0v4 GQA \(String(format: "%.2f", gqa0 / sdpa))x, turbo8v4 per-head \(String(format: "%.2f", legacy8 / sdpa))x"
+            )
+            for hps in [1, 2, 3, 6] {
+                for nsg in [1, 2, 4] {
+                    for maxBlocks in [64, 128] {
+                        _ = time(
+                            "T=\(tokens) turbo8v4 GQA hps=\(hps) nsg=\(nsg) maxBlocks=\(maxBlocks)",
+                            iterations: 10
+                        ) {
+                            gqa(affine, nsg: nsg, maxBlocks: maxBlocks, hps: hps)
+                        }
+                        _ = time(
+                            "T=\(tokens) turbo0v4 GQA hps=\(hps) nsg=\(nsg) maxBlocks=\(maxBlocks)",
+                            iterations: 10
+                        ) {
+                            gqa(.raw(rawKeys), nsg: nsg, maxBlocks: maxBlocks, hps: hps)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The one-time switch-over: 16 layers' first decode step on freshly
+    /// converted caches, which compresses each layer's whole prefill.
+    func testSwitchOver() {
+        let scale = 1 / Float(dim).squareRoot()
+        for tokens in contexts {
+            let keys = (MLXRandom.normal([1, kvHeads, tokens, dim]) * 0.5).asType(.bfloat16)
+            let values = (MLXRandom.normal([1, kvHeads, tokens, dim]) * 0.5).asType(.bfloat16)
+            let q = (MLXRandom.normal([1, queryHeads, 1, dim]) * 0.1).asType(.bfloat16)
+            let newK = (MLXRandom.normal([1, kvHeads, 1, dim]) * 0.5).asType(.bfloat16)
+            let newV = (MLXRandom.normal([1, kvHeads, 1, dim]) * 0.5).asType(.bfloat16)
+            eval(keys, values, q, newK, newV)
+            for keyBits in [8, 0] {
+                var samples: [Double] = []
+                for _ in 0 ..< 3 {
+                    let caches = (0 ..< layers).map { _ -> TurboQuantKVCache in
+                        let c = TurboQuantKVCache(bits: 4, keyBits: keyBits, valueBits: 4, seed: 42)
+                        _ = c.update(keys: keys, values: values)
+                        return c
+                    }
+                    eval(caches.flatMap(\.state))
+                    let start = Date()
+                    eval(
+                        caches.map {
+                            $0.compressedAttention(
+                                queries: q, keys: newK, values: newV, scale: scale)
+                        })
+                    samples.append(Date().timeIntervalSince(start) * 1000)
+                }
+                print(
+                    "[DECODE-BENCH] switch-over T=\(tokens) turbo\(keyBits)v4: "
+                        + samples.map { String(format: "%.1f", $0) }.joined(separator: " / ")
+                        + " ms per \(layers) layers")
+            }
+        }
+    }
+
+    /// The whole per-layer decode step through each cache: append one token,
+    /// then attend. TurboQuant adds its value encode and key quantization.
+    func testCacheStep() {
+        for tokens in contexts { cacheStep(tokens: tokens) }
+    }
+
+    private func cacheStep(tokens: Int) {
+        let scale = 1 / Float(dim).squareRoot()
+        let keys = (MLXRandom.normal([1, kvHeads, tokens, dim]) * 0.5).asType(.bfloat16)
+        let values = (MLXRandom.normal([1, kvHeads, tokens, dim]) * 0.5).asType(.bfloat16)
+        let q = (MLXRandom.normal([1, queryHeads, 1, dim]) * 0.1).asType(.bfloat16)
+        let newK = (MLXRandom.normal([1, kvHeads, 1, dim]) * 0.5).asType(.bfloat16)
+        let newV = (MLXRandom.normal([1, kvHeads, 1, dim]) * 0.5).asType(.bfloat16)
+        eval(keys, values, q, newK, newV)
+
+        let simple = (0 ..< layers).map { _ -> KVCacheSimple in
+            let c = KVCacheSimple()
+            _ = c.update(keys: keys, values: values)
+            return c
+        }
+        _ = time("step T=\(tokens) bf16 KVCacheSimple + SDPA", iterations: 30) {
+            simple.map { cache in
+                let (k, v) = cache.update(keys: newK, values: newV)
+                return MLXFast.scaledDotProductAttention(
+                    queries: q, keys: k, values: v, scale: scale, mask: .none)
+            }
+        }
+        for keyBits in [8, 0] {
+            let turbo = (0 ..< layers).map { _ -> TurboQuantKVCache in
+                let c = TurboQuantKVCache(bits: 4, keyBits: keyBits, valueBits: 4, seed: 42)
+                _ = c.update(keys: keys, values: values)
+                return c
+            }
+            _ = time("step T=\(tokens) turbo\(keyBits)v4", iterations: 30) {
+                turbo.map { cache in
+                    cache.compressedAttention(queries: q, keys: newK, values: newV, scale: scale)
+                }
+            }
+        }
+    }
 }
