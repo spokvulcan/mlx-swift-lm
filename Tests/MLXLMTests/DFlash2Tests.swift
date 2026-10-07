@@ -372,6 +372,8 @@ private final class MockTarget: Module, LanguageModel, KVCacheDimensionProvider,
     let embedding = Embedding(embeddingCount: vocab, dimensions: hidden)
     private(set) var verifyCalls = 0
     private(set) var verifyWidths: [Int] = []
+    /// The rope delta each prefill chunk and verify pass was given.
+    private(set) var positionDeltas: [Int] = []
 
     /// Per-position token script for the verify rows; nil uses `transition`.
     var script: [Int32]?
@@ -450,8 +452,9 @@ private final class MockTarget: Module, LanguageModel, KVCacheDimensionProvider,
     }
 
     func dflash2Prefill(
-        _ tokens: MLXArray, cache: [KVCache], captureLayers: [Int]
+        _ tokens: MLXArray, cache: [KVCache], captureLayers: [Int], positionDelta: Int
     ) -> (logits: MLXArray, hidden: [MLXArray]) {
+        positionDeltas.append(positionDelta)
         let positions = tokens.dim(-1)
         writeKV(cache, positions: positions)
         return (
@@ -462,6 +465,7 @@ private final class MockTarget: Module, LanguageModel, KVCacheDimensionProvider,
 
     func dflash2Verify(_ request: DFlash2VerifyRequest, cache: [KVCache]) -> DFlash2VerifyResult {
         verifyCalls += 1
+        positionDeltas.append(request.positionDelta)
         let positions = request.tokens.dim(-1)
         verifyWidths.append(positions)
         let attention = cache[0] as! KVCacheSimple
@@ -643,6 +647,30 @@ func testDFlash2IteratorWarmStartMatchesColdStream() throws {
     // Only the suffix position is captured; the first context is one row.
     #expect(drafter.contextRows.first == 1)
     #expect(drafter.contextPositions.first == 2)
+}
+
+@Test
+func testDFlash2IteratorRotatesPastThePromptsImages() throws {
+    // A caller that prefilled an image hands over the text tail with the
+    // image's rope delta: every prefill chunk and verify pass rotates by it,
+    // while the drafter keeps placing its context at cache rows.
+    let target = MockTarget()
+    let drafter = MockDrafter()
+    let cache = target.newCache(parameters: nil)
+    _ = target(LMInput.Text(tokens: MLXArray([Int32(1), 2, 3, 4])), cache: cache, state: nil)
+
+    var parameters = GenerateParameters(maxTokens: 6)
+    parameters.temperature = 0
+    var iterator = try DFlash2SpeculativeTokenIterator(
+        input: LMInput(tokens: MLXArray([Int32(1), 2, 3, 4, 5, 6])), mainModel: target,
+        drafter: drafter, mainCache: cache, prefilledPrefixTokens: 4, positionDelta: -3,
+        parameters: parameters)
+    while iterator.next() != nil {}
+
+    #expect(iterator.positionDelta == -3)
+    #expect(!target.positionDeltas.isEmpty)
+    #expect(target.positionDeltas.allSatisfy { $0 == -3 })
+    #expect(drafter.contextPositions.first == 4)
 }
 
 @Test

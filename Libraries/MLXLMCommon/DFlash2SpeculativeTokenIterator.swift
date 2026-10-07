@@ -13,7 +13,8 @@ public enum DFlash2SpeculationError: Error, Equatable {
     case unsupportedCache
     /// The drafter was distilled for a target of a different depth.
     case geometryMismatch(drafter: Int, target: Int)
-    /// DFlash2 speculation covers text-only prompts.
+    /// The prompt carries media the target cannot prefill
+    /// (see ``DFlash2MediaTargetModel``), or a batch of more than one.
     case textOnly
     /// `prefilledPrefixTokens` must leave at least one prompt token.
     case promptTooShort
@@ -53,6 +54,9 @@ public struct DFlash2SpeculativeTokenIterator: TokenIteratorProtocol {
     public let maxTokens: Int?
     /// Tokens per verify pass at full width: one anchor plus `blockSize - 1` drafts.
     public let blockSize: Int
+    /// Rotary offset of the prompt tail and every generated token past the
+    /// prompt's images (``DFlash2VerifyRequest/positionDelta``).
+    public let positionDelta: Int
 
     public private(set) var promptPrefillTime: TimeInterval = 0
 
@@ -89,7 +93,9 @@ public struct DFlash2SpeculativeTokenIterator: TokenIteratorProtocol {
     private var greedy: Bool { temperature <= 0 }
 
     /// - Parameters:
-    ///   - input: the prompt (text only).
+    ///   - input: the prompt, `[L]` or `[1, L]` tokens. Images or video need
+    ///     a ``DFlash2MediaTargetModel`` and an empty `mainCache`: the target
+    ///     prefills through the last of them, the iterator takes the text after.
     ///   - mainModel: the target; must conform to ``DFlash2TargetModel``.
     ///   - drafter: a DFlash2 drafter distilled for `mainModel`'s depth.
     ///   - mainCache: an existing target cache to decode over. Pass a warm
@@ -99,6 +105,10 @@ public struct DFlash2SpeculativeTokenIterator: TokenIteratorProtocol {
     ///     `mainCache` already holds. Only the remaining suffix is prefilled
     ///     and captured; RoPE positions stay absolute, so decoding matches a
     ///     cold run of the same prompt.
+    ///   - positionDelta: for a prompt whose images the caller prefilled
+    ///     (`mainCache` holds every image row, `input` carries the prompt's
+    ///     tokens only), the rope delta the text after them continues with.
+    ///     The drafter still places its context at cache rows.
     ///   - parameters: sampling and generation limits.
     ///   - blockSize: tokens per verify pass; `nil` uses the drafter's
     ///     trained block size.
@@ -109,6 +119,7 @@ public struct DFlash2SpeculativeTokenIterator: TokenIteratorProtocol {
         drafter: any DFlash2DrafterModel,
         mainCache: [KVCache]? = nil,
         prefilledPrefixTokens: Int = 0,
+        positionDelta: Int = 0,
         parameters: GenerateParameters,
         blockSize: Int? = nil,
         components: GenerationComponents = .init()
@@ -122,7 +133,11 @@ public struct DFlash2SpeculativeTokenIterator: TokenIteratorProtocol {
             throw DFlash2SpeculationError.geometryMismatch(
                 drafter: drafter.targetLayerCount, target: target.dflash2LayerCount)
         }
-        guard input.image == nil, input.video == nil, input.audio == nil else {
+        let hasMedia = input.image != nil || input.video != nil || input.audio != nil
+        let mediaTarget = target as? DFlash2MediaTargetModel
+        guard input.text.tokens.ndim == 1 || input.text.tokens.dim(0) == 1,
+            !hasMedia || (input.audio == nil && mediaTarget != nil && prefilledPrefixTokens == 0)
+        else {
             throw DFlash2SpeculationError.textOnly
         }
         let promptLength = input.text.tokens.dim(-1)
@@ -166,9 +181,18 @@ public struct DFlash2SpeculativeTokenIterator: TokenIteratorProtocol {
         self.blockSize = Swift.max(2, blockSize ?? drafter.blockSize)
 
         let prefillStart = Date.timeIntervalSinceReferenceDate
-        prepare(
-            input: input, prefilledPrefixTokens: prefilledPrefixTokens,
-            prefill: parameters.prefill)
+        var prefilled = prefilledPrefixTokens
+        var delta = positionDelta
+        if hasMedia, let mediaTarget {
+            guard
+                let media = try mediaTarget.dflash2PrefillMedia(
+                    input, cache: cache, prefill: parameters.prefill)
+            else { throw DFlash2SpeculationError.promptTooShort }
+            prefilled = media.prefilledTokens
+            delta = media.positionDelta
+        }
+        self.positionDelta = delta
+        prepare(input: input, prefilledPrefixTokens: prefilled, prefill: parameters.prefill)
         self.promptPrefillTime = Date.timeIntervalSinceReferenceDate - prefillStart
     }
 
@@ -181,8 +205,8 @@ public struct DFlash2SpeculativeTokenIterator: TokenIteratorProtocol {
     private mutating func prepare(
         input: LMInput, prefilledPrefixTokens: Int, prefill: PrefillParameters
     ) {
-        processor?.prompt(input.text.tokens)
-        let promptTokens = input.text.tokens
+        let promptTokens = input.text.tokens.reshaped(-1)
+        processor?.prompt(promptTokens)
         let promptLength = promptTokens.dim(0)
         if prefilledPrefixTokens > 0, let attention = cache.first(where: { $0.isTrimmable }) {
             precondition(
@@ -206,7 +230,8 @@ public struct DFlash2SpeculativeTokenIterator: TokenIteratorProtocol {
             let end = start + (remaining == 1 ? 1 : Swift.min(stepSize, remaining - 1))
             let chunk = promptTokens[start ..< end].expandedDimensions(axis: 0)
             let result = target.dflash2Prefill(
-                chunk, cache: cache, captureLayers: drafter.targetLayerIds)
+                chunk, cache: cache, captureLayers: drafter.targetLayerIds,
+                positionDelta: positionDelta)
 
             var hidden = concatenatedHidden(result.hidden)
             if let existing = hiddenWindow {
@@ -293,7 +318,8 @@ public struct DFlash2SpeculativeTokenIterator: TokenIteratorProtocol {
             tokens: concatenated([anchor.asType(.int32), draftTokens]).expandedDimensions(axis: 0),
             position: position,
             positionUpperBound: positionUpperBound,
-            captureLayers: drafter.targetLayerIds)
+            captureLayers: drafter.targetLayerIds,
+            positionDelta: positionDelta)
         let verify = target.dflash2Verify(request, cache: cache)
         asyncEval(verify.logits)
         inFlight = Round(

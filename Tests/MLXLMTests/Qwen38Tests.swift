@@ -251,19 +251,18 @@ final class Qwen38Tests: XCTestCase {
 
             let vlmConfig = try JSONDecoder.json5().decode(
                 MLXVLM.Qwen35Configuration.TextConfiguration.self, from: data)
-            let vlmModel = MLXVLM.Qwen35Language.Model(vlmConfig)
-            XCTAssertEqual(vlmModel.ssmIdx, expectedSSMIndex)
-            XCTAssertEqual(vlmModel.faIdx, expectedFullAttentionIndex)
+            // The vision class runs the text model on its text configuration.
+            let vlmModel = MLXLLM.Qwen35TextModel(vlmConfig.languageModelConfiguration)
+            XCTAssertEqual(vlmModel.model.ssmIdx, expectedSSMIndex)
+            XCTAssertEqual(vlmModel.model.faIdx, expectedFullAttentionIndex)
 
-            let vlmCaches: [KVCache?] = layerTypes.map {
-                $0 == "linear_attention" ? MambaCache() : KVCacheSimple()
-            }
+            let vlmCaches = try vlmModel.newCache(parameters: nil)
             let vlmOutput = vlmModel(tokens, cache: vlmCaches)
             eval(vlmOutput)
-            XCTAssertEqual(vlmOutput.shape, [1, 2, 16])
+            XCTAssertEqual(vlmOutput.shape, [1, 2, 64])
             let vlmDecodeOutput = vlmModel(nextToken, cache: vlmCaches)
             eval(vlmDecodeOutput)
-            XCTAssertEqual(vlmDecodeOutput.shape, [1, 1, 16])
+            XCTAssertEqual(vlmDecodeOutput.shape, [1, 1, 64])
         }
     }
 

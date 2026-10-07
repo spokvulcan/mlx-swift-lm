@@ -113,14 +113,19 @@ public struct DFlash2VerifyRequest {
     public var positionUpperBound: Int
     /// Layers whose outputs the drafter needs, in ``DFlash2VerifyResult/hidden`` order.
     public var captureLayers: [Int]
+    /// Rotary offset of text past the prompt's images: cache row `p` rotates
+    /// at `p + positionDelta`. Zero for a text-only prompt.
+    public var positionDelta: Int
 
     public init(
-        tokens: MLXArray, position: MLXArray, positionUpperBound: Int, captureLayers: [Int]
+        tokens: MLXArray, position: MLXArray, positionUpperBound: Int, captureLayers: [Int],
+        positionDelta: Int = 0
     ) {
         self.tokens = tokens
         self.position = position
         self.positionUpperBound = positionUpperBound
         self.captureLayers = captureLayers
+        self.positionDelta = positionDelta
     }
 }
 
@@ -159,13 +164,29 @@ public protocol DFlash2TargetModel: LanguageModel {
     func dflash2SupportsCache(_ cache: [KVCache]) -> Bool
 
     /// Ordinary prefill over `tokens` that also returns the outputs of
-    /// `captureLayers` (`[1, S, hidden]` each, in request order).
+    /// `captureLayers` (`[1, S, hidden]` each, in request order). Cache row
+    /// `p` rotates at `p + positionDelta` (see
+    /// ``DFlash2VerifyRequest/positionDelta``).
     func dflash2Prefill(
-        _ tokens: MLXArray, cache: [KVCache], captureLayers: [Int]
+        _ tokens: MLXArray, cache: [KVCache], captureLayers: [Int], positionDelta: Int
     ) -> (logits: MLXArray, hidden: [MLXArray])
 
     /// The verify pass. See ``DFlash2VerifyRequest`` and ``DFlash2VerifyResult``.
     func dflash2Verify(_ request: DFlash2VerifyRequest, cache: [KVCache]) -> DFlash2VerifyResult
+}
+
+/// A DFlash2 target that takes prompts with images: it prefills a prompt
+/// through its last image itself, and the iterator speculates over the text
+/// after it.
+public protocol DFlash2MediaTargetModel: DFlash2TargetModel {
+    /// Prefill `input` into the empty `cache` through its last image or video
+    /// row. Returns the prompt tokens that covers and the rope delta of the
+    /// text after them (``DFlash2VerifyRequest/positionDelta``), or nil,
+    /// before touching the cache, when the prompt has no such row or no text
+    /// after it.
+    func dflash2PrefillMedia(
+        _ input: LMInput, cache: [KVCache], prefill: PrefillParameters
+    ) throws -> (prefilledTokens: Int, positionDelta: Int)?
 }
 
 // MARK: - Recurrent capture
