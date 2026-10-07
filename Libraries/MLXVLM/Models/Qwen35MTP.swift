@@ -2,6 +2,7 @@
 
 import Foundation
 import MLX
+import MLXLLM
 import MLXLMCommon
 import MLXNN
 
@@ -120,7 +121,7 @@ public final class Qwen35VLMNextNDraftModel: Module, StatefulMTPDrafterModel {
         guard let target = target as? Qwen35 else {
             fatalError("Qwen35VLMNextNDraftModel requires a Qwen35 VLM target")
         }
-        let targetEmbedTokens = target.languageModel.model.embedTokens
+        let targetEmbedTokens = target.languageModel.embedTokens
         let inputEmbedding = mtp.embedTokens ?? targetEmbedTokens
         let prompt = normalizedMTPTokenBatch(promptTokens)
         let bonus = normalizedMTPColumn(firstBonus)
@@ -136,7 +137,7 @@ public final class Qwen35VLMNextNDraftModel: Module, StatefulMTPDrafterModel {
         state.seedHidden = mtpHidden[0..., (-1)..., 0...]
         state.seedToken = sampleMTPSeed(
             hidden: state.seedHidden!, targetEmbedTokens: targetEmbedTokens,
-            lmHead: target.languageModel.lmHead, sampler: sampler)
+            lmHead: target.languageModel.head, sampler: sampler)
         state.proposalAppended = 0
     }
 
@@ -179,9 +180,9 @@ public final class Qwen35VLMNextNDraftModel: Module, StatefulMTPDrafterModel {
                 "Qwen35VLMNextNDraftModel requires a Qwen35 VLM target, got \(type(of: target))")
         }
 
-        let targetEmbedTokens = target.languageModel.model.embedTokens
+        let targetEmbedTokens = target.languageModel.embedTokens
         let inputEmbedding = mtp.embedTokens ?? targetEmbedTokens
-        let lmHead = target.languageModel.lmHead
+        let lmHead = target.languageModel.head
 
         if let seed = state.seedToken {
             state.seedToken = nil
@@ -242,7 +243,7 @@ public final class Qwen35VLMNextNDraftModel: Module, StatefulMTPDrafterModel {
         tokens.append(normalizedMTPColumn(finalToken))
         hiddens.append(targetHidden[0..., acceptedCount ..< (acceptedCount + 1), 0...])
 
-        let targetEmbedTokens = target.languageModel.model.embedTokens
+        let targetEmbedTokens = target.languageModel.embedTokens
         let inputEmbedding = mtp.embedTokens ?? targetEmbedTokens
         let committedTokens = concatenated(tokens, axis: 1)
         let committedHidden = concatenated(hiddens, axis: 1)
@@ -254,7 +255,7 @@ public final class Qwen35VLMNextNDraftModel: Module, StatefulMTPDrafterModel {
         state.seedHidden = mtpHidden[0..., (-1)..., 0...]
         state.seedToken = sampleMTPSeed(
             hidden: state.seedHidden!, targetEmbedTokens: targetEmbedTokens,
-            lmHead: target.languageModel.lmHead, sampler: sampler)
+            lmHead: target.languageModel.head, sampler: sampler)
         state.proposalAppended = 0
     }
 

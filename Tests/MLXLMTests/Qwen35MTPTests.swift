@@ -230,21 +230,19 @@ struct Qwen35MTPMetalTests {
             from: Data(qwen35VLMConfigJSON(mtpLayers: 1).utf8))
         let model = MLXVLM.Qwen35(cfg)
         let tokens = MLXArray([Int32(1), 2, 3, 4]).reshaped([1, 4])
-        let base = MLXArray(0 ..< 4).asType(.int32).reshaped([1, 1, 4])
-        let positionIds = broadcast(base, to: [3, 1, 4])
-        let expected = model.languageModel.model(
-            tokens, positionIds: positionIds, applyFinalNorm: false)
+        let expected = model.languageModel.model.forward(tokens, applyFinalNorm: false)
         let normalized = model.languageModel.model.norm(expected)
         var state = LMOutput.State()
         state[mtpEmitFlagKey] = true
 
-        let output = model.languageModel(
-            tokens, cache: nil, state: state, positionIds: positionIds)
+        let output = model(LMInput.Text(tokens: tokens), cache: nil, state: state)
         let emitted = try #require(output.state?[mtpLastHiddenStatesKey])
+        let positionDeltas = try #require(output.state?[mtpPositionDeltasKey])
         eval(expected, normalized, emitted)
 
         #expect(allClose(emitted, normalized, rtol: 0, atol: 0).item(Bool.self))
         #expect(!allClose(emitted, expected, rtol: 0, atol: 0).item(Bool.self))
+        #expect(positionDeltas.asArray(Int32.self) == [0])
     }
 
     @Test

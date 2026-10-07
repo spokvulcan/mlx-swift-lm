@@ -661,6 +661,80 @@ final class Qwen35GatedDeltaNet: Module {
     }
 }
 
+// MARK: - Rotary positions
+
+/// Where a forward pass places its rows on the rotary axes.
+///
+/// The text model rotates cache row `p` at position `p`. A vision-language
+/// wrapper moves text that follows an image by the image's rope delta (the
+/// image spans fewer positions than tokens), and gives explicit positions to
+/// a pass that carries image rows.
+public enum Qwen35RotaryPositions {
+    /// Every row sits at its cache row plus the delta, on all three axes.
+    case shifted(Int)
+    /// Explicit `[3, batch, length]` temporal, height and width positions.
+    case multimodal(MLXArray)
+
+    /// The text model's own placement: row `p` at position `p`.
+    public static var unshifted: Self { .shifted(0) }
+}
+
+extension RoPEOffset {
+    /// The offset moved by `delta` rows; the same value when `delta` is zero.
+    fileprivate func shifted(by delta: Int) -> RoPEOffset {
+        guard delta != 0 else { return self }
+        switch self {
+        case .scalar(let offset): return .scalar(offset + delta)
+        case .batch(let offsets): return .batch(offsets + MLXArray(Int32(delta)))
+        }
+    }
+}
+
+/// Interleaved multimodal RoPE (Qwen3.5's `mrope_section`): frequency `f`
+/// turns at its row's temporal, height or width position. Rows whose three
+/// positions are equal rotate as the plain rope does.
+struct Qwen35MultimodalRoPE {
+    let dimensions: Int
+    /// `[dimensions / 2]` float32 inverse frequencies.
+    private let inverseFrequencies: MLXArray
+    /// `[dimensions / 2]` int32 axis of each frequency: 0 temporal, 1 height, 2 width.
+    private let axes: MLXArray
+
+    init(dimensions: Int, base: Float, scale: Float, sections: [Int]) {
+        self.dimensions = dimensions
+        let half = dimensions / 2
+        let exponents = MLXArray(stride(from: 0, to: dimensions, by: 2)).asType(.float32)
+        inverseFrequencies = scale / pow(MLXArray(base), exponents / Float(dimensions))
+        let sections = sections.count >= 3 ? sections : [11, 11, 10]
+        var axes = [Int32](repeating: 0, count: half)
+        for axis in 1 ... 2 {
+            for index in stride(from: axis, to: min(sections[axis] * 3, half), by: 3) {
+                axes[index] = Int32(axis)
+            }
+        }
+        self.axes = MLXArray(axes)
+    }
+
+    /// Rotates `x` (`[B, heads, L, headDim]`) at `positions` (`[3, B, L]`),
+    /// in float32.
+    func callAsFunction(_ x: MLXArray, positions: MLXArray) -> MLXArray {
+        let half = dimensions / 2
+        // [B, L, half]: each frequency reads its own axis of its row.
+        let rowPositions = take(
+            positions.asType(.float32).transposed(1, 2, 0), axes, axis: -1)
+        let angles = (rowPositions * inverseFrequencies).expandedDimensions(axis: 1)
+        let cosines = cos(angles)
+        let sines = sin(angles)
+        let x1 = x[.ellipsis, ..<half].asType(.float32)
+        let x2 = x[.ellipsis, half ..< dimensions].asType(.float32)
+        let rotated = concatenated(
+            [x1 * cosines - x2 * sines, x2 * cosines + x1 * sines], axis: -1
+        ).asType(x.dtype)
+        guard dimensions < x.dim(-1) else { return rotated }
+        return concatenated([rotated, x[.ellipsis, dimensions...]], axis: -1)
+    }
+}
+
 // MARK: - Attention
 
 final class Qwen35Attention: Module {
@@ -679,6 +753,8 @@ final class Qwen35Attention: Module {
     let rope: RoPELayer
     /// What the fused norm + rope kernel needs of `rope`; nil disables it.
     let plainRope: PlainRoPEParameters?
+    /// The rope of a pass with explicit multimodal positions.
+    let multimodalRope: Qwen35MultimodalRoPE
 
     /// Post-load stacked `q|k|v`; see `SameInputProjectionStacking`.
     var qkvStacked: QuantizedLinear?
@@ -729,15 +805,33 @@ final class Qwen35Attention: Module {
         self.plainRope = PlainRoPEParameters(
             dims: max(1, ropeDims), base: args.ropeTheta, traditional: false,
             scalingConfig: args.ropeScaling)
+        self.multimodalRope = Qwen35MultimodalRoPE(
+            dimensions: max(2, ropeDims), base: args.ropeTheta,
+            scale: plainRope?.scale ?? 1,
+            sections: args.ropeScaling?["mrope_section"]?.asInts() ?? [11, 11, 10])
 
         super.init()
     }
 
     func callAsFunction(
         _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: KVCache?,
-        positionOffset: Int? = nil
+        positionOffset: Int? = nil, positions: Qwen35RotaryPositions = .unshifted
     ) -> MLXArray {
-        let offset = positionOffset.map(RoPEOffset.scalar) ?? cache?.ropeOffset
+        let delta: Int
+        switch positions {
+        case .multimodal(let positionIds):
+            let (q, gate, k, values) = projectPreRope(x)
+            let output = attentionWithCacheUpdate(
+                queries: multimodalRope(q, positions: positionIds),
+                keys: multimodalRope(k, positions: positionIds),
+                values: values, cache: cache, scale: kernelScale, mask: mask)
+            return mergeHeadsAndProject(attention: output, gate: gate)
+        case .shifted(let shift):
+            delta = shift
+        }
+        let offset =
+            (positionOffset.map(RoPEOffset.scalar) ?? cache?.ropeOffset)
+            .map { $0.shifted(by: delta) } ?? (delta == 0 ? nil : .scalar(delta))
         let offsetArray: MLXArray
         switch offset {
         case nil: offsetArray = MLXArray([Int32(0)])
@@ -871,10 +965,10 @@ extension Qwen35Attention: SameInputProjectionStacking {
     }
 }
 
-/// The cache's rope offset as a `[1]` array, the trace input the compiled
-/// segments take (`.batch` semantics, batch size 1).
-private func ropeOffsetArray(_ cache: KVCache) -> MLXArray {
-    switch cache.ropeOffset {
+/// The cache's rope offset, moved by `delta`, as a `[1]` array: the trace
+/// input the compiled segments take (`.batch` semantics, batch size 1).
+private func ropeOffsetArray(_ cache: KVCache, shiftedBy delta: Int = 0) -> MLXArray {
+    switch cache.ropeOffset.shifted(by: delta) {
     case .scalar(let offset): MLXArray([Int32(offset)])
     case .batch(let offsets): offsets
     }
@@ -1002,17 +1096,18 @@ final class Qwen35DecoderLayer: Module {
         ssmMask: MLXArray?,
         cache: KVCache?,
         positionOffset: Int? = nil,
+        positions: Qwen35RotaryPositions = .unshifted,
         checkpointAfter: Int? = nil
     ) -> MLXArray {
         // Single-token unmasked decode runs the layer as one traced function
         // (two for full attention, split at the KV write). Everything else
         // takes the general body below.
-        if x.dim(1) == 1, ssmMask == nil {
+        if x.dim(1) == 1, ssmMask == nil, case .shifted(let delta) = positions {
             if isLinear, let mambaCache = cache as? MambaCache {
                 return decodeLinearLayer(x, cache: mambaCache)
             }
             if !isLinear, let cache, supportsUntracedDecodeAttention(cache) {
-                return decodeAttentionLayer(x, mask: attentionMask, cache: cache)
+                return decodeAttentionLayer(x, mask: attentionMask, cache: cache, ropeDelta: delta)
             }
         }
 
@@ -1024,7 +1119,7 @@ final class Qwen35DecoderLayer: Module {
         } else {
             r = selfAttn!(
                 inputLayerNorm(x), mask: attentionMask, cache: cache,
-                positionOffset: positionOffset)
+                positionOffset: positionOffset, positions: positions)
         }
 
         let (h, normed) = rmsNormResidual(
@@ -1075,9 +1170,11 @@ final class Qwen35DecoderLayer: Module {
     /// Full-attention decode layer: two traced functions around the KV write,
     /// which cannot live inside a trace because the cache grows every token.
     private func decodeAttentionLayer(
-        _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: KVCache
+        _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: KVCache,
+        ropeDelta: Int
     ) -> MLXArray {
-        let projected = compiledAttentionPre(self, [x, ropeOffsetArray(cache)])
+        let projected = compiledAttentionPre(
+            self, [x, ropeOffsetArray(cache, shiftedBy: ropeDelta)])
         let attention = attentionCacheStep(
             queries: projected[0], keys: projected[2], values: projected[3],
             cache: cache, mask: mask)
@@ -1241,30 +1338,37 @@ public class Qwen35TextModelInner: Module {
     /// post-final-norm hidden representation used by the target LM head.
     func forward(
         _ inputs: MLXArray,
+        inputEmbeddings: MLXArray? = nil,
         cache: [KVCache?]? = nil,
+        positions: Qwen35RotaryPositions = .unshifted,
         applyFinalNorm: Bool,
         checkpointAfter: Int? = nil
     ) -> MLXArray {
-        if applyFinalNorm, inputs.dim(1) == 1, let caches = cache,
-            let step = decodeStep(inputs, caches)
+        if applyFinalNorm, inputEmbeddings == nil, inputs.dim(1) == 1,
+            case .shifted(let delta) = positions, let caches = cache,
+            let step = decodeStep(inputs, caches, ropeDelta: delta)
         {
             return step
         }
         let hiddenStates = forwardLayers(
-            inputs, cache: cache, checkpointAfter: checkpointAfter, captureLayers: []
+            inputs, inputEmbeddings: inputEmbeddings, cache: cache, positions: positions,
+            checkpointAfter: checkpointAfter, captureLayers: []
         ).hidden
         return applyFinalNorm ? norm(hiddenStates) : hiddenStates
     }
 
     /// The general layer loop, without the final norm. Also returns the
-    /// outputs of `captureLayers`, in that order.
+    /// outputs of `captureLayers`, in that order. `inputEmbeddings`, when
+    /// given, replaces the embedding of `inputs`.
     func forwardLayers(
         _ inputs: MLXArray,
+        inputEmbeddings: MLXArray? = nil,
         cache: [KVCache?]?,
+        positions: Qwen35RotaryPositions = .unshifted,
         checkpointAfter: Int? = nil,
         captureLayers: [Int]
     ) -> (hidden: MLXArray, captured: [MLXArray]) {
-        var hiddenStates = embedTokens(inputs)
+        var hiddenStates = inputEmbeddings ?? embedTokens(inputs)
         var captured: [Int: MLXArray] = [:]
 
         var cacheArray = cache
@@ -1282,7 +1386,7 @@ public class Qwen35TextModelInner: Module {
                 ? MLXFast.ScaledDotProductAttentionMaskMode.none : faMask
             hiddenStates = layer(
                 hiddenStates, attentionMask: attnMask, ssmMask: mask, cache: cacheArray?[i],
-                checkpointAfter: checkpointAfter)
+                positions: positions, checkpointAfter: checkpointAfter)
             if captureLayers.contains(i) {
                 captured[i] = hiddenStates
             }
@@ -1369,7 +1473,9 @@ public class Qwen35TextModelInner: Module {
     /// update's in-place slice_update cannot live inside a trace, and
     /// everything else on a decode step is static-shaped, so the segments
     /// compile concretely.
-    private func decodeStep(_ inputs: MLXArray, _ cache: [KVCache?]) -> MLXArray? {
+    private func decodeStep(
+        _ inputs: MLXArray, _ cache: [KVCache?], ropeDelta: Int = 0
+    ) -> MLXArray? {
         guard cache.count == layers.count else { return nil }
         // The schedule is only valid when the masks the general path would
         // build both come out empty.
@@ -1405,7 +1511,7 @@ public class Qwen35TextModelInner: Module {
                 args.append(mambaCache[1]!)
             }
             if let pre = segment.attentionPreLayer {
-                args.append(ropeOffsetArray(cache[pre]!))
+                args.append(ropeOffsetArray(cache[pre]!, shiftedBy: ropeDelta))
             }
 
             let outputs = compiledSegments(self, at: segmentIndex, args)
@@ -1501,6 +1607,10 @@ public class Qwen35TextModelInner: Module {
         let rows = (request.position.asType(.int32) + MLXArray(Int32(0) ..< Int32(length)))
             .expandedDimensions(axis: 1)
         let mask = columns .< (rows + 1)
+        // The rows land at the cache position; they rotate past the prompt's images.
+        let ropePosition =
+            request.positionDelta == 0
+            ? request.position : request.position + MLXArray(Int32(request.positionDelta))
 
         var carry = request.tokens
         var pendingAttention: [MLXArray] = []
@@ -1515,7 +1625,7 @@ public class Qwen35TextModelInner: Module {
                 args.append(mambaCache[1]!)
             }
             if segment.attentionPreLayer != nil {
-                args.append(request.position)
+                args.append(ropePosition)
             }
 
             let key = VerifySegmentKey(
@@ -1608,15 +1718,35 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
     public func callAsFunction(
         _ input: LMInput.Text, cache: [KVCache]?, state: LMOutput.State?
     ) -> LMOutput {
+        self(input.tokens, inputEmbeddings: nil, cache: cache, positions: .unshifted, state: state)
+    }
+
+    /// The token embedding table, which a vision-language wrapper merges
+    /// image features into.
+    public var embedTokens: Embedding { model.embedTokens }
+
+    /// The output head; nil when tied to the embedding table.
+    public var head: Linear? { lmHead }
+
+    /// One forward over `inputs`, or over `inputEmbeddings` when a
+    /// vision-language wrapper merged image features into them, with the
+    /// rows at `positions`. Emits the MTP drafter state when `state` asks for
+    /// it, as the `LMInput.Text` overload does.
+    public func callAsFunction(
+        _ inputs: MLXArray, inputEmbeddings: MLXArray?, cache: [KVCache]?,
+        positions: Qwen35RotaryPositions, state: LMOutput.State?
+    ) -> LMOutput {
         let emitDrafterState = state?[mtpEmitFlagKey] ?? false
         let hiddenStates: MLXArray
         if emitDrafterState {
             let hidden = model.forward(
-                input.tokens, cache: cache, applyFinalNorm: false,
-                checkpointAfter: state?[mtpCacheCheckpointIndexKey])
+                inputs, inputEmbeddings: inputEmbeddings, cache: cache, positions: positions,
+                applyFinalNorm: false, checkpointAfter: state?[mtpCacheCheckpointIndexKey])
             hiddenStates = model.norm(hidden)
         } else {
-            hiddenStates = model(input.tokens, cache: cache)
+            hiddenStates = model.forward(
+                inputs, inputEmbeddings: inputEmbeddings, cache: cache, positions: positions,
+                applyFinalNorm: true)
         }
 
         let logits: MLXArray
@@ -1744,10 +1874,11 @@ extension Qwen35TextModel: DFlash2TargetModel {
     }
 
     public func dflash2Prefill(
-        _ tokens: MLXArray, cache: [KVCache], captureLayers: [Int]
+        _ tokens: MLXArray, cache: [KVCache], captureLayers: [Int], positionDelta: Int
     ) -> (logits: MLXArray, hidden: [MLXArray]) {
         let (hidden, captured) = model.forwardLayers(
-            tokens, cache: cache, captureLayers: captureLayers)
+            tokens, cache: cache, positions: .shifted(positionDelta),
+            captureLayers: captureLayers)
         return (logits(model.norm(hidden)), captured)
     }
 
@@ -1839,9 +1970,10 @@ extension Qwen35Model: DFlash2TargetModel {
     }
 
     public func dflash2Prefill(
-        _ tokens: MLXArray, cache: [KVCache], captureLayers: [Int]
+        _ tokens: MLXArray, cache: [KVCache], captureLayers: [Int], positionDelta: Int
     ) -> (logits: MLXArray, hidden: [MLXArray]) {
-        languageModel.dflash2Prefill(tokens, cache: cache, captureLayers: captureLayers)
+        languageModel.dflash2Prefill(
+            tokens, cache: cache, captureLayers: captureLayers, positionDelta: positionDelta)
     }
 
     public func dflash2Verify(

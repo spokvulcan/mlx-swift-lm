@@ -119,6 +119,8 @@ let package = Package(
             name: "MLXVLM",
             dependencies: [
                 "MLXLMCommon",
+                // Qwen 3.5's vision wrapper runs the text model's tuned engine.
+                "MLXLLM",
                 .product(name: "MLX", package: "mlx-swift"),
                 .product(name: "MLXNN", package: "mlx-swift"),
                 .product(name: "MLXOptimizers", package: "mlx-swift"),

@@ -9,6 +9,7 @@
 
 import Foundation
 import MLX
+import MLXLLM
 import MLXLMCommon
 import MLXNN
 
@@ -16,8 +17,8 @@ private enum Qwen35VLError: Error {
     case featureTokenMismatch(expected: Int, actual: Int)
 }
 
-private let precomputedPositionIdsKey = LMOutput.Key<MLXArray>(
-    "qwen35.precomputedPositionIds")
+/// Per batch row, how far text rotates past its cache row: the images
+/// before it span fewer positions than tokens.
 private let ropeDeltasKey = LMOutput.Key<MLXArray>(
     "qwen35.ropeDeltas")
 
@@ -817,294 +818,50 @@ public enum Qwen35Language {
             return h + (mlp as! UnaryLayer)(postAttentionLayerNorm(h))
         }
     }
-
-    open class Model: Module {
-        @ModuleInfo(key: "embed_tokens") var embedTokens: Embedding
-        @ModuleInfo(key: "layers") fileprivate var layers: [DecoderLayer]
-        @ModuleInfo(key: "norm") var norm: RMSNorm
-
-        let ssmIdx: Int
-        let faIdx: Int
-
-        public init(_ args: Qwen35Configuration.TextConfiguration) {
-            precondition(args.vocabularySize > 0)
-            _embedTokens.wrappedValue = Embedding(
-                embeddingCount: args.vocabularySize, dimensions: args.hiddenSize)
-            _layers.wrappedValue = (0 ..< args.hiddenLayers).map {
-                DecoderLayer(args, layerIdx: $0)
-            }
-            _norm.wrappedValue = RMSNorm(dimensions: args.hiddenSize, eps: args.rmsNormEps)
-
-            self.ssmIdx = 0
-            self.faIdx = args.fullAttentionInterval - 1
-            super.init()
-        }
-
-        open func callAsFunction(
-            _ inputs: MLXArray,
-            inputsEmbeds: MLXArray? = nil,
-            cache: [KVCache?]? = nil,
-            positionIds: MLXArray? = nil,
-            applyFinalNorm: Bool = true,
-            checkpointAfter: Int? = nil
-        ) -> MLXArray {
-            var hiddenStates: MLXArray
-            if let inputsEmbeds {
-                hiddenStates = inputsEmbeds
-            } else {
-                hiddenStates = embedTokens(inputs)
-            }
-
-            var cacheArray = cache
-            if cacheArray == nil {
-                cacheArray = Array(repeating: nil as KVCache?, count: layers.count)
-            }
-
-            let faMaskMode = createAttentionMask(
-                h: hiddenStates, cache: cacheArray?[faIdx], returnArray: true)
-            let faMask: MLXArray?
-            if case .array(let arrayMask) = faMaskMode {
-                faMask = arrayMask
-            } else {
-                faMask = nil
-            }
-            let ssmMask = createSSMMask(h: hiddenStates, cache: cacheArray?[ssmIdx] as? MambaCache)
-
-            for (index, layer) in layers.enumerated() {
-                let layerSSMMask = layer.isLinear ? ssmMask : nil
-                hiddenStates = layer(
-                    hiddenStates,
-                    attentionMask: faMask,
-                    ssmMask: layerSSMMask,
-                    cache: cacheArray?[index],
-                    positionIds: positionIds,
-                    checkpointAfter: checkpointAfter
-                )
-            }
-
-            return applyFinalNorm ? norm(hiddenStates) : hiddenStates
-        }
-    }
-
-    final class LanguageModel: Module {
-        @ModuleInfo var model: Model
-        @ModuleInfo(key: "lm_head") var lmHead: Linear?
-
-        let config: Qwen35Configuration
-        let textConfig: Qwen35Configuration.TextConfiguration
-        let modelType: String
-        let kvHeads: [Int]
-
-        init(_ config: Qwen35Configuration) {
-            self.config = config
-            self.textConfig = config.textConfiguration
-            self.modelType = config.textConfiguration.modelType
-            self.model = Model(config.textConfiguration)
-            self.kvHeads = Array(
-                repeating: config.textConfiguration.kvHeads,
-                count: config.textConfiguration.hiddenLayers
-            )
-
-            if !config.textConfiguration.tieWordEmbeddings {
-                _lmHead.wrappedValue = Linear(
-                    config.textConfiguration.hiddenSize,
-                    config.textConfiguration.vocabularySize,
-                    bias: false)
-            }
-            super.init()
-        }
-
-        func callAsFunction(
-            _ inputs: MLXArray,
-            inputsEmbeds: MLXArray? = nil,
-            cache: [KVCache?]? = nil,
-            state: LMOutput.State?,
-            mask: MLXArray? = nil,
-            positionIds providedPositionIds: MLXArray? = nil,
-            pixelValues: MLXArray? = nil,
-            imageGridTHW: [THW]? = nil,
-            videoGridTHW: [THW]? = nil
-        ) -> LMOutput {
-            var state = state ?? .init()
-
-            // Ensure inputs is 2D [batch, seq]. Text-only callers (e.g.
-            // WiredMemoryUtils, TokenIterator) may pass 1D token arrays.
-            let inputs = inputs.ndim == 1 ? inputs.expandedDimensions(axis: 0) : inputs
-
-            if pixelValues != nil {
-                state[precomputedPositionIdsKey] = nil
-                state[ropeDeltasKey] = nil
-            }
-            let precomputedPositionIds = state[precomputedPositionIdsKey]
-            let ropeDeltas = state[ropeDeltasKey]
-
-            var cacheOffset = 0
-            if let cache, let faCache = cache[model.faIdx] {
-                cacheOffset = faCache.offset
-            }
-
-            var ropeMask = mask
-            if let mask, mask.dim(-1) != inputs.dim(-1) {
-                ropeMask = nil
-            }
-
-            var positionIds = providedPositionIds
-            if positionIds == nil && (ropeMask == nil || ropeMask?.ndim == 2) {
-                if (cache != nil && cache?[model.faIdx] != nil && cacheOffset == 0)
-                    || ropeDeltas == nil
-                    || cache == nil
-                {
-                    if let precomputedPositionIds {
-                        let seqLength = inputs.dim(1)
-                        positionIds =
-                            precomputedPositionIds[
-                                0..., 0..., cacheOffset ..< (cacheOffset + seqLength)]
-                    } else {
-                        let (computed, deltas) = Qwen3VLLanguage.getRopeIndex(
-                            inputIds: inputs,
-                            imageGridTHW: imageGridTHW,
-                            videoGridTHW: videoGridTHW,
-                            spatialMergeSize: config.visionConfiguration.spatialMergeSize,
-                            imageTokenId: config.imageTokenId,
-                            videoTokenId: config.videoTokenId,
-                            visionStartTokenId: config.visionStartTokenId,
-                            attentionMask: ropeMask)
-                        positionIds = computed
-                        state[precomputedPositionIdsKey] = computed
-                        state[ropeDeltasKey] = deltas
-                    }
-                } else {
-                    let batchSize = inputs.dim(0)
-                    let seqLength = inputs.dim(1)
-
-                    var delta = MLXArray(cacheOffset).asType(.int32)
-                    if let ropeDeltas {
-                        delta = delta + ropeDeltas.asType(.int32)
-                    }
-
-                    var base = MLXArray(0 ..< seqLength).asType(.int32)
-                    base = broadcast(base[.newAxis, 0...], to: [batchSize, seqLength])
-
-                    if delta.ndim == 0 {
-                        delta = broadcast(delta, to: [batchSize])
-                    } else if delta.dim(0) < batchSize {
-                        delta = repeated(delta, count: batchSize, axis: 0)
-                    } else if delta.dim(0) > batchSize {
-                        delta = delta[0 ..< batchSize]
-                    }
-
-                    base = base + delta[0..., .newAxis]
-                    positionIds = broadcast(
-                        base[.newAxis, 0..., 0...], to: [3, batchSize, seqLength])
-                }
-            }
-
-            let emitDrafterState = state[mtpEmitFlagKey] ?? false
-            let preNormHidden = model(
-                inputs,
-                inputsEmbeds: inputsEmbeds,
-                cache: cache,
-                positionIds: positionIds,
-                applyFinalNorm: !emitDrafterState,
-                checkpointAfter: state[mtpCacheCheckpointIndexKey]
-            )
-            let hiddenStates = emitDrafterState ? model.norm(preNormHidden) : preNormHidden
-
-            var out = hiddenStates
-            if let lmHead {
-                out = lmHead(out)
-            } else {
-                out = model.embedTokens.asLinear(out)
-            }
-
-            if emitDrafterState {
-                state[mtpLastHiddenStatesKey] = hiddenStates
-                state[mtpSharedKVStatesKey] = qwen35VLMSharedKVState(
-                    cache: cache, fullAttentionIndex: model.faIdx)
-                state[mtpSharedKVOffsetsKey] = qwen35VLMSharedKVOffsets(
-                    cache: cache, fullAttentionIndex: model.faIdx)
-                state[mtpSharedKVSourceIndicesKey] = ["full_attention": model.faIdx]
-                state[mtpPositionDeltasKey] = state[ropeDeltasKey]
-            }
-
-            return LMOutput(logits: out, state: state)
-        }
-
-        func makeCache(capacity: KVCacheConfiguration.Capacity?) -> [KVCache] {
-            model.layers.map { layer in
-                if layer.isLinear {
-                    return MambaCache()
-                }
-                if let capacity {
-                    return capacity.makeRotatingCache()
-                }
-                return KVCacheSimple()
-            }
-        }
-
-        func prepare() throws {
-            for layer in model.layers {
-                if let linearAttn = layer.linearAttn {
-                    _ = try linearAttn.prepareFusedInputProjection()
-                }
-            }
-        }
-    }
-}
-
-private func qwen35VLMSharedKVState(
-    cache: [KVCache?]?,
-    fullAttentionIndex: Int
-) -> [String: (MLXArray, MLXArray)] {
-    guard let cache,
-        fullAttentionIndex < cache.count,
-        let faCache = cache[fullAttentionIndex]
-    else {
-        return [:]
-    }
-    let state = faCache.state
-    guard state.count == 2 else {
-        return [:]
-    }
-    return ["full_attention": (state[0], state[1])]
-}
-
-private func qwen35VLMSharedKVOffsets(
-    cache: [KVCache?]?,
-    fullAttentionIndex: Int
-) -> [String: Int]? {
-    guard let cache,
-        fullAttentionIndex < cache.count,
-        let faCache = cache[fullAttentionIndex]
-    else {
-        return nil
-    }
-    return ["full_attention": faCache.offset]
 }
 
 // MARK: - Model
 
-public class Qwen35: Module, VLMModel {
+extension Qwen35Configuration.TextConfiguration {
+    /// This configuration as the text model reads it: the values resolved
+    /// here, defaults included, decoded into the text model's own type.
+    var languageModelConfiguration: Qwen35TextConfiguration {
+        do {
+            return try JSONDecoder().decode(
+                Qwen35TextConfiguration.self, from: JSONEncoder().encode(self))
+        } catch {
+            preconditionFailure("Qwen3.5 text configuration does not round-trip: \(error)")
+        }
+    }
+}
+
+/// Qwen3.5 vision-language model: the vision tower in front of the text
+/// model's own engine (`MLXLLM.Qwen35TextModel`), so compiled decode,
+/// DFlash2 verify and MTP state serve image prompts as they serve text.
+public class Qwen35: Module, VLMModel, KVCacheDimensionProvider {
     @ModuleInfo(key: "vision_tower") private var visionModel: Qwen3VLVision.VisionModel
-    @ModuleInfo(key: "language_model") var languageModel: Qwen35Language.LanguageModel
+    @ModuleInfo(key: "language_model") var languageModel: Qwen35TextModel
 
     public let config: Qwen35Configuration
 
     public init(_ config: Qwen35Configuration) {
         self.config = config
         _visionModel.wrappedValue = Qwen3VLVision.VisionModel(config.visionConfiguration)
-        _languageModel.wrappedValue = Qwen35Language.LanguageModel(config)
+        _languageModel.wrappedValue = Qwen35TextModel(
+            config.textConfiguration.languageModelConfiguration)
         super.init()
     }
 
     public var vocabularySize: Int { config.vocabSize }
 
+    public var kvHeads: [Int] { languageModel.kvHeads }
+
     public var loraLayers: [Module] {
-        languageModel.model.layers
+        languageModel.loraLayers
     }
 
     public func newCache(parameters: GenerateParameters?) throws -> [KVCache] {
-        languageModel.makeCache(capacity: try parameters?.effectiveKVCacheCapacity())
+        try languageModel.newCache(parameters: parameters)
     }
 
     public func prepare() throws {
@@ -1204,7 +961,7 @@ public class Qwen35: Module, VLMModel {
                 .nilIfEmpty
         {
             let inputIds = input.text.tokens
-            let textEmbeds = languageModel.model.embedTokens(inputIds)
+            let textEmbeds = languageModel.embedTokens(inputIds)
             let (visionHidden, _) = visionModel(pixelValues, gridTHW: frames)
             let visionFeatures = visionHidden.asType(textEmbeds.dtype)
 
@@ -1256,19 +1013,32 @@ public class Qwen35: Module, VLMModel {
         let (pixelValues, imageFrames, videoFrames, inputEmbeddings) =
             try visionInputEmbeddings(input)
 
+        // A cold prompt: text rotates as the text model does; images get
+        // their M-RoPE positions from zero.
+        var state = state ?? .init()
+        let positions: Qwen35RotaryPositions
+        if pixelValues == nil {
+            positions = .unshifted
+            state[ropeDeltasKey] = MLXArray([Int32](repeating: 0, count: inputIds2D.dim(0)))
+        } else {
+            let (positionIds, deltas) = Qwen3VLLanguage.getRopeIndex(
+                inputIds: inputIds2D,
+                imageGridTHW: imageFrames,
+                videoGridTHW: videoFrames,
+                spatialMergeSize: config.visionConfiguration.spatialMergeSize,
+                imageTokenId: config.imageTokenId,
+                videoTokenId: config.videoTokenId,
+                visionStartTokenId: config.visionStartTokenId,
+                attentionMask: input.text.mask)
+            positions = .multimodal(positionIds)
+            state[ropeDeltasKey] = deltas
+        }
+
         let typedCache = castCache(cache)
         let output = withPreparedCache(cache, lengths: input.text.sequenceLengths) {
-            languageModel(
-                inputIds,
-                inputsEmbeds: inputEmbeddings,
-                cache: typedCache,
-                state: state,
-                mask: input.text.mask,
-                positionIds: nil,
-                pixelValues: pixelValues,
-                imageGridTHW: imageFrames,
-                videoGridTHW: videoFrames
-            )
+            languageForward(
+                inputIds2D, inputEmbeddings: inputEmbeddings, cache: typedCache,
+                positions: positions, state: state)
         }
 
         let total = inputIds.dim(-1)
@@ -1279,8 +1049,24 @@ public class Qwen35: Module, VLMModel {
     /// Offset of the first full-attention layer's cache — the model's notion
     /// of "how many tokens are already cached".
     private func faCacheOffset(_ cache: [any KVCache]) -> Int {
-        let faIdx = languageModel.model.faIdx
+        let faIdx = config.textConfiguration.fullAttentionInterval - 1
         return cache.indices.contains(faIdx) ? cache[faIdx].offset : 0
+    }
+
+    /// The text model's forward. The returned state keeps the rope delta
+    /// `state` carries, and hands it to an MTP drafter that asked for state.
+    private func languageForward(
+        _ inputs: MLXArray, inputEmbeddings: MLXArray?, cache: [KVCache]?,
+        positions: Qwen35RotaryPositions, state: LMOutput.State
+    ) -> LMOutput {
+        let output = languageModel(
+            inputs, inputEmbeddings: inputEmbeddings, cache: cache, positions: positions,
+            state: state)
+        var outState = output.state ?? state
+        if state[mtpEmitFlagKey] ?? false {
+            outState[mtpPositionDeltasKey] = state[ropeDeltasKey]
+        }
+        return LMOutput(logits: output.logits, state: outState)
     }
 
     /// Warm, windowed continuation through an image-bearing remainder — the
@@ -1317,20 +1103,42 @@ public class Qwen35: Module, VLMModel {
         let (_, imageFrames, videoFrames, inputEmbeddings) =
             try visionInputEmbeddings(input)
 
-        // Offset-aware M-RoPE positions for the whole remainder — once. The new
-        // image's t/h/w indices diverge from the anchor; the returned delta is
-        // in the same offset frame.
-        let (positionIds, ropeDeltas) = Qwen3VLLanguage.getRopeIndex(
-            inputIds: inputIds,
-            imageGridTHW: imageFrames,
-            videoGridTHW: videoFrames,
-            spatialMergeSize: config.visionConfiguration.spatialMergeSize,
-            imageTokenId: config.imageTokenId,
-            videoTokenId: config.videoTokenId,
-            visionStartTokenId: config.visionStartTokenId,
-            attentionMask: input.text.mask,
-            positionOffset: positionOffset
-        )
+        // Where each chunk's rows rotate. Text rows sit at their cache row
+        // plus a delta and take the text model's own rope; only a chunk that
+        // holds image rows needs explicit M-RoPE positions. `resumeDelta` is
+        // the delta the text after this remainder continues with.
+        let chunkPositions: (Range<Int>) -> Qwen35RotaryPositions
+        let resumeDelta: Int
+        if inputEmbeddings == nil {
+            resumeDelta = positionOffset - cacheOffset
+            chunkPositions = { _ in .shifted(resumeDelta) }
+        } else {
+            // Offset-aware M-RoPE positions for the whole remainder — once. The
+            // new image's t/h/w indices diverge from the anchor; the returned
+            // delta is in the same offset frame.
+            let (positionIds, ropeDeltas) = Qwen3VLLanguage.getRopeIndex(
+                inputIds: inputIds,
+                imageGridTHW: imageFrames,
+                videoGridTHW: videoFrames,
+                spatialMergeSize: config.visionConfiguration.spatialMergeSize,
+                imageTokenId: config.imageTokenId,
+                videoTokenId: config.videoTokenId,
+                visionStartTokenId: config.visionStartTokenId,
+                attentionMask: input.text.mask,
+                positionOffset: positionOffset
+            )
+            resumeDelta = ropeDeltas[0].item(Int.self) - cacheOffset
+            let tokens = inputIds[0].asArray(Int32.self)
+            let rowPositions = positionIds[0, 0].asArray(Int32.self)
+            let media = Set([Int32(config.imageTokenIndex), Int32(config.videoTokenIndex)])
+            chunkPositions = { range in
+                if tokens[range].contains(where: media.contains) {
+                    return .multimodal(positionIds[0..., 0..., range])
+                }
+                return .shifted(
+                    Int(rowPositions[range.lowerBound]) - (cacheOffset + range.lowerBound))
+            }
+        }
 
         // Chunk the forward. Each window forwards `chunk` query tokens against
         // the growing cache, so the full-attention scratch stays `[heads,
@@ -1346,17 +1154,10 @@ public class Qwen35: Module, VLMModel {
         func forward(_ range: Range<Int>) -> LMOutput {
             languageModel(
                 inputIds[0..., range],
-                inputsEmbeds: inputEmbeddings.map { $0[0..., range, 0...] },
+                inputEmbeddings: inputEmbeddings.map { $0[0..., range, 0...] },
                 cache: typedCache,
-                state: nil,
-                mask: nil,
-                positionIds: positionIds[0..., 0..., range],
-                // Never the pixels: a non-nil value here clears the carried
-                // anchor and restarts positions at zero.
-                pixelValues: nil,
-                imageGridTHW: nil,
-                videoGridTHW: nil
-            )
+                positions: chunkPositions(range),
+                state: nil)
         }
 
         let processed = try prefill.forEachChunk(total: remainderLength) { range in
@@ -1372,37 +1173,59 @@ public class Qwen35: Module, VLMModel {
         let lastLogits = forward(processed ..< remainderLength).logits
         prefill.progress?(remainderLength, remainderLength)
 
-        // Seed the post-image text tail's anchor. The vendor's flat-continuation
-        // branch positions tail token j at `tailCacheOffset + ropeDeltas + j`;
-        // after this remainder `tailCacheOffset = P + remainderLength`, so the
-        // delta the tail needs is the offset-frame `getRopeIndex` delta minus
-        // `P` (which `getRopeIndex` implicitly counted into `remainderLength`).
-        return .logits(
-            LMOutput(
-                logits: lastLogits,
-                state: QwenVL.continuationResumeState(
-                    ropeDeltas: ropeDeltas, cacheOffset: cacheOffset, key: ropeDeltasKey)))
+        // Seed the post-image text tail's anchor: tail token j rotates at
+        // `tailCacheOffset + delta + j`. Host-built, so decode reads it
+        // without waiting on the GPU.
+        var resumeState = LMOutput.State()
+        resumeState[ropeDeltasKey] = MLXArray([Int32(resumeDelta)])
+        return .logits(LMOutput(logits: lastLogits, state: resumeState))
     }
 
     public func callAsFunction(
         _ input: LMInput.Text, cache: [any KVCache]?, state: LMOutput.State?
     ) -> LMOutput {
+        let cacheOffset = faCacheOffset(cache ?? [])
         precondition(
-            faCacheOffset(cache ?? []) == 0 || state?[ropeDeltasKey] != nil,
+            cacheOffset == 0 || state?[ropeDeltasKey] != nil,
             "Qwen35 cannot continue a warm prompt cache without \(ropeDeltasKey.id)")
-        let typedCache = castCacheOptional(cache)
-        let result = languageModel(
-            input.tokens,
-            inputsEmbeds: nil,
-            cache: typedCache,
-            state: state,
-            mask: nil,
-            positionIds: nil,
-            pixelValues: nil,
-            imageGridTHW: nil,
-            videoGridTHW: nil
-        )
-        return result
+        let inputs =
+            input.tokens.ndim == 1 ? input.tokens.expandedDimensions(axis: 0) : input.tokens
+        var state = state ?? .init()
+        let positions: Qwen35RotaryPositions
+        if cacheOffset == 0 {
+            positions = .unshifted
+            state[ropeDeltasKey] = MLXArray([Int32](repeating: 0, count: inputs.dim(0)))
+        } else {
+            positions = continuingPositions(
+                deltas: state[ropeDeltasKey]!, cacheOffset: cacheOffset, inputs: inputs)
+        }
+        return languageForward(
+            inputs, inputEmbeddings: nil, cache: castCacheOptional(cache), positions: positions,
+            state: state)
+    }
+
+    /// Positions for text continuing a warm cache: each row's cache row plus
+    /// its batch row's delta. One delta for every row is the text model's
+    /// own rope, shifted.
+    private func continuingPositions(
+        deltas: MLXArray, cacheOffset: Int, inputs: MLXArray
+    ) -> Qwen35RotaryPositions {
+        let batchSize = inputs.dim(0)
+        // Read every decode step: an int32 delta is read as stored, with no
+        // conversion op to wait on.
+        var rowDeltas = (deltas.dtype == .int32 ? deltas : deltas.asType(.int32))
+            .asArray(Int32.self)
+        if rowDeltas.count < batchSize {
+            rowDeltas += Array(repeating: rowDeltas.last ?? 0, count: batchSize - rowDeltas.count)
+        }
+        rowDeltas = Array(rowDeltas.prefix(batchSize))
+        if Set(rowDeltas).count == 1 {
+            return .shifted(Int(rowDeltas[0]))
+        }
+        let length = inputs.dim(1)
+        let rows = MLXArray(Int32(cacheOffset) ..< Int32(cacheOffset + length))
+        let perRow = rows[.newAxis, 0...] + MLXArray(rowDeltas)[0..., .newAxis]
+        return .multimodal(broadcast(perRow[.newAxis], to: [3, batchSize, length]))
     }
 
     public func sanitize(weights: [String: MLXArray], metadata: [String: String]) -> [String:
@@ -1487,6 +1310,58 @@ public class Qwen35: Module, VLMModel {
 
 extension Qwen35: SpeculativeCacheRewindModel {
     public var maximumNativeTargetCacheRewind: Int { 1 }
+}
+
+/// The text model's DFlash2 target. A prompt's images are prefilled through
+/// ``prepare(_:cache:state:prefill:)`` first; the speculative iterator then
+/// takes the text after them, rotated by their rope delta.
+extension Qwen35: DFlash2TargetModel {
+    public var dflash2LayerCount: Int { languageModel.dflash2LayerCount }
+    public var dflash2Embedding: Embedding { languageModel.dflash2Embedding }
+    public var dflash2Head: Linear? { languageModel.dflash2Head }
+
+    public func dflash2SupportsCache(_ cache: [KVCache]) -> Bool {
+        languageModel.dflash2SupportsCache(cache)
+    }
+
+    public func dflash2Prefill(
+        _ tokens: MLXArray, cache: [KVCache], captureLayers: [Int], positionDelta: Int
+    ) -> (logits: MLXArray, hidden: [MLXArray]) {
+        languageModel.dflash2Prefill(
+            tokens, cache: cache, captureLayers: captureLayers, positionDelta: positionDelta)
+    }
+
+    public func dflash2Verify(
+        _ request: DFlash2VerifyRequest, cache: [KVCache]
+    ) -> DFlash2VerifyResult {
+        languageModel.dflash2Verify(request, cache: cache)
+    }
+}
+
+extension Qwen35: DFlash2MediaTargetModel {
+    /// Runs ``prepare(_:cache:state:prefill:)`` over the prompt through its
+    /// last image or video row. Nil when the prompt has no such row or no
+    /// text after it.
+    public func dflash2PrefillMedia(
+        _ input: LMInput, cache: [KVCache], prefill: PrefillParameters
+    ) throws -> (prefilledTokens: Int, positionDelta: Int)? {
+        let tokens = input.text.tokens.reshaped(1, -1)
+        let ids = tokens[0].asArray(Int32.self)
+        let media = Set([Int32(config.imageTokenIndex), Int32(config.videoTokenIndex)])
+        guard let last = ids.lastIndex(where: media.contains), last + 1 < ids.count else {
+            return nil
+        }
+        let prefix = LMInput(
+            text: LMInput.Text(tokens: tokens[0..., ..<(last + 1)]), image: input.image,
+            video: input.video)
+        guard
+            case .logits(let output) = try prepare(
+                prefix, cache: cache, state: nil, prefill: prefill)
+        else { return nil }
+        eval(cache)
+        let delta = output.state?[ropeDeltasKey].map { $0.asType(.int32)[0].item(Int.self) } ?? 0
+        return (last + 1, delta)
+    }
 }
 
 extension Array where Element == THW {
