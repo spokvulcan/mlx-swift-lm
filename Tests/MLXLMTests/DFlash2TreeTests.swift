@@ -289,6 +289,89 @@ func testQwen35TreeVerifyOverTurboQuantTracksThePlainCache(keyBits: Int) throws 
     }
 }
 
+/// Over TurboQuant caches a Qwen 3.5 tree verify gives each row the logits a
+/// chain block of its path gives, bit for bit: with the whole block in one
+/// key block (position 301), and with the leaves' depths and slots in
+/// different key blocks and partitions (position 316). At this model's size
+/// a reordered sum rarely moves a logit;
+/// `testTurboVerifyTreeRowsMatchTheirPathsChain` checks the attention itself.
+@Test(.serialized, arguments: [0, 8], [300, 315])
+func testQwen35TreeVerifyOverTurboQuantComputesEachRowAsItsPathsChain(
+    keyBits: Int, promptLength: Int
+) throws {
+    let model = try treeTestModel()
+    var cache = try model.newCache(parameters: nil)
+    eval(
+        model(
+            MLXArray((0 ..< promptLength).map { Int32($0 % 97) }).reshaped(1, promptLength),
+            cache: cache))
+    _ = try applyKVCacheConfiguration(
+        cache: &cache,
+        configuration: KVCacheConfiguration(
+            strategy: .turboQuant(
+                try TurboQuantKVCacheConfiguration(
+                    keyPrecision: keyBits == 8 ? .affineEightBit : .fp16,
+                    valuePrecision: .fourBit)),
+            compatibility: .requireAllLayers))
+    try #require(model.dflash2SupportsTree(cache))
+    eval(model(MLXArray([Int32(5)]).reshaped(1, 1), cache: cache))
+
+    let tree = FixedTree(tokens: [7, 11, 22, 12, 23, 13, 14, 15])
+    let position = promptLength + 1
+    func verify(_ tokens: MLXArray, tree layout: DFlash2TreeLayout?) -> MLXArray {
+        model.dflash2Verify(
+            DFlash2VerifyRequest(
+                tokens: tokens, position: MLXArray([Int32(position)]),
+                positionUpperBound: position, captureLayers: [1, 2], tree: layout),
+            cache: cache.map { $0.copy() }
+        ).logits
+    }
+    let treeLogits = verify(tree.proposal.tokens, tree: tree.proposal.layout)
+    for row in 0 ..< tree.tokens.count {
+        let path = tree.path(to: row)
+        let padded = path + Array(repeating: Int32(0), count: tree.tokens.count - path.count)
+        let chainLogits = verify(MLXArray(padded).reshaped(1, padded.count), tree: nil)
+        let actual = treeLogits[0, row].asType(.float32)
+        let expected = chainLogits[0, path.count - 1].asType(.float32)
+        #expect(abs(actual - expected).max().item(Float.self) == 0, "row \(row)")
+    }
+}
+
+/// A TurboQuant tree of other than 8 rows takes the dequantizing path: a
+/// chain-shaped tree there tracks the chain (through the verify kernel at 4
+/// rows, the same path at 16).
+@Test(arguments: [0, 8], [4, 16])
+func testTurboQuantTreeOfOtherWidthsTakesTheMaskedPath(keyBits: Int, width S: Int) throws {
+    let (HQ, HK, D, rows) = (4, 2, 128, 300)
+    let cache = TurboQuantKVCache(bits: 4, keyBits: keyBits, valueBits: 4)
+    let (k, v, q, newK, newV) = withRandomState(MLXRandom.RandomState(seed: 41)) {
+        (
+            MLXRandom.normal([1, HK, rows, D]).asType(.bfloat16),
+            MLXRandom.normal([1, HK, rows, D]).asType(.bfloat16),
+            MLXRandom.normal([1, HQ, S, D]).asType(.bfloat16),
+            MLXRandom.normal([1, HK, S, D]).asType(.bfloat16),
+            MLXRandom.normal([1, HK, S, D]).asType(.bfloat16)
+        )
+    }
+    _ = cache.update(keys: k, values: v)
+    let chainRows = MLXArray(Int32(0) ..< Int32(S))
+    let tree = DFlash2TreeLayout(
+        depths: chainRows,
+        ancestry: chainRows.reshaped([S, 1]) .>= chainRows.reshaped([1, S]),
+        commits: MLXArray.ones([1, S], dtype: .int32), chainRows: chainRows,
+        slotRows: chainRows, slots: chainRows)
+    func attend(_ tree: DFlash2TreeLayout?) -> MLXArray {
+        cache.verifyAttention(
+            queries: q, keys: newK, values: newV, position: MLXArray([Int32(rows)]),
+            visibleLength: rows + S, scale: 1 / Float(D).squareRoot(), tree: tree
+        ).asType(.float32)
+    }
+    let chain = attend(nil)
+    let error = (abs(attend(tree) - chain).max() / abs(chain).max()).item(Float.self)
+    // At 16 rows the chain takes the same path, so the masks agree exactly.
+    #expect(S == 16 ? error == 0 : error < 2e-2, "error \(error)")
+}
+
 /// The tree attention kernel is MLX's one-pass vector SDPA bit for bit: on a
 /// chain block it reproduces `scaledDotProductAttention`, and a leaf row
 /// reproduces it as computed with its own key at its depth, where a chain
@@ -356,10 +439,75 @@ func testDFlash2TreeAttentionMatchesTheChainKernel(spot: (position: Int, upper: 
 
 }
 
+/// The TurboQuant verify kernel computes each tree row as it computes a chain
+/// block of the row's path, bit for bit in its float32 output: chain rows
+/// read their keys in their own slots, and a leaf reads its key and value at
+/// its depth, from its slot. At the Qwen3.8-27B shape, from one 32-key block
+/// to 6K keys; at 316 the leaves' depths and slots fall in different key
+/// blocks and partitions.
+@Test(arguments: [0, 8], [301, 316, 3001, 6140])
+func testTurboVerifyTreeRowsMatchTheirPathsChain(keyBits: Int, position: Int) throws {
+    let (HQ, HK, S, D) = (24, 4, 8, 256)
+    let rows = position + 64
+    let visible = position + S + 3
+    let scale: Float = 1 / Float(D).squareRoot()
+    let codec = MSECodec(dim: D, bits: 4, seed: 43)
+    let (q, keys, values) = withRandomState(MLXRandom.RandomState(seed: 29)) {
+        (
+            MLXRandom.normal([1, HQ, S, D]).asType(.bfloat16),
+            MLXRandom.normal([HK, rows, D]).asType(.bfloat16),
+            MLXRandom.normal([HK, rows, D]).asType(.bfloat16)
+        )
+    }
+    let (packed, norms) = TurboQuantKernelOps.fusedEncodeWHT(
+        input: values.reshaped([-1, D]).asType(.float32), whtSigns: codec.whtSigns!,
+        boundaries: codec.boundaries, codebook: codec.codebook, bits: 4, dim: D)
+    let quantizedKeys = quantized(keys, groupSize: 64, bits: 8)
+    let buffers = [
+        keys, quantizedKeys.wq, quantizedKeys.scales, quantizedKeys.biases!,
+        packed.reshaped([HK, rows, -1]), norms.reshaped([HK, rows]),
+    ]
+    // Rows in topological order, cached in slot order: the anchor and the
+    // chain at their depths, then leaves at depths 2 and 3.
+    let depths: [Int32] = [0, 1, 2, 2, 3, 3, 4, 5]
+    let slots: [Int32] = [0, 1, 6, 2, 7, 3, 4, 5]
+
+    func attention(_ queries: MLXArray, cacheRows: [Int32]?, tree: Bool) -> MLXArray {
+        let b =
+            cacheRows.map { rows in buffers.map { take($0, MLXArray(rows), axis: 1) } }
+            ?? buffers
+        return TurboQuantKernelOps.turboVerifyAttention(
+            queries: queries,
+            keys: keyBits == 8
+                ? .affine(weights: b[1], scales: b[2], biases: b[3], groupSize: 64) : .raw(b[0]),
+            valPacked: b[4], valNorms: b[5], valCodebook: codec.codebook,
+            valRotation: codec.rotation, position: MLXArray([Int32(position)]),
+            visibleLength: visible, scale: scale, repeatCount: HQ / HK, valueBits: 4, dim: D,
+            treeRows: tree ? (MLXArray(depths), MLXArray(slots)) : nil)
+    }
+    let tree = attention(q, cacheRows: nil, tree: true)
+    for row in 0 ..< S {
+        // The row's path as a chain block: its query, key and value at its
+        // depth, its ancestors (the chain) before it.
+        let depth = Int(depths[row])
+        var cacheRows = (0 ..< rows).map(Int32.init)
+        cacheRows[position + depth] = Int32(position) + slots[row]
+        var queryRows = (0 ..< S).map(Int32.init)
+        queryRows[depth] = Int32(row)
+        let chain = attention(
+            take(q, MLXArray(queryRows), axis: 2), cacheRows: cacheRows, tree: false)
+        #expect(
+            abs(tree[0..., 0..., row] - chain[0..., 0..., depth]).max().item(Float.self) == 0,
+            "row \(row)")
+    }
+}
+
 /// Opt-in timing (`TEST_RUNNER_TREE_ATTENTION_BENCH=1`): one verify pass's
-/// attention over 16 layers at the Qwen3.8-27B shape, MLX's SDPA on a chain
-/// block against the tree kernels on a chain block and on a tree with three
-/// leaves. `TEST_RUNNER_TREE_ATTENTION_BENCH_CONTEXTS=600,6000` picks N.
+/// attention over 16 layers at the Qwen3.8-27B shape, one layer after
+/// another: MLX's SDPA on a chain block against the tree kernels on a chain
+/// block and on a tree with two leaves, then the same for turbo8v4's verify
+/// kernel.
+/// `TEST_RUNNER_TREE_ATTENTION_BENCH_CONTEXTS=600,6000` picks N.
 @Test(
     .enabled(if: ProcessInfo.processInfo.environment["TREE_ATTENTION_BENCH"] == "1"),
     .serialized)
@@ -388,47 +536,78 @@ func benchDFlash2TreeAttention() throws {
         let chainRows = MLXArray(Int32(0) ..< Int32(S))
         let treeDepths = MLXArray([Int32(0), 1, 2, 2, 3, 3, 4, 5])
         let treeSlots = MLXArray([Int32(0), 1, 6, 2, 7, 3, 4, 5])
-        func measure(_ body: () -> [MLXArray]) -> Double {
+        // The same keys and values as a turbo8v4 cache holds them.
+        let codec = MSECodec(dim: D, bits: 4, seed: 43)
+        let turbo = (0 ..< layers).map { l in
+            let (packed, norms) = TurboQuantKernelOps.fusedEncodeWHT(
+                input: values[l].reshaped([-1, D]).asType(.float32), whtSigns: codec.whtSigns!,
+                boundaries: codec.boundaries, codebook: codec.codebook, bits: 4, dim: D)
+            let k = quantized(keys[l].reshaped([HK, capacity, D]), groupSize: 64, bits: 8)
+            return [
+                k.wq, k.scales, k.biases!, packed.reshaped([HK, capacity, -1]),
+                norms.reshaped([HK, capacity]),
+            ]
+        }
+        eval(turbo.flatMap { $0 })
+        func turboLayer(
+            _ x: MLXArray, _ l: Int, _ treeRows: (depths: MLXArray, slots: MLXArray)?
+        ) -> MLXArray {
+            let t = turbo[l]
+            return TurboQuantKernelOps.turboVerifyAttention(
+                queries: x,
+                keys: .affine(weights: t[0], scales: t[1], biases: t[2], groupSize: 64),
+                valPacked: t[3], valNorms: t[4], valCodebook: codec.codebook,
+                valRotation: codec.rotation, position: position, visibleLength: visible,
+                scale: scale, repeatCount: HQ / HK, valueBits: 4, dim: D, treeRows: treeRows)
+        }
+        // One verify pass: each layer's queries wait for the previous layer's
+        // output (a zero-weighted term), so the layers run one after another.
+        func measure(_ layer: (MLXArray, Int) -> MLXArray) -> Double {
+            func pass() -> MLXArray {
+                var x = q
+                for l in 0 ..< layers { x = q + (layer(x, l) * 0).asType(q.dtype) }
+                return x
+            }
             let start = Date()
-            for _ in 0 ..< 20 { eval(body()) }
+            for _ in 0 ..< 20 { eval(pass()) }
             return Date().timeIntervalSince(start) * 1000 / 20
         }
-        let variants: [(String, () -> [MLXArray])] = [
+        let variants: [(String, (MLXArray, Int) -> MLXArray)] = [
             (
                 "MLX SDPA, chain",
-                {
-                    (0 ..< layers).map { l in
-                        MLXFast.scaledDotProductAttention(
-                            queries: q, keys: keys[l][.ellipsis, ..<visible, 0...],
-                            values: values[l][.ellipsis, ..<visible, 0...], scale: scale,
-                            mask: .array(mask))
-                    }
+                { x, l in
+                    MLXFast.scaledDotProductAttention(
+                        queries: x, keys: keys[l][.ellipsis, ..<visible, 0...],
+                        values: values[l][.ellipsis, ..<visible, 0...], scale: scale,
+                        mask: .array(mask))
                 }
             ),
             (
                 "tree kernel, chain",
-                {
-                    (0 ..< layers).map { l in
-                        dflash2TreeAttention(
-                            queries: q, keys: keys[l], values: values[l], position: position,
-                            depths: chainRows, slots: chainRows, visibleLength: visible,
-                            scale: scale)!
-                    }
+                { x, l in
+                    dflash2TreeAttention(
+                        queries: x, keys: keys[l], values: values[l], position: position,
+                        depths: chainRows, slots: chainRows, visibleLength: visible,
+                        scale: scale)!
                 }
             ),
             (
                 "tree kernel, 2 leaves",
-                {
-                    (0 ..< layers).map { l in
-                        dflash2TreeAttention(
-                            queries: q, keys: keys[l], values: values[l], position: position,
-                            depths: treeDepths, slots: treeSlots, visibleLength: visible,
-                            scale: scale)!
-                    }
+                { x, l in
+                    dflash2TreeAttention(
+                        queries: x, keys: keys[l], values: values[l], position: position,
+                        depths: treeDepths, slots: treeSlots, visibleLength: visible,
+                        scale: scale)!
                 }
             ),
+            ("turbo8v4 kernel, chain", { x, l in turboLayer(x, l, nil) }),
+            ("turbo8v4 tree kernel, chain", { x, l in turboLayer(x, l, (chainRows, chainRows)) }),
+            (
+                "turbo8v4 tree kernel, 2 leaves",
+                { x, l in turboLayer(x, l, (treeDepths, treeSlots)) }
+            ),
         ]
-        for (_, body) in variants { for _ in 0 ..< 3 { eval(body()) } }
+        for (_, layer) in variants { for _ in 0 ..< 3 { _ = measure(layer) } }
         var samples = Array(repeating: [Double](), count: variants.count)
         for _ in 0 ..< 7 {
             for (i, variant) in variants.enumerated() { samples[i].append(measure(variant.1)) }

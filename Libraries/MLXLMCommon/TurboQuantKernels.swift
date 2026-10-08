@@ -2061,22 +2061,652 @@ enum TurboQuantMetalKernels {
     static let turboVerifyPass1AffineKSource =
         verifyPass1Prologue + verifyStageAffineK + verifyPass1Body
 
-    /// A tree block's mask: row `r` sees the committed rows and the block
-    /// slots `j` whose bit is set in `tree_anc[r]`.
-    private static let verifyPass1TreeBody = verifyPass1Body.replacingOccurrences(
-        of: "const bool masked = kpos >= pEnd || int(kpos) > rowPos;",
-        with: """
-            const int slot = int(kpos) - pos0;
-                            const bool masked = kpos >= pEnd || (slot >= 0
-                                && (slot >= QL
-                                    || ((tree_anc[chunk * QL + smRow] >> uint(slot)) & 1u) == 0u));
-            """)
+    /// A tree block (`depth`, `slot` per row): row `r` sees keys up to its
+    /// depth index, where it reads its own key and value from its slot, as a
+    /// chain block of its path holds them. In the block holding a leaf
+    /// row's index, the K tile's row is patched and the column group's MMAs
+    /// rerun for the leaf's score, and the leaf's P.V runs as its own pass
+    /// over the patched V tile in the same group order, while the main pass
+    /// gives its row exact zeros. Each row then reduces exactly as in a
+    /// chain block of its path.
+    private static let verifyPass1TreePrologue = """
+        constexpr int BK = 32;
+        constexpr int QL = 8;
+        constexpr int H2 = Dim / 2;
+        constexpr int NT = H2 / 8;
+        constexpr uint VAL_LEVELS = 1u << ValueBits;
+        constexpr uint VAL_MASK = VAL_LEVELS - 1u;
+        constexpr float NEG = -3.402823466e+38f;
+
+        const uint N = params[0];
+        const uint s_pad = params[1];
+        const uint parts = params[2];
+        const uint k_stride = params[3];
+        const uint v_stride = params[4];
+        const float scale = fparams[0];
+        const int pos0 = position[0];
+
+        const uint lane = thread_index_in_simdgroup;
+        const uint dhalf = thread_position_in_threadgroup.y;
+        const uint stripe = thread_position_in_threadgroup.z;
+        const uint kvb = threadgroup_position_in_grid.x;
+        const uint chunk = threadgroup_position_in_grid.y;
+        const uint part = threadgroup_position_in_grid.z;
+        const uint qbh = kvb * Rep + stripe;
+        const uint tix = (stripe * 2 + dhalf) * 32 + lane;
+        constexpr uint NTHREADS = Rep * 64;
+
+        threadgroup float sS[2 * Rep * QL * BK];
+        threadgroup T sP[Rep * QL * BK];
+        threadgroup float sFactor[Rep * QL];
+        threadgroup uint4 sKV4[BK * Dim * 2 / 16];
+        threadgroup T* sKV = (threadgroup T*)sKV4;
+        threadgroup float cb[VAL_LEVELS];
+        if (tix < VAL_LEVELS) cb[tix] = val_codebook[tix];
+
+        const uint span = ((N + parts * BK - 1) / (parts * BK)) * BK;
+        const uint p0 = part * span;
+        const uint pEnd = min(p0 + span, N);
+        // A partition wholly past the chunk's last row contributes nothing.
+        const int chunkLast = pos0 + int(chunk * QL + QL - 1);
+        const uint loopEnd = (int(p0) > chunkLast) ? p0 : pEnd;
+
+        simdgroup_matrix<T, 8, 8> Qf[NT];
+        const device T* qBase = q_in + (size_t)(qbh * s_pad + chunk * QL) * Dim;
+        for (int t = 0; t < NT; ++t) {
+            simdgroup_load(Qf[t], qBase, Dim, ulong2(dhalf * H2 + t * 8, 0));
+        }
+
+        // The C-fragment row of this lane's thread_elements, and the row and
+        // column quarter it owns in the scalar softmax.
+        const int fragRow = int(((lane >> 2) & 4) + ((lane >> 1) & 3));
+        const int smRow = int(lane >> 2);
+        const int smCol = int(lane & 3) * (BK / 4);
+        const int rowPos = pos0 + int(chunk * QL) + smRow;
+
+        simdgroup_matrix<float, 8, 8> O[NT];
+        for (int t = 0; t < NT; ++t) O[t] = simdgroup_matrix<float, 8, 8>(0);
+        float mRun = NEG;
+        float lRun = 0.0f;
+
+        threadgroup float* sSMine = sS + (dhalf * Rep + stripe) * (QL * BK);
+        threadgroup float* sSOther = sS + ((1 - dhalf) * Rep + stripe) * (QL * BK);
+        threadgroup T* sPMine = sP + stripe * (QL * BK);
+
+        // Tree: row smRow sees keys up to its depth index, where it reads
+        // its own key and value from its slot; the leaves' indices bound
+        // the blocks that need that.
+        const int selfIndex = pos0 + depth[chunk * QL + smRow];
+        int leafLo = int(N);
+        int leafHi = -1;
+        for (int r = 0; r < QL; ++r) {
+            if (slot[r] != depth[r]) {
+                leafLo = min(leafLo, pos0 + depth[r]);
+                leafHi = max(leafHi, pos0 + depth[r]);
+            }
+        }
+        // Blocks before the first leaf's index run the chain variant's body
+        // (under the depth mask), so the tree code stays out of their loop.
+        uint treeFrom = loopEnd;
+        if (leafHi >= int(p0) && leafLo < int(loopEnd)) {
+            treeFrom = p0 + (uint(max(leafLo, int(p0))) - p0) / BK * BK;
+        }
+
+        """
+
+    private static let verifyTreeChainLoop =
+        "        for (uint n0 = p0; n0 < treeFrom; n0 += BK) {\n\n"
+
+    /// The chain variant's loop body under the tree's depth mask.
+    private static let verifyPass1TreeChainBody = """
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            // Partial scores over this half's dims: S_half[8, BK].
+            simdgroup_matrix<float, 8, 8> Sc[BK / 8];
+            for (int c = 0; c < BK / 8; ++c) Sc[c] = simdgroup_matrix<float, 8, 8>(0);
+            for (int c = 0; c < BK / 8; ++c) {
+                for (int t = 0; t < NT; ++t) {
+                    simdgroup_matrix<T, 8, 8> Kf;
+                    simdgroup_load(Kf, sKV, (ulong)Dim, ulong2(dhalf * H2 + t * 8, c * 8), true);
+                    simdgroup_multiply_accumulate(Sc[c], Qf[t], Kf, Sc[c]);
+                }
+            }
+            for (int c = 0; c < BK / 8; ++c) {
+                simdgroup_store(Sc[c], sSMine, (ulong)BK, ulong2(c * 8, 0));
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            // Online softmax on row smRow, both halves redundantly.
+            float sv[BK / 4];
+            float rowMax = NEG;
+            for (int j = 0; j < BK / 4; ++j) {
+                const int c = smCol + j;
+                const uint kpos = n0 + uint(c);
+                const float s = (sSMine[smRow * BK + c] + sSOther[smRow * BK + c]) * scale;
+                const bool masked = kpos >= pEnd || int(kpos) > selfIndex;
+                sv[j] = masked ? NEG : s;
+                rowMax = max(rowMax, sv[j]);
+            }
+            rowMax = max(rowMax, simd_shuffle_xor(rowMax, 1));
+            rowMax = max(rowMax, simd_shuffle_xor(rowMax, 2));
+            const float mNew = max(mRun, rowMax);
+            const float factor = mRun == NEG ? 1.0f : fast::exp(mRun - mNew);
+            float rowSum = 0.0f;
+            for (int j = 0; j < BK / 4; ++j) {
+                const float p = sv[j] == NEG ? 0.0f : fast::exp(sv[j] - mNew);
+                sv[j] = p;
+                rowSum += p;
+            }
+            rowSum += simd_shuffle_xor(rowSum, 1);
+            rowSum += simd_shuffle_xor(rowSum, 2);
+            lRun = lRun * factor + rowSum;
+            mRun = mNew;
+            if (dhalf == 0) {
+                if ((lane & 3) == 0) sFactor[stripe * QL + smRow] = factor;
+                for (int j = 0; j < BK / 4; ++j) sPMine[smRow * BK + smCol + j] = T(sv[j]);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            // Values over the consumed key staging: codebook entry times norm,
+            // in the rotated basis.
+            constexpr uint G8 = Dim / 8;
+            for (uint i = tix; i < BK * G8; i += NTHREADS) {
+                const uint n = i / G8;
+                const uint g = i % G8;
+                threadgroup T* dst = sKV + n * Dim + g * 8;
+                if (n0 + n < N) {
+                    const size_t row = (size_t)kvb * v_stride + n0 + n;
+                    const device uint32_t* vp = val_packed + row * ValuePackedWidth;
+                    const uint bit = g * 8 * ValueBits;
+                    const uint word = bit >> 5;
+                    const uint shift = bit & 31u;
+                    ulong bits = vp[word];
+                    if (shift + 8 * ValueBits > 32) bits |= ((ulong)vp[word + 1]) << 32;
+                    bits >>= shift;
+                    const float nrm = val_norms[row];
+                    for (uint j = 0; j < 8; j++) {
+                        dst[j] = T(cb[(uint)(bits >> (j * ValueBits)) & VAL_MASK] * nrm);
+                    }
+                } else {
+                    for (uint j = 0; j < 8; j++) dst[j] = T(0);
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            const float oFactor = sFactor[stripe * QL + fragRow];
+            simdgroup_matrix<T, 8, 8> Pf[BK / 8];
+            for (int c = 0; c < BK / 8; ++c) {
+                simdgroup_load(Pf[c], sPMine, (ulong)BK, ulong2(c * 8, 0));
+            }
+            for (int t = 0; t < NT; ++t) {
+                O[t].thread_elements()[0] *= oFactor;
+                O[t].thread_elements()[1] *= oFactor;
+                for (int c = 0; c < BK / 8; ++c) {
+                    simdgroup_matrix<T, 8, 8> Vf;
+                    simdgroup_load(Vf, sKV, (ulong)Dim, ulong2(dhalf * H2 + t * 8, c * 8));
+                    simdgroup_multiply_accumulate(O[t], Pf[c], Vf, O[t]);
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        """
+
+    private static let verifyTreeLeafLoop =
+        "        for (uint n0 = treeFrom; n0 < loopEnd; n0 += BK) {\n\n"
+
+    private static let verifyPass1TreeBodyRawK = """
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            // Partial scores over this half's dims: S_half[8, BK].
+            simdgroup_matrix<float, 8, 8> Sc[BK / 8];
+            for (int c = 0; c < BK / 8; ++c) Sc[c] = simdgroup_matrix<float, 8, 8>(0);
+            for (int c = 0; c < BK / 8; ++c) {
+                for (int t = 0; t < NT; ++t) {
+                    simdgroup_matrix<T, 8, 8> Kf;
+                    simdgroup_load(Kf, sKV, (ulong)Dim, ulong2(dhalf * H2 + t * 8, c * 8), true);
+                    simdgroup_multiply_accumulate(Sc[c], Qf[t], Kf, Sc[c]);
+                }
+            }
+            for (int c = 0; c < BK / 8; ++c) {
+                simdgroup_store(Sc[c], sSMine, (ulong)BK, ulong2(c * 8, 0));
+            }
+            // Tree: a leaf row whose depth index falls in this block scores
+            // its own key there: patch the K tile's row, rerun that column
+            // group's MMAs, keep the leaf row's entry, restore the row.
+            const bool anyLeaf = leafHi >= int(n0) && leafLo < int(n0) + BK;
+            if (anyLeaf) {
+                threadgroup float* scratch = (threadgroup float*)sP + (dhalf * Rep + stripe) * 64;
+                for (int r = 0; r < QL; ++r) {
+                    const int idx = pos0 + depth[r];
+                    if (slot[r] == depth[r] || idx < int(n0) || idx >= int(n0) + BK) continue;
+                    const uint c = uint(idx) - n0;
+                    const uint grp = c / 8;
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                    for (uint i = tix; i < V4R; i += NTHREADS) {
+                        sKV4[c * V4R + i] =
+                            ((const device uint4*)(k_raw + ((size_t)kvb * k_stride + pos0 + slot[r]) * Dim))[i];
+                    }
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                    simdgroup_matrix<float, 8, 8> Sg = simdgroup_matrix<float, 8, 8>(0);
+                    for (int t = 0; t < NT; ++t) {
+                        simdgroup_matrix<T, 8, 8> Kf;
+                        simdgroup_load(Kf, sKV, (ulong)Dim, ulong2(dhalf * H2 + t * 8, grp * 8), true);
+                        simdgroup_multiply_accumulate(Sg, Qf[t], Kf, Sg);
+                    }
+                    simdgroup_store(Sg, scratch, (ulong)8, ulong2(0, 0));
+                    simdgroup_barrier(mem_flags::mem_threadgroup);
+                    if (lane == 0) sSMine[r * BK + c] = scratch[r * 8 + (c - grp * 8)];
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                    for (uint i = tix; i < V4R; i += NTHREADS) {
+                        sKV4[c * V4R + i] =
+                            ((const device uint4*)(k_raw + ((size_t)kvb * k_stride + n0 + c) * Dim))[i];
+                    }
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            // Online softmax on row smRow, both halves redundantly.
+            float sv[BK / 4];
+            float rowMax = NEG;
+            for (int j = 0; j < BK / 4; ++j) {
+                const int c = smCol + j;
+                const uint kpos = n0 + uint(c);
+                const float s = (sSMine[smRow * BK + c] + sSOther[smRow * BK + c]) * scale;
+                const bool masked = kpos >= pEnd || int(kpos) > selfIndex;
+                sv[j] = masked ? NEG : s;
+                rowMax = max(rowMax, sv[j]);
+            }
+            rowMax = max(rowMax, simd_shuffle_xor(rowMax, 1));
+            rowMax = max(rowMax, simd_shuffle_xor(rowMax, 2));
+            const float mNew = max(mRun, rowMax);
+            const float factor = mRun == NEG ? 1.0f : fast::exp(mRun - mNew);
+            float rowSum = 0.0f;
+            for (int j = 0; j < BK / 4; ++j) {
+                const float p = sv[j] == NEG ? 0.0f : fast::exp(sv[j] - mNew);
+                sv[j] = p;
+                rowSum += p;
+            }
+            rowSum += simd_shuffle_xor(rowSum, 1);
+            rowSum += simd_shuffle_xor(rowSum, 2);
+            lRun = lRun * factor + rowSum;
+            mRun = mNew;
+            if (dhalf == 0) {
+                if ((lane & 3) == 0) sFactor[stripe * QL + smRow] = factor;
+                for (int j = 0; j < BK / 4; ++j) sPMine[smRow * BK + smCol + j] = T(sv[j]);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            // Values over the consumed key staging: codebook entry times norm,
+            // in the rotated basis.
+            constexpr uint G8 = Dim / 8;
+            for (uint i = tix; i < BK * G8; i += NTHREADS) {
+                const uint n = i / G8;
+                const uint g = i % G8;
+                threadgroup T* dst = sKV + n * Dim + g * 8;
+                if (n0 + n < N) {
+                    const size_t row = (size_t)kvb * v_stride + n0 + n;
+                    const device uint32_t* vp = val_packed + row * ValuePackedWidth;
+                    const uint bit = g * 8 * ValueBits;
+                    const uint word = bit >> 5;
+                    const uint shift = bit & 31u;
+                    ulong bits = vp[word];
+                    if (shift + 8 * ValueBits > 32) bits |= ((ulong)vp[word + 1]) << 32;
+                    bits >>= shift;
+                    const float nrm = val_norms[row];
+                    for (uint j = 0; j < 8; j++) {
+                        dst[j] = T(cb[(uint)(bits >> (j * ValueBits)) & VAL_MASK] * nrm);
+                    }
+                } else {
+                    for (uint j = 0; j < 8; j++) dst[j] = T(0);
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            // Tree: the main P.V runs with the leaf rows' probabilities zeroed
+            // (they add exact zeros); each leaf then adds its own row against
+            // the V tile patched with its value, in the same column order.
+            threadgroup T* sPMain = sPMine;
+            if (anyLeaf) {
+                sPMain = (threadgroup T*)sS + stripe * (QL * BK);
+                if (dhalf == 0) {
+                    for (int i = lane; i < QL * BK; i += 32) {
+                        const int r = i / BK;
+                        const int idx = pos0 + depth[r];
+                        const bool leaf = slot[r] != depth[r] && idx >= int(n0) && idx < int(n0) + BK;
+                        sPMain[i] = leaf ? T(0) : sPMine[i];
+                    }
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+            const float oFactor = sFactor[stripe * QL + fragRow];
+            simdgroup_matrix<T, 8, 8> Pf[BK / 8];
+            for (int c = 0; c < BK / 8; ++c) {
+                simdgroup_load(Pf[c], sPMain, (ulong)BK, ulong2(c * 8, 0));
+            }
+            for (int t = 0; t < NT; ++t) {
+                O[t].thread_elements()[0] *= oFactor;
+                O[t].thread_elements()[1] *= oFactor;
+                for (int c = 0; c < BK / 8; ++c) {
+                    simdgroup_matrix<T, 8, 8> Vf;
+                    simdgroup_load(Vf, sKV, (ulong)Dim, ulong2(dhalf * H2 + t * 8, c * 8));
+                    simdgroup_multiply_accumulate(O[t], Pf[c], Vf, O[t]);
+                }
+            }
+            if (anyLeaf) {
+                threadgroup T* sPLeaf = (threadgroup T*)sS + (Rep + stripe) * (QL * BK);
+                for (int r = 0; r < QL; ++r) {
+                    const int idx = pos0 + depth[r];
+                    if (slot[r] == depth[r] || idx < int(n0) || idx >= int(n0) + BK) continue;
+                    const uint c = uint(idx) - n0;
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                    for (uint g8 = tix; g8 < G8; g8 += NTHREADS) {
+                        threadgroup T* dst = sKV + c * Dim + g8 * 8;
+                        const size_t row = (size_t)kvb * v_stride + pos0 + slot[r];
+                        const device uint32_t* vp = val_packed + row * ValuePackedWidth;
+                        const uint bit = g8 * 8 * ValueBits;
+                        const uint word = bit >> 5;
+                        const uint shift = bit & 31u;
+                        ulong bits = vp[word];
+                        if (shift + 8 * ValueBits > 32) bits |= ((ulong)vp[word + 1]) << 32;
+                        bits >>= shift;
+                        const float nrm = val_norms[row];
+                        for (uint j = 0; j < 8; j++) {
+                            dst[j] = T(cb[(uint)(bits >> (j * ValueBits)) & VAL_MASK] * nrm);
+                        }
+                    }
+                    if (dhalf == 0) {
+                        for (int i = lane; i < QL * BK; i += 32) {
+                            sPLeaf[i] = (i / BK == r) ? sPMine[i] : T(0);
+                        }
+                    }
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                    simdgroup_matrix<T, 8, 8> Pl[BK / 8];
+                    for (int cc = 0; cc < BK / 8; ++cc) {
+                        simdgroup_load(Pl[cc], sPLeaf, (ulong)BK, ulong2(cc * 8, 0));
+                    }
+                    for (int t = 0; t < NT; ++t) {
+                        for (int cc = 0; cc < BK / 8; ++cc) {
+                            simdgroup_matrix<T, 8, 8> Vf;
+                            simdgroup_load(Vf, sKV, (ulong)Dim, ulong2(dhalf * H2 + t * 8, cc * 8));
+                            simdgroup_multiply_accumulate(O[t], Pl[cc], Vf, O[t]);
+                        }
+                    }
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                    for (uint g8 = tix; g8 < G8; g8 += NTHREADS) {
+                        threadgroup T* dst = sKV + c * Dim + g8 * 8;
+                        const size_t row = (size_t)kvb * v_stride + n0 + c;
+                        const device uint32_t* vp = val_packed + row * ValuePackedWidth;
+                        const uint bit = g8 * 8 * ValueBits;
+                        const uint word = bit >> 5;
+                        const uint shift = bit & 31u;
+                        ulong bits = vp[word];
+                        if (shift + 8 * ValueBits > 32) bits |= ((ulong)vp[word + 1]) << 32;
+                        bits >>= shift;
+                        const float nrm = val_norms[row];
+                        for (uint j = 0; j < 8; j++) {
+                            dst[j] = T(cb[(uint)(bits >> (j * ValueBits)) & VAL_MASK] * nrm);
+                        }
+                    }
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        // Unnormalized partials with each row's max and exp-sum, the contract
+        // the GQA decode's pass 2 merges.
+        const size_t row0 = (size_t)qbh * s_pad + chunk * QL;
+        device float* oBase = o_partials + (row0 * parts + part) * Dim;
+        for (int t = 0; t < NT; ++t) {
+            simdgroup_store(O[t], oBase, (ulong)(parts * Dim), ulong2(dhalf * H2 + t * 8, 0));
+        }
+        if (dhalf == 0 && (lane & 3) == 0) {
+            const size_t r = row0 + smRow;
+            m_partials[r * parts + part] = mRun == NEG ? -INFINITY : mRun;
+            l_partials[r * parts + part] = lRun;
+        }
+        """
+
+    private static let verifyPass1TreeBodyAffineK = """
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            // Partial scores over this half's dims: S_half[8, BK].
+            simdgroup_matrix<float, 8, 8> Sc[BK / 8];
+            for (int c = 0; c < BK / 8; ++c) Sc[c] = simdgroup_matrix<float, 8, 8>(0);
+            for (int c = 0; c < BK / 8; ++c) {
+                for (int t = 0; t < NT; ++t) {
+                    simdgroup_matrix<T, 8, 8> Kf;
+                    simdgroup_load(Kf, sKV, (ulong)Dim, ulong2(dhalf * H2 + t * 8, c * 8), true);
+                    simdgroup_multiply_accumulate(Sc[c], Qf[t], Kf, Sc[c]);
+                }
+            }
+            for (int c = 0; c < BK / 8; ++c) {
+                simdgroup_store(Sc[c], sSMine, (ulong)BK, ulong2(c * 8, 0));
+            }
+            // Tree: a leaf row whose depth index falls in this block scores
+            // its own key there: patch the K tile's row, rerun that column
+            // group's MMAs, keep the leaf row's entry, restore the row.
+            const bool anyLeaf = leafHi >= int(n0) && leafLo < int(n0) + BK;
+            if (anyLeaf) {
+                threadgroup float* scratch = (threadgroup float*)sP + (dhalf * Rep + stripe) * 64;
+                for (int r = 0; r < QL; ++r) {
+                    const int idx = pos0 + depth[r];
+                    if (slot[r] == depth[r] || idx < int(n0) || idx >= int(n0) + BK) continue;
+                    const uint c = uint(idx) - n0;
+                    const uint grp = c / 8;
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                    for (uint q = tix; q < QPR; q += NTHREADS) {
+                        threadgroup vec<T, 4>* dst = (threadgroup vec<T, 4>*)(sKV + c * Dim + q * 16);
+                        const size_t row = (size_t)kvb * k_stride + pos0 + slot[r];
+                        const uint4 words = ((const device uint4*)(k_weights + row * WPR))[q];
+                        const uint g = (q * 16) / KGroup;
+                        const float ks = float(k_scales[row * GPR + g]);
+                        const float kb = float(k_biases[row * GPR + g]);
+                        for (uint j = 0; j < 4; j++) {
+                            const uint word = words[j];
+                            dst[j] = vec<T, 4>(
+                                T(float(word & 0xFFu) * ks + kb), T(float((word >> 8) & 0xFFu) * ks + kb),
+                                T(float((word >> 16) & 0xFFu) * ks + kb), T(float(word >> 24) * ks + kb));
+                        }
+                    }
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                    simdgroup_matrix<float, 8, 8> Sg = simdgroup_matrix<float, 8, 8>(0);
+                    for (int t = 0; t < NT; ++t) {
+                        simdgroup_matrix<T, 8, 8> Kf;
+                        simdgroup_load(Kf, sKV, (ulong)Dim, ulong2(dhalf * H2 + t * 8, grp * 8), true);
+                        simdgroup_multiply_accumulate(Sg, Qf[t], Kf, Sg);
+                    }
+                    simdgroup_store(Sg, scratch, (ulong)8, ulong2(0, 0));
+                    simdgroup_barrier(mem_flags::mem_threadgroup);
+                    if (lane == 0) sSMine[r * BK + c] = scratch[r * 8 + (c - grp * 8)];
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                    for (uint q = tix; q < QPR; q += NTHREADS) {
+                        threadgroup vec<T, 4>* dst = (threadgroup vec<T, 4>*)(sKV + c * Dim + q * 16);
+                        const size_t row = (size_t)kvb * k_stride + n0 + c;
+                        const uint4 words = ((const device uint4*)(k_weights + row * WPR))[q];
+                        const uint g = (q * 16) / KGroup;
+                        const float ks = float(k_scales[row * GPR + g]);
+                        const float kb = float(k_biases[row * GPR + g]);
+                        for (uint j = 0; j < 4; j++) {
+                            const uint word = words[j];
+                            dst[j] = vec<T, 4>(
+                                T(float(word & 0xFFu) * ks + kb), T(float((word >> 8) & 0xFFu) * ks + kb),
+                                T(float((word >> 16) & 0xFFu) * ks + kb), T(float(word >> 24) * ks + kb));
+                        }
+                    }
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            // Online softmax on row smRow, both halves redundantly.
+            float sv[BK / 4];
+            float rowMax = NEG;
+            for (int j = 0; j < BK / 4; ++j) {
+                const int c = smCol + j;
+                const uint kpos = n0 + uint(c);
+                const float s = (sSMine[smRow * BK + c] + sSOther[smRow * BK + c]) * scale;
+                const bool masked = kpos >= pEnd || int(kpos) > selfIndex;
+                sv[j] = masked ? NEG : s;
+                rowMax = max(rowMax, sv[j]);
+            }
+            rowMax = max(rowMax, simd_shuffle_xor(rowMax, 1));
+            rowMax = max(rowMax, simd_shuffle_xor(rowMax, 2));
+            const float mNew = max(mRun, rowMax);
+            const float factor = mRun == NEG ? 1.0f : fast::exp(mRun - mNew);
+            float rowSum = 0.0f;
+            for (int j = 0; j < BK / 4; ++j) {
+                const float p = sv[j] == NEG ? 0.0f : fast::exp(sv[j] - mNew);
+                sv[j] = p;
+                rowSum += p;
+            }
+            rowSum += simd_shuffle_xor(rowSum, 1);
+            rowSum += simd_shuffle_xor(rowSum, 2);
+            lRun = lRun * factor + rowSum;
+            mRun = mNew;
+            if (dhalf == 0) {
+                if ((lane & 3) == 0) sFactor[stripe * QL + smRow] = factor;
+                for (int j = 0; j < BK / 4; ++j) sPMine[smRow * BK + smCol + j] = T(sv[j]);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            // Values over the consumed key staging: codebook entry times norm,
+            // in the rotated basis.
+            constexpr uint G8 = Dim / 8;
+            for (uint i = tix; i < BK * G8; i += NTHREADS) {
+                const uint n = i / G8;
+                const uint g = i % G8;
+                threadgroup T* dst = sKV + n * Dim + g * 8;
+                if (n0 + n < N) {
+                    const size_t row = (size_t)kvb * v_stride + n0 + n;
+                    const device uint32_t* vp = val_packed + row * ValuePackedWidth;
+                    const uint bit = g * 8 * ValueBits;
+                    const uint word = bit >> 5;
+                    const uint shift = bit & 31u;
+                    ulong bits = vp[word];
+                    if (shift + 8 * ValueBits > 32) bits |= ((ulong)vp[word + 1]) << 32;
+                    bits >>= shift;
+                    const float nrm = val_norms[row];
+                    for (uint j = 0; j < 8; j++) {
+                        dst[j] = T(cb[(uint)(bits >> (j * ValueBits)) & VAL_MASK] * nrm);
+                    }
+                } else {
+                    for (uint j = 0; j < 8; j++) dst[j] = T(0);
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            // Tree: the main P.V runs with the leaf rows' probabilities zeroed
+            // (they add exact zeros); each leaf then adds its own row against
+            // the V tile patched with its value, in the same column order.
+            threadgroup T* sPMain = sPMine;
+            if (anyLeaf) {
+                sPMain = (threadgroup T*)sS + stripe * (QL * BK);
+                if (dhalf == 0) {
+                    for (int i = lane; i < QL * BK; i += 32) {
+                        const int r = i / BK;
+                        const int idx = pos0 + depth[r];
+                        const bool leaf = slot[r] != depth[r] && idx >= int(n0) && idx < int(n0) + BK;
+                        sPMain[i] = leaf ? T(0) : sPMine[i];
+                    }
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+            const float oFactor = sFactor[stripe * QL + fragRow];
+            simdgroup_matrix<T, 8, 8> Pf[BK / 8];
+            for (int c = 0; c < BK / 8; ++c) {
+                simdgroup_load(Pf[c], sPMain, (ulong)BK, ulong2(c * 8, 0));
+            }
+            for (int t = 0; t < NT; ++t) {
+                O[t].thread_elements()[0] *= oFactor;
+                O[t].thread_elements()[1] *= oFactor;
+                for (int c = 0; c < BK / 8; ++c) {
+                    simdgroup_matrix<T, 8, 8> Vf;
+                    simdgroup_load(Vf, sKV, (ulong)Dim, ulong2(dhalf * H2 + t * 8, c * 8));
+                    simdgroup_multiply_accumulate(O[t], Pf[c], Vf, O[t]);
+                }
+            }
+            if (anyLeaf) {
+                threadgroup T* sPLeaf = (threadgroup T*)sS + (Rep + stripe) * (QL * BK);
+                for (int r = 0; r < QL; ++r) {
+                    const int idx = pos0 + depth[r];
+                    if (slot[r] == depth[r] || idx < int(n0) || idx >= int(n0) + BK) continue;
+                    const uint c = uint(idx) - n0;
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                    for (uint g8 = tix; g8 < G8; g8 += NTHREADS) {
+                        threadgroup T* dst = sKV + c * Dim + g8 * 8;
+                        const size_t row = (size_t)kvb * v_stride + pos0 + slot[r];
+                        const device uint32_t* vp = val_packed + row * ValuePackedWidth;
+                        const uint bit = g8 * 8 * ValueBits;
+                        const uint word = bit >> 5;
+                        const uint shift = bit & 31u;
+                        ulong bits = vp[word];
+                        if (shift + 8 * ValueBits > 32) bits |= ((ulong)vp[word + 1]) << 32;
+                        bits >>= shift;
+                        const float nrm = val_norms[row];
+                        for (uint j = 0; j < 8; j++) {
+                            dst[j] = T(cb[(uint)(bits >> (j * ValueBits)) & VAL_MASK] * nrm);
+                        }
+                    }
+                    if (dhalf == 0) {
+                        for (int i = lane; i < QL * BK; i += 32) {
+                            sPLeaf[i] = (i / BK == r) ? sPMine[i] : T(0);
+                        }
+                    }
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                    simdgroup_matrix<T, 8, 8> Pl[BK / 8];
+                    for (int cc = 0; cc < BK / 8; ++cc) {
+                        simdgroup_load(Pl[cc], sPLeaf, (ulong)BK, ulong2(cc * 8, 0));
+                    }
+                    for (int t = 0; t < NT; ++t) {
+                        for (int cc = 0; cc < BK / 8; ++cc) {
+                            simdgroup_matrix<T, 8, 8> Vf;
+                            simdgroup_load(Vf, sKV, (ulong)Dim, ulong2(dhalf * H2 + t * 8, cc * 8));
+                            simdgroup_multiply_accumulate(O[t], Pl[cc], Vf, O[t]);
+                        }
+                    }
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                    for (uint g8 = tix; g8 < G8; g8 += NTHREADS) {
+                        threadgroup T* dst = sKV + c * Dim + g8 * 8;
+                        const size_t row = (size_t)kvb * v_stride + n0 + c;
+                        const device uint32_t* vp = val_packed + row * ValuePackedWidth;
+                        const uint bit = g8 * 8 * ValueBits;
+                        const uint word = bit >> 5;
+                        const uint shift = bit & 31u;
+                        ulong bits = vp[word];
+                        if (shift + 8 * ValueBits > 32) bits |= ((ulong)vp[word + 1]) << 32;
+                        bits >>= shift;
+                        const float nrm = val_norms[row];
+                        for (uint j = 0; j < 8; j++) {
+                            dst[j] = T(cb[(uint)(bits >> (j * ValueBits)) & VAL_MASK] * nrm);
+                        }
+                    }
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        // Unnormalized partials with each row's max and exp-sum, the contract
+        // the GQA decode's pass 2 merges.
+        const size_t row0 = (size_t)qbh * s_pad + chunk * QL;
+        device float* oBase = o_partials + (row0 * parts + part) * Dim;
+        for (int t = 0; t < NT; ++t) {
+            simdgroup_store(O[t], oBase, (ulong)(parts * Dim), ulong2(dhalf * H2 + t * 8, 0));
+        }
+        if (dhalf == 0 && (lane & 3) == 0) {
+            const size_t r = row0 + smRow;
+            m_partials[r * parts + part] = mRun == NEG ? -INFINITY : mRun;
+            l_partials[r * parts + part] = lRun;
+        }
+        """
 
     static let turboVerifyPass1RawKTreeSource =
-        verifyPass1Prologue + verifyStageRawK + verifyPass1TreeBody
+        verifyPass1TreePrologue + verifyTreeChainLoop + verifyStageRawK + verifyPass1TreeChainBody
+        + verifyTreeLeafLoop + verifyStageRawK + verifyPass1TreeBodyRawK
 
     static let turboVerifyPass1AffineKTreeSource =
-        verifyPass1Prologue + verifyStageAffineK + verifyPass1TreeBody
+        verifyPass1TreePrologue + verifyTreeChainLoop + verifyStageAffineK
+        + verifyPass1TreeChainBody + verifyTreeLeafLoop + verifyStageAffineK
+        + verifyPass1TreeBodyAffineK
 
     // MARK: - Row dequantization (long query blocks)
 
@@ -3242,9 +3872,10 @@ enum TurboQuantKernelOps {
     ///   - keys, valPacked, valNorms: whole buffers, `[B * nKVHeads, rows, ...]`.
     ///   - position: `[1]` int32, possibly lazy: the position of query row 0.
     ///   - visibleLength: rows the pass may read; at least `position + S`.
-    ///   - treeAncestry: a tree block's `[S]` uint32 slot masks (bit `j` of
-    ///     row `i`: row `i` sees the row at `position + j`), `S <= 8`; nil
-    ///     for a chain.
+    ///   - treeRows: a tree block's `[S]` int32 depths and slots, `S == 8`:
+    ///     row `i` sees the rows up to `position + depth[i]` and reads its own
+    ///     key and value there from row `position + slot[i]`. Nil for a
+    ///     chain.
     /// - Returns: `[B, nQHeads, S, dim]` float32 in the original value space.
     static func turboVerifyAttention(
         queries: MLXArray, keys: GQAKeys,
@@ -3252,7 +3883,7 @@ enum TurboQuantKernelOps {
         valCodebook: MLXArray, valRotation: MLXArray,
         position: MLXArray, visibleLength: Int, scale: Float,
         repeatCount: Int, valueBits: Int, dim: Int, partitions: Int? = nil,
-        treeAncestry: MLXArray? = nil
+        treeRows: (depths: MLXArray, slots: MLXArray)? = nil
     ) -> MLXArray {
         let B = queries.dim(0)
         let nQHeads = queries.dim(1)
@@ -3274,10 +3905,10 @@ enum TurboQuantKernelOps {
             ("T", queries.dtype), ("Dim", dim), ("Rep", repeatCount),
             ("ValueBits", valueBits), ("ValuePackedWidth", vpw),
         ]
-        precondition(treeAncestry == nil || chunks == 1, "a tree block has at most 8 rows")
-        let tree = treeAncestry != nil
+        precondition(treeRows == nil || S == 8, "a tree block has 8 rows")
+        let tree = treeRows != nil
         let treeName = tree ? "_tree" : ""
-        let treeInput = tree ? ["tree_anc"] : []
+        let treeInput = tree ? ["depth", "slot"] : []
         let keyRows: Int
         switch keys {
         case .raw(let rawKeys):
@@ -3317,11 +3948,11 @@ enum TurboQuantKernelOps {
             valPacked, f32(valNorms), f32(valCodebook), position.asType(.int32).reshaped([1]),
             params, MLXArray([scale]),
         ]
-        if let treeAncestry {
-            // Padded rows see the committed rows only.
-            let bits = treeAncestry.asType(.uint32).reshaped([-1])
-            inputs.append(
-                S == sPad ? bits : concatenated([bits, MLXArray.zeros([sPad - S], dtype: .uint32)]))
+        if let treeRows {
+            inputs += [
+                treeRows.depths.asType(.int32).reshaped([S]),
+                treeRows.slots.asType(.int32).reshaped([S]),
+            ]
         }
         let partials = kernel(
             inputs,

@@ -1248,18 +1248,19 @@ public class TurboQuantKVCache: BaseKVCache {
     /// offset are scratch that a later write at a smaller position overwrites,
     /// so growth keeps every row. Commit with ``commitRows(count:)``.
     ///
-    /// A tree block passes `treeAncestry`, `[S]` uint32 slot masks: row `i`
-    /// then sees the rows before `position` and the block rows
-    /// `position + j` whose bit `j` is set.
+    /// A tree block (`tree`, its rows written in slot order) attends as each
+    /// row's own path would in a chain block: through the verify kernel each
+    /// row reads its own key at its depth; the dequantizing fallback masks
+    /// by the tree's ancestry.
     package func verifyAttention(
         queries: MLXArray, keys newKeys: MLXArray, values newValues: MLXArray,
-        position: MLXArray, visibleLength: Int, scale: Float, treeAncestry: MLXArray? = nil
+        position: MLXArray, visibleLength: Int, scale: Float, tree: DFlash2TreeLayout? = nil
     ) -> MLXArray {
         writeRows(
             keys: newKeys, values: newValues, position: position, visibleLength: visibleLength)
         return attendRows(
             queries: queries, position: position, visibleLength: visibleLength, scale: scale,
-            causalTail: false, treeAncestry: treeAncestry)
+            causalTail: false, tree: tree)
     }
 
     /// The cache now holds `count` positions.
@@ -1423,7 +1424,7 @@ public class TurboQuantKVCache: BaseKVCache {
     /// last rows of `visibleLength`, so a causal mask states the same thing.
     private func attendRows(
         queries: MLXArray, position: MLXArray, visibleLength: Int, scale: Float,
-        causalTail: Bool, treeAncestry: MLXArray? = nil
+        causalTail: Bool, tree: DFlash2TreeLayout? = nil
     ) -> MLXArray {
         let B = queries.dim(0)
         let headDim = queries.dim(-1)
@@ -1445,17 +1446,26 @@ public class TurboQuantKVCache: BaseKVCache {
             let rk = rawKeys!
             keys = .raw(rk.reshaped([B * nKVHeads, rk.dim(2), headDim]))
         }
-        guard queries.dim(2) <= Self.mmaQueryRows, verifyKernelServes(queries) else {
+        // The kernel takes a chain block of up to 8 rows, or a tree of 8.
+        guard queries.dim(2) <= Self.mmaQueryRows,
+            tree == nil || queries.dim(2) == Self.mmaQueryRows, verifyKernelServes(queries)
+        else {
             let (k, rotatedValues) = TurboQuantKernelOps.turboDequantizeRows(
                 keys: keys, valPacked: vp.reshaped([B * nKVHeads, vp.dim(2), -1]),
                 valNorms: vn.reshaped([B * nKVHeads, vn.dim(2)]), valCodebook: codec.codebook,
                 rows: visibleLength, valueBits: valueBits, dim: headDim, dtype: queries.dtype)
             let mask: MLXFast.ScaledDotProductAttentionMaskMode
-            if let treeAncestry {
+            if let tree {
+                // Each tree row's visible block slots as bits.
+                let width = tree.ancestry.dim(1)
+                let bits =
+                    (tree.ancestry.asType(.uint32)
+                    * (MLXArray(UInt32(1))
+                        << MLXArray(Int32(0) ..< Int32(width)).asType(.uint32)))
+                    .sum(axis: 1).asType(.uint32).reshaped([-1, 1])
                 let relative =
                     MLXArray(Int32(0) ..< Int32(visibleLength)).expandedDimensions(axis: 0)
                     - position.asType(.int32)
-                let bits = treeAncestry.asType(.uint32).reshaped([-1, 1])
                 let seen =
                     ((bits >> clip(relative, min: 0, max: 31).asType(.uint32)) & UInt32(1))
                     .== UInt32(1)
@@ -1485,7 +1495,7 @@ public class TurboQuantKVCache: BaseKVCache {
             valCodebook: codec.codebook, valRotation: codec.rotation,
             position: position, visibleLength: visibleLength, scale: scale,
             repeatCount: repeatCount, valueBits: valueBits, dim: headDim,
-            treeAncestry: treeAncestry
+            treeRows: tree.map { ($0.depths, $0.slots) }
         ).asType(queries.dtype)
     }
 
