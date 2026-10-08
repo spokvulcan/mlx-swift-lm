@@ -1247,20 +1247,47 @@ public class TurboQuantKVCache: BaseKVCache {
     /// `visibleLength` rows up to `position + i`. Rows past the committed
     /// offset are scratch that a later write at a smaller position overwrites,
     /// so growth keeps every row. Commit with ``commitRows(count:)``.
+    ///
+    /// A tree block passes `treeAncestry`, `[S]` uint32 slot masks: row `i`
+    /// then sees the rows before `position` and the block rows
+    /// `position + j` whose bit `j` is set.
     package func verifyAttention(
         queries: MLXArray, keys newKeys: MLXArray, values newValues: MLXArray,
-        position: MLXArray, visibleLength: Int, scale: Float
+        position: MLXArray, visibleLength: Int, scale: Float, treeAncestry: MLXArray? = nil
     ) -> MLXArray {
         writeRows(
             keys: newKeys, values: newValues, position: position, visibleLength: visibleLength)
         return attendRows(
             queries: queries, position: position, visibleLength: visibleLength, scale: scale,
-            causalTail: false)
+            causalTail: false, treeAncestry: treeAncestry)
     }
 
     /// The cache now holds `count` positions.
     package func commitRows(count: Int) {
         offset = count
+    }
+
+    /// Block row `k` (cache row `position + k`) takes block row `rows[k]`'s
+    /// compressed keys and values, for every `k < width`.
+    package func gatherRows(position: Int, rows: MLXArray, width: Int) {
+        let start = MLXArray([Int32(position)])
+        let block = position ..< (position + width)
+        func gathered(_ buffer: MLXArray?) -> MLXArray? {
+            buffer.map {
+                dynamicSliceUpdated(
+                    $0, update: take($0[0..., 0..., block], rows, axis: 2), start: start,
+                    axes: [2])
+            }
+        }
+        if affineKeyMode {
+            affKeyW = gathered(affKeyW)
+            affKeyScales = gathered(affKeyScales)
+            affKeyBiases = gathered(affKeyBiases)
+        } else {
+            rawKeys = gathered(rawKeys)
+        }
+        valPackedMSE = gathered(valPackedMSE)
+        valNorms = gathered(valNorms)
     }
 
     private func writeRows(
@@ -1396,7 +1423,7 @@ public class TurboQuantKVCache: BaseKVCache {
     /// last rows of `visibleLength`, so a causal mask states the same thing.
     private func attendRows(
         queries: MLXArray, position: MLXArray, visibleLength: Int, scale: Float,
-        causalTail: Bool
+        causalTail: Bool, treeAncestry: MLXArray? = nil
     ) -> MLXArray {
         let B = queries.dim(0)
         let headDim = queries.dim(-1)
@@ -1424,7 +1451,18 @@ public class TurboQuantKVCache: BaseKVCache {
                 valNorms: vn.reshaped([B * nKVHeads, vn.dim(2)]), valCodebook: codec.codebook,
                 rows: visibleLength, valueBits: valueBits, dim: headDim, dtype: queries.dtype)
             let mask: MLXFast.ScaledDotProductAttentionMaskMode
-            if causalTail {
+            if let treeAncestry {
+                let relative =
+                    MLXArray(Int32(0) ..< Int32(visibleLength)).expandedDimensions(axis: 0)
+                    - position.asType(.int32)
+                let bits = treeAncestry.asType(.uint32).reshaped([-1, 1])
+                let seen =
+                    ((bits >> clip(relative, min: 0, max: 31).asType(.uint32)) & UInt32(1))
+                    .== UInt32(1)
+                mask = .array(
+                    (relative .< 0)
+                        .|| ((relative .< Int32(queries.dim(2))) .&& seen))
+            } else if causalTail {
                 mask = .causal
             } else {
                 let columns = MLXArray(Int32(0) ..< Int32(visibleLength))
@@ -1446,7 +1484,8 @@ public class TurboQuantKVCache: BaseKVCache {
             valNorms: vn.reshaped([B * nKVHeads, vn.dim(2)]),
             valCodebook: codec.codebook, valRotation: codec.rotation,
             position: position, visibleLength: visibleLength, scale: scale,
-            repeatCount: repeatCount, valueBits: valueBits, dim: headDim
+            repeatCount: repeatCount, valueBits: valueBits, dim: headDim,
+            treeAncestry: treeAncestry
         ).asType(queries.dtype)
     }
 

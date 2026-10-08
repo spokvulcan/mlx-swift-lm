@@ -541,14 +541,17 @@ final class Qwen35GatedDeltaNet: Module {
 
     /// `silu(conv1d(convInput))` split into the normed, scaled `q`/`k` and
     /// `v` as one launch; nil when the kernel does not cover the shape.
-    private func fusedConvNormQKV(convState: MLXArray, qkvSource: GateSource) -> (
+    private func fusedConvNormQKV(
+        convState: MLXArray, qkvSource: GateSource, windows: MLXArray? = nil
+    ) -> (
         q: MLXArray, k: MLXArray, v: MLXArray, convInput: MLXArray, nextConvState: MLXArray
     )? {
         guard headKDim == headVDim, qkvSource.array.dtype == .bfloat16 else { return nil }
         return gatedDeltaConvNormQKV(
             convState: convState, rows: qkvSource.array, rowOffset: qkvSource.offset,
             weight: conv1d.weight, numKHeads: numKHeads, numVHeads: numVHeads,
-            headDim: headKDim, scales: qkScales(qkvSource.array.dtype).pair, eps: 1e-6)
+            headDim: headKDim, scales: qkScales(qkvSource.array.dtype).pair, eps: 1e-6,
+            windows: windows)
     }
 
     /// The conv → silu → q/k norm → head scale stage and the next conv
@@ -589,11 +592,20 @@ final class Qwen35GatedDeltaNet: Module {
         )
     }
 
+    /// Whether a tree verify runs here: it needs the fused conv and scan
+    /// kernels (bf16, 128-wide heads shared by keys and values).
+    var supportsTreeVerify: Bool {
+        headKDim == headVDim && headKDim == 128 && conv1d.weight.dtype == .bfloat16
+    }
+
     /// The DFlash2 verify body: `forward` over an unmasked block, also
     /// returning what a prefix replay needs. Traceable, since the capture
-    /// rides out as outputs.
+    /// rides out as outputs. A tree block (`tree`: the layout's conv windows
+    /// and commit flags) runs the fused kernels only: each row convolves its
+    /// ancestors and scans from its parent's state.
     func verifyForward(
-        _ x: MLXArray, convState: MLXArray, recState: MLXArray
+        _ x: MLXArray, convState: MLXArray, recState: MLXArray,
+        tree: (windows: MLXArray, commits: MLXArray)? = nil
     ) -> (output: MLXArray, convState: MLXArray, capture: GatedDeltaCapture) {
         let B = x.dim(0)
         let S = x.dim(1)
@@ -606,9 +618,12 @@ final class Qwen35GatedDeltaNet: Module {
         let v: MLXArray
         let convInput: MLXArray
         let newConvState: MLXArray
-        if let fused = fusedConvNormQKV(convState: convState, qkvSource: qkvSource) {
+        if let fused = fusedConvNormQKV(
+            convState: convState, qkvSource: qkvSource, windows: tree?.windows)
+        {
             (q, k, v, convInput, newConvState) = fused
         } else {
+            precondition(tree == nil, "a tree verify needs the fused conv kernel")
             convInput = concatenated([convState, qkv], axis: 1)
             newConvState = contiguous(convInput[0..., (-(convKernelSize - 1))..., 0...])
             (q, k, v) = normalizedQKV(silu(conv1d(convInput)), batch: B, sequence: S)
@@ -617,7 +632,17 @@ final class Qwen35GatedDeltaNet: Module {
         // The kernel reads the gates out of the projection row, which rides
         // in the capture; the final state is never stored (the replay
         // rebuilds it).
-        let out = gatedDeltaOutput(q: q, k: k, v: v, gates: .source(gates), state: recState)
+        let out: MLXArray
+        if let tree {
+            guard
+                let treeOut = gatedDeltaOutput(
+                    q: q, k: k, v: v, gates: .source(gates), state: recState,
+                    commits: tree.commits)
+            else { preconditionFailure("a tree verify needs the fused scan kernel") }
+            out = treeOut
+        } else {
+            out = gatedDeltaOutput(q: q, k: k, v: v, gates: .source(gates), state: recState)
+        }
         let capture = GatedDeltaCapture(
             convInput: convInput, k: k, v: v, gates: .source(gates), initialState: recState)
         let gated = fusedNormGate(out, gate: zSource) ?? norm(out, gate: z)
@@ -862,6 +887,13 @@ final class Qwen35Attention: Module {
         )
 
         return mergeHeadsAndProject(attention: output, gate: gate)
+    }
+
+    /// Whether ``projectNormRope(_:offset:)`` runs (the per-row rope a tree
+    /// verify needs).
+    var supportsFusedNormRope: Bool {
+        qkvStacked != nil && plainRope != nil && qNorm.eps == kNorm.eps
+            && qkvStackedDims.q == attentionHeads * qNorm.weight.dim(0) * 2
     }
 
     /// The stacked projection with both norms and the rope in one launch
@@ -1228,10 +1260,10 @@ final class Qwen35DecoderLayer: Module {
     /// returned as a capture instead of a new state.
     func linearLayerVerifyBody(
         x: MLXArray, normedX: MLXArray? = nil, convState: MLXArray, recState: MLXArray,
-        nextNorm: RMSNorm? = nil
+        nextNorm: RMSNorm? = nil, tree: (windows: MLXArray, commits: MLXArray)? = nil
     ) -> (out: MLXArray, nextNormed: MLXArray?, convState: MLXArray, capture: GatedDeltaCapture) {
         let (r, newConvState, capture) = linearAttn!.verifyForward(
-            normedX ?? inputLayerNorm(x), convState: convState, recState: recState)
+            normedX ?? inputLayerNorm(x), convState: convState, recState: recState, tree: tree)
         let (h, normed) = rmsNormResidual(
             x, r, weight: postAttentionLayerNorm.weight, eps: postAttentionLayerNorm.eps)
         let (out, nextNormed) = residualOut(h, mlpForward(normed), next: nextNorm)
@@ -1543,6 +1575,7 @@ public class Qwen35TextModelInner: Module {
         var index: Int
         var length: Int
         var captureLayers: [Int]
+        var tree: Bool
     }
 
     private var verifyTraces: [VerifySegmentKey: CompiledTrace<Qwen35TextModelInner>] = [:]
@@ -1553,10 +1586,14 @@ public class Qwen35TextModelInner: Module {
     /// and each layer in `captureLayers` emits its output. Out: `[x]`, the
     /// GDN arrays, the captured outputs, then the attention head. The final
     /// norm is left to the caller.
+    /// A tree block's conv windows and commit flags ride after every other
+    /// argument (after the rope offset, which is then one position per row).
     private func verifySegmentBody(
-        at index: Int, captureLayers: [Int], _ args: [MLXArray]
+        at index: Int, captureLayers: [Int], tree: Bool, _ allArgs: [MLXArray]
     ) -> [MLXArray] {
         let segment = decodeSegments[index]
+        let args = tree ? Array(allArgs.dropLast(2)) : allArgs
+        let treeArrays = tree ? (windows: allArgs[allArgs.count - 2], commits: allArgs.last!) : nil
         var hiddenStates = index == 0 ? embedTokens(args[0]) : args[0]
         var normedInput: MLXArray? = nil
         var captured: [MLXArray] = []
@@ -1573,7 +1610,8 @@ public class Qwen35TextModelInner: Module {
             let slot = segment.stateInputOffset + 2 * i
             let result = layers[layerIndex].linearLayerVerifyBody(
                 x: hiddenStates, normedX: normedInput, convState: args[slot],
-                recState: args[slot + 1], nextNorm: nextInputNorm(in: segment, afterLinear: i))
+                recState: args[slot + 1], nextNorm: nextInputNorm(in: segment, afterLinear: i),
+                tree: treeArrays)
             hiddenStates = result.out
             normedInput = result.nextNormed
             states.append(result.convState)
@@ -1602,20 +1640,43 @@ public class Qwen35TextModelInner: Module {
         let captureLayers = request.captureLayers
 
         // Bool mask `[S, visibleLength]`: row `i` sees columns up to its own
-        // position, `position + i`, inclusive.
+        // position, `position + i`, inclusive; a tree row sees the committed
+        // columns and its ancestors' rows.
         let columns = MLXArray(Int32(0) ..< Int32(visibleLength)).expandedDimensions(axis: 0)
-        let rows = (request.position.asType(.int32) + MLXArray(Int32(0) ..< Int32(length)))
-            .expandedDimensions(axis: 1)
-        let mask = columns .< (rows + 1)
-        // The rows land at the cache position; they rotate past the prompt's images.
-        let ropePosition =
+        let mask: MLXArray
+        if let tree = request.tree {
+            let relative = columns - request.position.asType(.int32)
+            let blockColumns = take(
+                tree.ancestry, clip(relative, min: 0, max: length - 1).reshaped([-1]), axis: 1)
+            mask = (relative .< 0) .|| ((relative .< Int32(length)) .&& blockColumns)
+        } else {
+            let rows = (request.position.asType(.int32) + MLXArray(Int32(0) ..< Int32(length)))
+                .expandedDimensions(axis: 1)
+            mask = columns .< (rows + 1)
+        }
+        // The rows land at the cache position; they rotate past the prompt's
+        // images, a tree row at its depth.
+        let blockPosition =
             request.positionDelta == 0
             ? request.position : request.position + MLXArray(Int32(request.positionDelta))
+        let ropePosition =
+            request.tree.map { blockPosition.asType(.int32) + $0.depths.asType(.int32) }
+            ?? blockPosition
 
         var carry = request.tokens
         var pendingAttention: [MLXArray] = []
         var captured: [Int: MLXArray] = [:]
         var recurrentCaptures: [Int: GatedDeltaCapture] = [:]
+        let treeArrays = request.tree.map { tree -> [MLXArray] in
+            let kernel = layers.first { $0.isLinear }?.linearAttn?.convKernelSize ?? 4
+            return [tree.convWindows(kernel: kernel), tree.commits.asType(.int32)]
+        }
+        // Each tree row's visible block slots as bits, for caches that attend
+        // by position.
+        let treeAncestry = request.tree.map { tree in
+            (tree.ancestry.asType(.uint32)
+                * (MLXArray(UInt32(1)) << MLXArray(UInt32(0) ..< UInt32(length)))).sum(axis: 1)
+        }
 
         for (segmentIndex, segment) in decodeSegments.enumerated() {
             var args: [MLXArray] = [carry] + pendingAttention
@@ -1627,9 +1688,13 @@ public class Qwen35TextModelInner: Module {
             if segment.attentionPreLayer != nil {
                 args.append(ropePosition)
             }
+            if let treeArrays {
+                args += treeArrays
+            }
 
+            let isTree = request.tree != nil
             let key = VerifySegmentKey(
-                index: segmentIndex, length: length, captureLayers: captureLayers)
+                index: segmentIndex, length: length, captureLayers: captureLayers, tree: isTree)
             let trace = verifyTracesLock.withLock {
                 if let existing = verifyTraces[key] { return existing }
                 let trace = CompiledTrace<Qwen35TextModelInner>(
@@ -1640,7 +1705,7 @@ public class Qwen35TextModelInner: Module {
                     },
                     body: { model, args in
                         model.verifySegmentBody(
-                            at: segmentIndex, captureLayers: captureLayers, args)
+                            at: segmentIndex, captureLayers: captureLayers, tree: isTree, args)
                     })
                 verifyTraces[key] = trace
                 return trace
@@ -1671,10 +1736,16 @@ public class Qwen35TextModelInner: Module {
             pendingAttention = []
             if let pre = segment.attentionPreLayer {
                 let kvCache = cache[pre] as! DFlash2AttentionCache
+                // A tree block caches its keys and values in slot order.
+                let slotRows = request.tree?.slotRows
+                let keys =
+                    slotRows.map { take(outputs[next + 2], $0, axis: 2) } ?? outputs[next + 2]
+                let values =
+                    slotRows.map { take(outputs[next + 3], $0, axis: 2) } ?? outputs[next + 3]
                 let attention = kvCache.dflash2Attention(
-                    queries: outputs[next], keys: outputs[next + 2], values: outputs[next + 3],
+                    queries: outputs[next], keys: keys, values: values,
                     position: request.position, visibleLength: visibleLength, mask: mask,
-                    scale: layers[pre].selfAttn!.kernelScale)
+                    treeAncestry: treeAncestry, scale: layers[pre].selfAttn!.kernelScale)
                 pendingAttention = [attention, outputs[next + 1]]
             }
         }
@@ -1873,6 +1944,17 @@ extension Qwen35TextModel: DFlash2TargetModel {
             }
     }
 
+    /// Tree blocks need the fused conv and scan kernels on every linear
+    /// layer and the per-row rope of the fused q/k norm kernel on every
+    /// attention layer.
+    public func dflash2SupportsTree(_ cache: [KVCache]) -> Bool {
+        dflash2SupportsCache(cache)
+            && model.layers.allSatisfy { layer in
+                if let linear = layer.linearAttn { return linear.supportsTreeVerify }
+                return layer.selfAttn?.supportsFusedNormRope ?? true
+            }
+    }
+
     public func dflash2Prefill(
         _ tokens: MLXArray, cache: [KVCache], captureLayers: [Int], positionDelta: Int
     ) -> (logits: MLXArray, hidden: [MLXArray]) {
@@ -1967,6 +2049,10 @@ extension Qwen35Model: DFlash2TargetModel {
 
     public func dflash2SupportsCache(_ cache: [KVCache]) -> Bool {
         languageModel.dflash2SupportsCache(cache)
+    }
+
+    public func dflash2SupportsTree(_ cache: [KVCache]) -> Bool {
+        languageModel.dflash2SupportsTree(cache)
     }
 
     public func dflash2Prefill(

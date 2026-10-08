@@ -2061,6 +2061,23 @@ enum TurboQuantMetalKernels {
     static let turboVerifyPass1AffineKSource =
         verifyPass1Prologue + verifyStageAffineK + verifyPass1Body
 
+    /// A tree block's mask: row `r` sees the committed rows and the block
+    /// slots `j` whose bit is set in `tree_anc[r]`.
+    private static let verifyPass1TreeBody = verifyPass1Body.replacingOccurrences(
+        of: "const bool masked = kpos >= pEnd || int(kpos) > rowPos;",
+        with: """
+            const int slot = int(kpos) - pos0;
+                            const bool masked = kpos >= pEnd || (slot >= 0
+                                && (slot >= QL
+                                    || ((tree_anc[chunk * QL + smRow] >> uint(slot)) & 1u) == 0u));
+            """)
+
+    static let turboVerifyPass1RawKTreeSource =
+        verifyPass1Prologue + verifyStageRawK + verifyPass1TreeBody
+
+    static let turboVerifyPass1AffineKTreeSource =
+        verifyPass1Prologue + verifyStageAffineK + verifyPass1TreeBody
+
     // MARK: - Row dequantization (long query blocks)
 
     /// Expands the first rows of an affine-K / turbo-V cache to the activation
@@ -3225,13 +3242,17 @@ enum TurboQuantKernelOps {
     ///   - keys, valPacked, valNorms: whole buffers, `[B * nKVHeads, rows, ...]`.
     ///   - position: `[1]` int32, possibly lazy: the position of query row 0.
     ///   - visibleLength: rows the pass may read; at least `position + S`.
+    ///   - treeAncestry: a tree block's `[S]` uint32 slot masks (bit `j` of
+    ///     row `i`: row `i` sees the row at `position + j`), `S <= 8`; nil
+    ///     for a chain.
     /// - Returns: `[B, nQHeads, S, dim]` float32 in the original value space.
     static func turboVerifyAttention(
         queries: MLXArray, keys: GQAKeys,
         valPacked: MLXArray, valNorms: MLXArray,
         valCodebook: MLXArray, valRotation: MLXArray,
         position: MLXArray, visibleLength: Int, scale: Float,
-        repeatCount: Int, valueBits: Int, dim: Int, partitions: Int? = nil
+        repeatCount: Int, valueBits: Int, dim: Int, partitions: Int? = nil,
+        treeAncestry: MLXArray? = nil
     ) -> MLXArray {
         let B = queries.dim(0)
         let nQHeads = queries.dim(1)
@@ -3253,28 +3274,36 @@ enum TurboQuantKernelOps {
             ("T", queries.dtype), ("Dim", dim), ("Rep", repeatCount),
             ("ValueBits", valueBits), ("ValuePackedWidth", vpw),
         ]
+        precondition(treeAncestry == nil || chunks == 1, "a tree block has at most 8 rows")
+        let tree = treeAncestry != nil
+        let treeName = tree ? "_tree" : ""
+        let treeInput = tree ? ["tree_anc"] : []
         let keyRows: Int
         switch keys {
         case .raw(let rawKeys):
             kernel = gqaKernel(
-                "turbo_verify_p1_rawk_\(dim)_\(repeatCount)_\(valueBits)_\(queries.dtype)",
+                "turbo_verify_p1_rawk\(treeName)_\(dim)_\(repeatCount)_\(valueBits)_\(queries.dtype)",
                 inputNames: [
                     "q_in", "k_raw", "val_packed", "val_norms", "val_codebook", "position",
                     "params", "fparams",
-                ],
+                ] + treeInput,
                 outputNames: ["o_partials", "m_partials", "l_partials"],
-                source: TurboQuantMetalKernels.turboVerifyPass1RawKSource)
+                source: tree
+                    ? TurboQuantMetalKernels.turboVerifyPass1RawKTreeSource
+                    : TurboQuantMetalKernels.turboVerifyPass1RawKSource)
             inputs.append(rawKeys)
             keyRows = rawKeys.dim(1)
         case .affine(let weights, let scales, let biases, let groupSize):
             kernel = gqaKernel(
-                "turbo_verify_p1_affk_\(dim)_\(repeatCount)_\(valueBits)_\(groupSize)_\(queries.dtype)_\(scales.dtype)_\(biases.dtype)",
+                "turbo_verify_p1_affk\(treeName)_\(dim)_\(repeatCount)_\(valueBits)_\(groupSize)_\(queries.dtype)_\(scales.dtype)_\(biases.dtype)",
                 inputNames: [
                     "q_in", "k_weights", "k_scales", "k_biases", "val_packed", "val_norms",
                     "val_codebook", "position", "params", "fparams",
-                ],
+                ] + treeInput,
                 outputNames: ["o_partials", "m_partials", "l_partials"],
-                source: TurboQuantMetalKernels.turboVerifyPass1AffineKSource)
+                source: tree
+                    ? TurboQuantMetalKernels.turboVerifyPass1AffineKTreeSource
+                    : TurboQuantMetalKernels.turboVerifyPass1AffineKSource)
             inputs += [weights, scales, biases]
             template.append(("KGroup", groupSize))
             keyRows = weights.dim(1)
@@ -3288,6 +3317,12 @@ enum TurboQuantKernelOps {
             valPacked, f32(valNorms), f32(valCodebook), position.asType(.int32).reshaped([1]),
             params, MLXArray([scale]),
         ]
+        if let treeAncestry {
+            // Padded rows see the committed rows only.
+            let bits = treeAncestry.asType(.uint32).reshaped([-1])
+            inputs.append(
+                S == sPad ? bits : concatenated([bits, MLXArray.zeros([sPad - S], dtype: .uint32)]))
+        }
         let partials = kernel(
             inputs,
             template: template,
