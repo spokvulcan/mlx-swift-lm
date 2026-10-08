@@ -31,6 +31,33 @@ public struct DFlash2Proposal {
     }
 }
 
+/// A drafter's whole candidate lattice for one block: what the selector
+/// chooses its path from, for analysis and tree search.
+public struct DFlash2Lattice {
+    /// Top-K candidate ids per drafted position, `[1, L, K]`.
+    public var candidates: MLXArray
+    /// Each candidate's draft logit, `[1, L, K]`.
+    public var unary: MLXArray
+    /// Score of following candidate `i` at position `t` with candidate `j`
+    /// at `t + 1`, `[1, L - 1, K, K]`.
+    public var edges: MLXArray
+    /// Score of following the anchor with each candidate at position 0, `[1, K]`.
+    public var anchorEdges: MLXArray
+    /// The greedy path, as ``DFlash2Proposal/tokens``, `[1, L]`.
+    public var tokens: MLXArray
+
+    public init(
+        candidates: MLXArray, unary: MLXArray, edges: MLXArray, anchorEdges: MLXArray,
+        tokens: MLXArray
+    ) {
+        self.candidates = candidates
+        self.unary = unary
+        self.edges = edges
+        self.anchorEdges = anchorEdges
+        self.tokens = tokens
+    }
+}
+
 /// Per-stream drafter state, owned by the iterator and passed to the drafter
 /// on every proposal. Drafter instances hold no per-stream state, so one
 /// drafter serves many iterators.
@@ -457,7 +484,7 @@ public final class DFlash2ContextCache {
 
     /// Commit the first `valid` of the newest `newest` rows; the rest stay
     /// placeholders and drop at the next compaction.
-    package func resolve(newest: Int, valid: Int) {
+    public func resolve(newest: Int, valid: Int) {
         precondition(newest <= storedCount, "resolving more rows than stored")
         let base = storedCount - newest
         for i in 0 ..< newest {

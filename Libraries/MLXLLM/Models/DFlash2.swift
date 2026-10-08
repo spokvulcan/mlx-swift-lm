@@ -582,9 +582,11 @@ final class DFlash2CandidateSelector: Module {
         return DFlash2Proposal(tokens: outputs[0], candidates: outputs[1])
     }
 
-    private func walk(
-        hidden: MLXArray, logits: MLXArray, anchor: MLXArray, temperature: Float
-    ) -> DFlash2Proposal {
+    /// The lattice's scores: candidates and their unary scores per position,
+    /// edges between consecutive positions' candidates, and from the anchor.
+    private func scores(
+        hidden: MLXArray, logits: MLXArray, anchor: MLXArray
+    ) -> (candidates: MLXArray, unary: MLXArray, edges: MLXArray, anchorEdges: MLXArray) {
         let length = logits.dim(1)
         let candidates = topKIndices(logits, k: topK)
         let unary = takeAlong(logits, candidates, axis: -1)
@@ -600,6 +602,24 @@ final class DFlash2CandidateSelector: Module {
             predecessors[0..., 0 ..< (length - 1), 0..., 0...]
             * projected[0..., 1..., .newAxis, 0...]
         let edges = matmul(gated, successors[0..., 1..., 0..., 0...].transposed(0, 1, 3, 2))
+        return (candidates, unary, edges, anchorEdges)
+    }
+
+    func lattice(hidden: MLXArray, logits: MLXArray, anchor: MLXArray) -> DFlash2Lattice {
+        let (candidates, unary, edges, anchorEdges) = scores(
+            hidden: hidden, logits: logits, anchor: anchor)
+        let tokens = select(hidden: hidden, logits: logits, anchor: anchor, temperature: 0).tokens
+        return DFlash2Lattice(
+            candidates: candidates, unary: unary, edges: edges, anchorEdges: anchorEdges,
+            tokens: tokens)
+    }
+
+    private func walk(
+        hidden: MLXArray, logits: MLXArray, anchor: MLXArray, temperature: Float
+    ) -> DFlash2Proposal {
+        let length = logits.dim(1)
+        let (candidates, unary, edges, anchorEdges) = scores(
+            hidden: hidden, logits: logits, anchor: anchor)
 
         // The greedy path as one launch instead of a gather, add, argmax
         // and gather per position.
@@ -710,6 +730,38 @@ public final class DFlash2DraftModel: Module, DFlash2DrafterModel {
         target: any DFlash2TargetModel,
         state: inout DFlash2DrafterState
     ) -> DFlash2Proposal {
+        let (hidden, logits) = blockLogits(
+            block: block, targetHidden: targetHidden, contextPosition: contextPosition,
+            validRows: validRows, target: target, state: &state)
+        return candidateSelector.select(
+            hidden: hidden, logits: logits, anchor: block[0..., 0], temperature: temperature)
+    }
+
+    /// ``propose(block:targetHidden:contextPosition:validRows:temperature:target:state:)``
+    /// that returns the selector's whole lattice instead of its greedy path.
+    public func proposeLattice(
+        block: MLXArray,
+        targetHidden: MLXArray,
+        contextPosition: Int,
+        validRows: MLXArray,
+        target: any DFlash2TargetModel,
+        state: inout DFlash2DrafterState
+    ) -> DFlash2Lattice {
+        let (hidden, logits) = blockLogits(
+            block: block, targetHidden: targetHidden, contextPosition: contextPosition,
+            validRows: validRows, target: target, state: &state)
+        return candidateSelector.lattice(hidden: hidden, logits: logits, anchor: block[0..., 0])
+    }
+
+    /// The block's normed hidden states past the anchor and their draft logits.
+    private func blockLogits(
+        block: MLXArray,
+        targetHidden: MLXArray,
+        contextPosition: Int,
+        validRows: MLXArray,
+        target: any DFlash2TargetModel,
+        state: inout DFlash2DrafterState
+    ) -> (hidden: MLXArray, logits: MLXArray) {
         precondition(block.dim(0) == 1, "DFlash2 drafts one stream at a time")
         precondition(
             state.contextCaches.count == layers.count, "one context cache per drafter layer")
@@ -777,8 +829,7 @@ public final class DFlash2DraftModel: Module, DFlash2DrafterModel {
         if let cap = config.dflash.finalLogitSoftcapping, cap > 0 {
             logits = tanh(logits / cap) * cap
         }
-        return candidateSelector.select(
-            hidden: hidden, logits: logits, anchor: block[0..., 0], temperature: temperature)
+        return (hidden, logits)
     }
 
     /// Bool mask `[width, cache.count + width]`. Committed context rows
