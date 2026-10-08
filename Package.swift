@@ -62,10 +62,11 @@ let package = Package(
     ],
     dependencies: [
         // Exact-revision pin on the spokvulcan/mlx-swift fork, branch
-        // pin-tesseract: db60fb7 = 2d1bd1b + the mlx gitlinks 3c6990d9
+        // pin-tesseract: 3425495 = 2d1bd1b + the mlx gitlinks 3c6990d9
         // (in-place custom kernel outputs: an `inplace_<input>` output updates
-        // that input's buffer) and e90cd38a (cheaper quantized and custom
-        // kernel dispatch). 2d1bd1b = 6058402 + upstream mlx-swift's
+        // that input's buffer), e90cd38a (cheaper quantized and custom kernel
+        // dispatch) and 2394c0d0 (a 128 x 32 tile for large-M 4-bit QMM,
+        // bitwise with qmm_t). 2d1bd1b = 6058402 + upstream mlx-swift's
         // MLXLogger (#484, #493; mlx-swift-lm uses it since #535). 6058402 = 24779d5
         // (lineage: ml-explore 0.31.6 +
         // provenance + C-series gitlink bumps + qmv_wide backport (mlx#3764)
@@ -95,7 +96,7 @@ let package = Package(
         // docs/mlx-core-fork.md.
         .package(
             url: "https://github.com/spokvulcan/mlx-swift",
-            revision: "db60fb7c6069c9d2595c2577153a92b65deddec0"),
+            revision: "3425495d3b2a9a54549a7d9a96700a53fee4d308"),
         // 602.0.0 floor: swift.org publishes signed prebuilt swift-syntax artifacts only for
         // >= 602 tags on current toolchains; a 600.x/601.x resolution falls back to the full
         // source compile of swift-syntax.
