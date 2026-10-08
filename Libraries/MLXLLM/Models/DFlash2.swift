@@ -542,6 +542,8 @@ final class DFlash2CandidateSelector: Module {
 
     /// The greedy walk is ~60 small ops per block; one trace per width.
     private var compiledGreedy: [Int: CompiledTrace<DFlash2CandidateSelector>] = [:]
+    /// The tree proposal, scores to layout; one trace per width.
+    private var compiledTree: [Int: CompiledTrace<DFlash2CandidateSelector>] = [:]
     private let lock = NSLock()
 
     init(_ config: DFlash2Configuration) {
@@ -608,10 +610,44 @@ final class DFlash2CandidateSelector: Module {
     func lattice(hidden: MLXArray, logits: MLXArray, anchor: MLXArray) -> DFlash2Lattice {
         let (candidates, unary, edges, anchorEdges) = scores(
             hidden: hidden, logits: logits, anchor: anchor)
-        let tokens = select(hidden: hidden, logits: logits, anchor: anchor, temperature: 0).tokens
+        let tokens =
+            dflash2GreedyWalk(
+                unary: unary, edges: edges, anchorEdges: anchorEdges, candidates: candidates)
+            ?? walk(hidden: hidden, logits: logits, anchor: anchor, temperature: 0).tokens
         return DFlash2Lattice(
             candidates: candidates, unary: unary, edges: edges, anchorEdges: anchorEdges,
             tokens: tokens)
+    }
+
+    /// ``dflash2TreeProposal(lattice:anchor:siblingRanks:temperature:)`` over
+    /// this block's lattice, as one compiled trace per width.
+    func tree(
+        hidden: MLXArray, logits: MLXArray, anchor: MLXArray, siblingRanks: Int,
+        temperature: Float
+    ) -> DFlash2TreeProposal {
+        let width = logits.dim(1)
+        let trace = lock.withLock {
+            if let existing = compiledTree[width] { return existing }
+            let trace = CompiledTrace<DFlash2CandidateSelector> { selector, args in
+                let tree = dflash2TreeProposal(
+                    lattice: selector.lattice(hidden: args[0], logits: args[1], anchor: args[2]),
+                    anchor: args[2], siblingRanks: siblingRanks, temperature: temperature)
+                let layout = tree.layout
+                return [
+                    tree.tokens, layout.depths, layout.ancestry, layout.commits, layout.chainRows,
+                    layout.slotRows, layout.slots, tree.parents, tree.chainLength,
+                ]
+            }
+            compiledTree[width] = trace
+            return trace
+        }
+        let outputs = trace(self, [hidden, logits, anchor])
+        return DFlash2TreeProposal(
+            tokens: outputs[0],
+            layout: DFlash2TreeLayout(
+                depths: outputs[1], ancestry: outputs[2], commits: outputs[3],
+                chainRows: outputs[4], slotRows: outputs[5], slots: outputs[6]),
+            parents: outputs[7], chainLength: outputs[8])
     }
 
     private func walk(
@@ -752,6 +788,37 @@ public final class DFlash2DraftModel: Module, DFlash2DrafterModel {
             validRows: validRows, target: target, state: &state)
         return candidateSelector.lattice(hidden: hidden, logits: logits, anchor: block[0..., 0])
     }
+
+    /// The greedy proposal as a tree: the selector's greedy chain plus leaf
+    /// siblings (``dflash2TreeProposal(lattice:anchor:siblingRanks:)``).
+    public func proposeTree(
+        block: MLXArray,
+        targetHidden: MLXArray,
+        contextPosition: Int,
+        validRows: MLXArray,
+        target: any DFlash2TargetModel,
+        state: inout DFlash2DrafterState
+    ) -> DFlash2TreeProposal? {
+        let (hidden, logits) = blockLogits(
+            block: block, targetHidden: targetHidden, contextPosition: contextPosition,
+            validRows: validRows, target: target, state: &state)
+        return candidateSelector.tree(
+            hidden: hidden, logits: logits, anchor: block[0..., 0],
+            siblingRanks: Self.treeSiblingRanks, temperature: Self.treeTemperature)
+    }
+
+    /// `DFLASH2_TREE_RANKS=N`: leaves considered per position (default 3; 0
+    /// verifies the chain alone through the tree path).
+    private static let treeSiblingRanks: Int =
+        ProcessInfo.processInfo.environment["DFLASH2_TREE_RANKS"].flatMap(Int.init) ?? 3
+
+    /// `DFLASH2_TREE_TEMPERATURE=T`: the temperature of the local scores that
+    /// rank tree items. 1.25 calibrates the selector: it maximizes the
+    /// likelihood of the chain's per-position hits on Qwen3.8-27B's travel,
+    /// summary and math streams (1.0 on code).
+    private static let treeTemperature: Float =
+        ProcessInfo.processInfo.environment["DFLASH2_TREE_TEMPERATURE"].flatMap(Float.init)
+        ?? 1.25
 
     /// The block's normed hidden states past the anchor and their draft logits.
     private func blockLogits(

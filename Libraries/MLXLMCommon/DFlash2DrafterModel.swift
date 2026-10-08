@@ -58,6 +58,29 @@ public struct DFlash2Lattice {
     }
 }
 
+/// A block drafted as a tree: the selector's greedy chain plus leaf rows,
+/// alternatives that branch off it where the chain is least sure. Every
+/// array may be lazy and has the block's static width `S`.
+public struct DFlash2TreeProposal {
+    /// `[1, S]` token ids in topological order; row 0 is the anchor.
+    public var tokens: MLXArray
+    /// What the verify pass needs to run the block as a tree.
+    public var layout: DFlash2TreeLayout
+    /// `[S]` int32: each row's parent row (0 for the anchor itself).
+    public var parents: MLXArray
+    /// `[]` int32: the chain's length, anchor excluded.
+    public var chainLength: MLXArray
+
+    public init(
+        tokens: MLXArray, layout: DFlash2TreeLayout, parents: MLXArray, chainLength: MLXArray
+    ) {
+        self.tokens = tokens
+        self.layout = layout
+        self.parents = parents
+        self.chainLength = chainLength
+    }
+}
+
 /// Per-stream drafter state, owned by the iterator and passed to the drafter
 /// on every proposal. Drafter instances hold no per-stream state, so one
 /// drafter serves many iterators.
@@ -122,15 +145,93 @@ public protocol DFlash2DrafterModel: BaseLanguageModel {
     /// so a drafter that predicts over a vocabulary prefix can widen when
     /// the target leaves it. Default: ignored.
     func observeCommitted(_ tokens: [Int])
+
+    /// Propose one greedy block as a tree of `block.dim(1)` rows; nil when
+    /// the drafter only drafts chains. Same inputs and state handling as
+    /// ``propose(block:targetHidden:contextPosition:validRows:temperature:target:state:)``.
+    func proposeTree(
+        block: MLXArray,
+        targetHidden: MLXArray,
+        contextPosition: Int,
+        validRows: MLXArray,
+        target: any DFlash2TargetModel,
+        state: inout DFlash2DrafterState
+    ) -> DFlash2TreeProposal?
 }
 
 extension DFlash2DrafterModel {
     public func observeCommitted(_ tokens: [Int]) {}
+
+    public func proposeTree(
+        block: MLXArray, targetHidden: MLXArray, contextPosition: Int, validRows: MLXArray,
+        target: any DFlash2TargetModel, state: inout DFlash2DrafterState
+    ) -> DFlash2TreeProposal? { nil }
 }
 
 // MARK: - Target
 
 /// One verify pass over `[anchor, draft_1, ..., draft_{S-1}]`.
+/// A verify block whose rows form a tree: a chain from the anchor plus leaf
+/// rows that branch off it, in topological order (every row after its
+/// parent). Each row attends to its ancestors, rotates at its depth, and
+/// convolves and scans along its own ancestry; the chain rows compute
+/// exactly what they compute in a plain block.
+public struct DFlash2TreeLayout {
+    /// `[S]` int32 depth of each row (0 for the anchor): its position past
+    /// the block's.
+    public var depths: MLXArray
+    /// `[S, S]` bool: row `i` sees block slot `j` (it holds an ancestor, or
+    /// the row itself). The block's keys and values are cached in slot
+    /// order, see ``slotRows``.
+    public var ancestry: MLXArray
+    /// `[1, S]` int32: 1 where the row continues the recurrent state (the
+    /// anchor and the chain), 0 for a leaf.
+    public var commits: MLXArray
+    /// `[S]` int32: the row holding the chain at each depth (`chainRows[0]`
+    /// is the anchor's row, 0); depths past the chain repeat its last row.
+    /// A row at depth `d` descends from `chainRows[0 ..< d]`.
+    public var chainRows: MLXArray
+    /// `[S]` int32: the row whose keys and values go in each cache slot of
+    /// the block: the anchor and the chain by depth first, exactly where a
+    /// chain block puts them, then the leaves. A chain row's attention then
+    /// reads the same keys in the same slots as in a chain block, so it
+    /// reduces in the same order.
+    public var slotRows: MLXArray
+    /// `[S]` int32: each row's slot (the inverse of ``slotRows``).
+    public var slots: MLXArray
+
+    public init(
+        depths: MLXArray, ancestry: MLXArray, commits: MLXArray, chainRows: MLXArray,
+        slotRows: MLXArray, slots: MLXArray
+    ) {
+        self.depths = depths
+        self.ancestry = ancestry
+        self.commits = commits
+        self.chainRows = chainRows
+        self.slotRows = slotRows
+        self.slots = slots
+    }
+
+    /// `[1, S, K]` int32 conv windows for a depthwise conv of width `K` over
+    /// the virtual input `K - 1` state rows then the block's rows (see
+    /// ``gatedDeltaConvNormQKV(convState:rows:rowOffset:weight:numKHeads:numVHeads:headDim:scales:eps:windows:)``):
+    /// each row's `K - 1` ancestors along the chain, or state rows above the
+    /// anchor, then the row itself. A chain gets `s ..< s + K`.
+    public func convWindows(kernel K: Int) -> MLXArray {
+        let S = depths.dim(0)
+        let depth = depths.asType(.int32).reshaped([S, 1])
+        // Path positions depth - (K - 1) ..< depth: a state row above the
+        // anchor (negative), else the chain row at that depth.
+        let pathPosition = depth + MLXArray(Int32(-(K - 1)) ..< Int32(0)).reshaped([1, K - 1])
+        let chainRow = take(chainRows.asType(.int32), maximum(pathPosition, 0).reshaped([-1]))
+            .reshaped([S, K - 1])
+        let ancestors = MLX.where(
+            pathPosition .< 0, pathPosition + Int32(K - 1), chainRow + Int32(K - 1))
+        let own = MLXArray(Int32(K - 1) ..< Int32(K - 1 + S)).reshaped([S, 1])
+        return concatenated([ancestors, own], axis: 1).reshaped([1, S, K])
+    }
+}
+
 public struct DFlash2VerifyRequest {
     /// `[1, S]` token ids.
     public var tokens: MLXArray
@@ -143,16 +244,19 @@ public struct DFlash2VerifyRequest {
     /// Rotary offset of text past the prompt's images: cache row `p` rotates
     /// at `p + positionDelta`. Zero for a text-only prompt.
     public var positionDelta: Int
+    /// The block's tree shape; nil for a chain (row `i` at depth `i`).
+    public var tree: DFlash2TreeLayout?
 
     public init(
         tokens: MLXArray, position: MLXArray, positionUpperBound: Int, captureLayers: [Int],
-        positionDelta: Int = 0
+        positionDelta: Int = 0, tree: DFlash2TreeLayout? = nil
     ) {
         self.tokens = tokens
         self.position = position
         self.positionUpperBound = positionUpperBound
         self.captureLayers = captureLayers
         self.positionDelta = positionDelta
+        self.tree = tree
     }
 }
 
@@ -200,6 +304,14 @@ public protocol DFlash2TargetModel: LanguageModel {
 
     /// The verify pass. See ``DFlash2VerifyRequest`` and ``DFlash2VerifyResult``.
     func dflash2Verify(_ request: DFlash2VerifyRequest, cache: [KVCache]) -> DFlash2VerifyResult
+
+    /// Whether `dflash2Verify` can run a ``DFlash2TreeLayout`` block over
+    /// `cache`. Default: false.
+    func dflash2SupportsTree(_ cache: [KVCache]) -> Bool
+}
+
+extension DFlash2TargetModel {
+    public func dflash2SupportsTree(_ cache: [KVCache]) -> Bool { false }
 }
 
 /// A DFlash2 target that takes prompts with images: it prefills a prompt
@@ -295,6 +407,30 @@ public struct GatedDeltaCapture {
             initialState: initialState)
     }
 
+    /// The capture with its block rows taken in `rows` order (`[S]` int32,
+    /// possibly lazy): a tree block's accepted path as a chain, which
+    /// ``replay(validCount:)`` then replays like any other.
+    public func gathering(rows: MLXArray) -> GatedDeltaCapture {
+        let stateRows = convInput.dim(1) - k.dim(1)
+        let gatedGates: GatedDeltaGates
+        switch gates {
+        case .precomputed(let g, let beta):
+            gatedGates = .precomputed(g: take(g, rows, axis: 1), beta: take(beta, rows, axis: 1))
+        case .source(var source):
+            source.aSource = take(source.aSource, rows, axis: 1)
+            source.bSource = take(source.bSource, rows, axis: 1)
+            gatedGates = .source(source)
+        }
+        return GatedDeltaCapture(
+            convInput: concatenated(
+                [
+                    convInput[0..., ..<stateRows],
+                    take(convInput[0..., stateRows...], rows, axis: 1),
+                ], axis: 1),
+            k: take(k, rows, axis: 1), v: take(v, rows, axis: 1), gates: gatedGates,
+            initialState: initialState)
+    }
+
     /// The layer's state after the first `validCount` positions of the pass.
     ///
     /// Replays every position with the steps past `validCount` skipped.
@@ -317,21 +453,43 @@ public struct GatedDeltaCapture {
 /// `position` (a `[1]` int32, possibly lazy) without moving `offset` and
 /// attends over the first `visibleLength` rows, row `i` seeing columns up to
 /// `position + i`. `mask` is that position mask (`[S, visibleLength]` bool);
-/// a conformer may rebuild it from `position` instead. The iterator then
-/// commits the accepted prefix with ``commitRows(count:)``.
+/// a conformer may rebuild it from `position` instead. A tree block's mask
+/// lets row `i` see the rows before `position` and the block rows
+/// `position + j` whose bit `j` is set in `treeAncestry[i]` (`[S]` uint32,
+/// nil for a chain). The iterator then commits the accepted prefix with
+/// ``commitRows(count:)``.
 package protocol DFlash2AttentionCache: KVCache {
     func dflash2Attention(
         queries: MLXArray, keys: MLXArray, values: MLXArray, position: MLXArray,
-        visibleLength: Int, mask: MLXArray, scale: Float
+        visibleLength: Int, mask: MLXArray, treeAncestry: MLXArray?, scale: Float
     ) -> MLXArray
 
     func commitRows(count: Int)
+
+    /// Reorder a tree block's rows before the commit: block row `k` (cache
+    /// row `position + k`) takes the content of block row `rows[k]` for
+    /// every `k < width`, so the accepted path lies contiguous from
+    /// `position`. `rows` (`[width]` int32) may be lazy.
+    func gatherRows(position: Int, rows: MLXArray, width: Int)
+}
+
+extension DFlash2AttentionCache {
+    /// A chain block's attention.
+    package func dflash2Attention(
+        queries: MLXArray, keys: MLXArray, values: MLXArray, position: MLXArray,
+        visibleLength: Int, mask: MLXArray, scale: Float
+    ) -> MLXArray {
+        dflash2Attention(
+            queries: queries, keys: keys, values: values, position: position,
+            visibleLength: visibleLength, mask: mask, treeAncestry: nil, scale: scale)
+    }
 }
 
 extension KVCacheSimple: DFlash2AttentionCache {
     package func dflash2Attention(
         queries: MLXArray, keys newKeys: MLXArray, values newValues: MLXArray,
-        position: MLXArray, visibleLength: Int, mask: MLXArray, scale: Float
+        position: MLXArray, visibleLength: Int, mask: MLXArray, treeAncestry: MLXArray?,
+        scale: Float
     ) -> MLXArray {
         let (keys, values) = writeRows(
             keys: newKeys, values: newValues, position: position, visibleLength: visibleLength)
@@ -341,13 +499,16 @@ extension KVCacheSimple: DFlash2AttentionCache {
 }
 
 extension TurboQuantKVCache: DFlash2AttentionCache {
+    /// The compressed verify attends by position (and a tree's slot masks),
+    /// not by `mask`.
     package func dflash2Attention(
         queries: MLXArray, keys newKeys: MLXArray, values newValues: MLXArray,
-        position: MLXArray, visibleLength: Int, mask: MLXArray, scale: Float
+        position: MLXArray, visibleLength: Int, mask: MLXArray, treeAncestry: MLXArray?,
+        scale: Float
     ) -> MLXArray {
         verifyAttention(
             queries: queries, keys: newKeys, values: newValues, position: position,
-            visibleLength: visibleLength, scale: scale)
+            visibleLength: visibleLength, scale: scale, treeAncestry: treeAncestry)
     }
 }
 
@@ -393,6 +554,18 @@ extension KVCacheSimple {
     /// the cache now holds `count` positions.
     package func commitRows(count: Int) {
         offset = count
+    }
+
+    package func gatherRows(position: Int, rows: MLXArray, width: Int) {
+        guard let keys, let values else { return }
+        let start = MLXArray([Int32(position)])
+        let block = position ..< (position + width)
+        self.keys = dynamicSliceUpdated(
+            keys, update: take(keys[.ellipsis, block, 0...], rows, axis: 2), start: start,
+            axes: [2])
+        self.values = dynamicSliceUpdated(
+            values, update: take(values[.ellipsis, block, 0...], rows, axis: 2), start: start,
+            axes: [2])
     }
 }
 

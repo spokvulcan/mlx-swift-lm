@@ -75,7 +75,15 @@ public struct DFlash2SpeculativeTokenIterator: TokenIteratorProtocol {
         var probabilities: MLXArray?
         var width: Int
         var verify: DFlash2VerifyResult
+        /// The block's tree shape when it was drafted as a tree.
+        var tree: DFlash2TreeProposal? = nil
     }
+
+    /// Whether greedy rounds are drafted and verified as trees (a chain plus
+    /// leaf siblings, ``dflash2TreeProposal(lattice:anchor:siblingRanks:temperature:)``)
+    /// where the drafter, target and cache support them and no logit
+    /// processor runs. `DFLASH2_TREE=0` keeps every round a chain.
+    private let treeRounds: Bool
 
     private var inFlight: Round?
     /// Absolute position of the in-flight round's anchor.
@@ -179,6 +187,9 @@ public struct DFlash2SpeculativeTokenIterator: TokenIteratorProtocol {
             parameters.seed.map { MLXRandom.RandomState(seed: $0) } ?? MLXRandom.RandomState()
         self.maxTokens = parameters.maxTokens
         self.blockSize = Swift.max(2, blockSize ?? drafter.blockSize)
+        self.treeRounds =
+            ProcessInfo.processInfo.environment["DFLASH2_TREE"] != "0"
+            && parameters.temperature <= 0
 
         let prefillStart = Date.timeIntervalSinceReferenceDate
         var prefilled = prefilledPrefixTokens
@@ -309,6 +320,28 @@ public struct DFlash2SpeculativeTokenIterator: TokenIteratorProtocol {
         }
         let masks = MLXArray(Array(repeating: Int32(drafter.maskTokenId), count: drafts))
         let block = concatenated([anchor.asType(.int32), masks]).expandedDimensions(axis: 0)
+        // Full-width greedy rounds may run as trees; a capped last round
+        // stays a chain.
+        if treeRounds, processor == nil, drafts == blockSize - 1,
+            target.dflash2SupportsTree(cache),
+            let tree = drafter.proposeTree(
+                block: block, targetHidden: targetHidden, contextPosition: contextPosition,
+                validRows: validRows, target: target, state: &drafterState)
+        {
+            let request = DFlash2VerifyRequest(
+                tokens: tree.tokens,
+                position: position,
+                positionUpperBound: positionUpperBound,
+                captureLayers: drafter.targetLayerIds,
+                positionDelta: positionDelta,
+                tree: tree.layout)
+            let verify = target.dflash2Verify(request, cache: cache)
+            asyncEval(verify.logits)
+            inFlight = Round(
+                drafts: tree.tokens[0, 1...], candidates: tree.tokens, probabilities: nil,
+                width: drafts + 1, verify: verify, tree: tree)
+            return targetHidden.dim(1)
+        }
         let proposal = drafter.propose(
             block: block, targetHidden: targetHidden, contextPosition: contextPosition,
             validRows: validRows, temperature: temperature, target: target,
@@ -335,25 +368,40 @@ public struct DFlash2SpeculativeTokenIterator: TokenIteratorProtocol {
         let gamma = round.width - 1
 
         // 1. Accept (lazy). The processor state is current through the last
-        // committed round; drafted tokens feed a scratch copy row by row.
-        let logits = processedRows(round.verify.logits[0], drafts: round.drafts)
+        // committed round; drafted tokens feed a scratch copy row by row. A
+        // tree accepts a path, whose rows every commit below gathers.
         let acceptance: Acceptance
-        if greedy {
-            acceptance = Self.greedyAcceptance(drafts: round.drafts, logits: logits)
+        var captures = round.verify.recurrentCaptures
+        var verifiedHidden = concatenatedHidden(round.verify.hidden)
+        if let tree = round.tree {
+            let path = dflash2TreeAcceptance(tree, logits: round.verify.logits[0])
+            acceptance = Acceptance(
+                accepted: path.accepted, bonus: path.bonus, packed: path.packed)
+            captures = captures.map { $0.gathering(rows: path.pathRows) }
+            verifiedHidden = take(verifiedHidden, path.pathRows, axis: 1)
+            for entry in cache {
+                (entry as? DFlash2AttentionCache)?.gatherRows(
+                    position: anchorPosition, rows: path.pathSlots, width: round.width)
+            }
         } else {
-            acceptance = sampledAcceptance(round: round, logits: logits)
+            let logits = processedRows(round.verify.logits[0], drafts: round.drafts)
+            if greedy {
+                acceptance = Self.greedyAcceptance(drafts: round.drafts, logits: logits)
+            } else {
+                acceptance = sampledAcceptance(round: round, logits: logits)
+            }
         }
         asyncEval(acceptance.packed)
 
         // 2. Recurrent state for this round's outcome, whatever it is.
         let validCount = acceptance.accepted + 1
-        commitRecurrentState(round.verify.recurrentCaptures, validCount: validCount)
+        commitRecurrentState(captures, validCount: validCount)
 
         // 3. Next round, from lazy accept-dependent inputs.
         let appendedRows = buildRound(
             anchor: acceptance.bonus,
             validRows: validCount,
-            targetHidden: concatenatedHidden(round.verify.hidden),
+            targetHidden: verifiedHidden,
             contextPosition: anchorPosition,
             position: MLXArray([Int32(anchorPosition)]) + validCount.asType(.int32),
             positionUpperBound: anchorPosition + round.width,
@@ -392,7 +440,7 @@ public struct DFlash2SpeculativeTokenIterator: TokenIteratorProtocol {
         committedAcceptedCount = accepted
         producedTokens += accepted + 1
         anchorPosition = committed
-        committedCaptures = round.verify.recurrentCaptures
+        committedCaptures = captures
 
         proposedCount += gamma
         acceptedCount += accepted
