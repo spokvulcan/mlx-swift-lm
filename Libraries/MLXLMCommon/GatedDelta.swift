@@ -29,6 +29,10 @@ enum GatedDeltaKernelVariant: Hashable {
     case full(masked: Bool)
     /// `y` only: the final state is not stored (verify passes discard it).
     case outputOnly
+    /// `y` only, for a tree block: each step runs on a copy of the state,
+    /// and only steps whose int32 `commits` flag is set keep it, so a leaf
+    /// row's output comes from its parent's state and leaves it untouched.
+    case outputOnlyTree
     /// The final state only, over the first `valid` steps (`valid` is an
     /// int32 array input): the replay that rewinds a verify pass. With
     /// `conv` it also copies the replay's conv state — rows `valid ..<
@@ -61,6 +65,13 @@ private func makeGatedDeltaKernel(
         inputNames = ["q", "k", "v", "g", "beta", "state_in", "T"]
         outputNames = ["y"]
         baseName = "gated_delta_step_y"
+    case .outputOnlyTree:
+        readsQuery = true
+        writesState = false
+        stepGuard = "true"
+        inputNames = ["q", "k", "v", "g", "beta", "state_in", "T", "commits"]
+        outputNames = ["y"]
+        baseName = "gated_delta_step_y_tree"
     case .stateAfterValid(let conv):
         readsQuery = false
         writesState = true
@@ -73,6 +84,10 @@ private func makeGatedDeltaKernel(
     // Fused gates read the pre-activations straight out of their projection
     // rows (`a_src[b, t, AOFF + h]`, `b_src[b, t, BOFF + h]`) plus the
     // layer's `A_log` and `dt_bias`, instead of precomputed `g`/`beta`.
+    // A tree step works on a copy of the state (the same expressions on
+    // `work`) and keeps it only when its row commits.
+    let tree = variant == .outputOnlyTree
+    let st = tree ? "work" : "state"
     let gateInputs = fusedGates ? ["a_src", "b_src", "a_log", "dt_bias"] : ["g", "beta"]
     inputNames = inputNames.flatMap { $0 == "g" ? gateInputs : ($0 == "beta" ? [] : [$0]) }
     let name = fusedGates ? baseName + "_fg" : baseName
@@ -180,6 +195,14 @@ private func makeGatedDeltaKernel(
                   const float g_t = g_[hv_idx];
                   const float beta_t = beta_[hv_idx];
                   """)
+              \(tree ? """
+                  float work[RPT][n_per_t];
+                  for (int r = 0; r < RPT; ++r) {
+                    for (int i = 0; i < n_per_t; ++i) {
+                      work[r][i] = state[r][i];
+                    }
+                  }
+                  """ : "")
               if (\(stepGuard)) {
                 float kv_mem[RPT];
                 for (int r = 0; r < RPT; ++r) {
@@ -190,8 +213,8 @@ private func makeGatedDeltaKernel(
                   kv_mem[r] = 0.0f;
                   for (int i = 0; i < n_per_t; ++i) {
                     auto s_idx = n_per_t * dk_idx + i;
-                    state[r][i] = state[r][i] * g_t;
-                    auto product = state[r][i] * k_[s_idx];
+                    \(st)[r][i] = \(st)[r][i] * g_t;
+                    auto product = \(st)[r][i] * k_[s_idx];
                     auto corrected = product - kv_compensation;
                     auto next_sum = kv_mem[r] + corrected;
                     kv_compensation = (next_sum - kv_mem[r]) - corrected;
@@ -208,8 +231,8 @@ private func makeGatedDeltaKernel(
                   \(readsQuery ? "out[r] = 0.0f;" : "")
                   for (int i = 0; i < n_per_t; ++i) {
                     auto s_idx = n_per_t * dk_idx + i;
-                    state[r][i] = state[r][i] + k_[s_idx] * delta;
-                    \(readsQuery ? "out[r] += state[r][i] * q_[s_idx];" : "")
+                    \(st)[r][i] = \(st)[r][i] + k_[s_idx] * delta;
+                    \(readsQuery ? "out[r] += \(st)[r][i] * q_[s_idx];" : "")
                   }
                 }
                 \(readsQuery ? """
@@ -229,6 +252,15 @@ private func makeGatedDeltaKernel(
                     }
                     """ : "")
               }
+              \(tree ? """
+                  if (commits[b_idx * T + t] != 0) {
+                    for (int r = 0; r < RPT; ++r) {
+                      for (int i = 0; i < n_per_t; ++i) {
+                        state[r][i] = work[r][i];
+                      }
+                    }
+                  }
+                  """ : "")
               // Increment data pointers to next time step
               \(readsQuery ? "q_ += Hk * Dk;" : "")
               k_ += Hk * Dk;
@@ -260,11 +292,13 @@ private final class GatedDeltaKernelManager: Sendable {
     let kernel: MLXFast.MLXFastKernel?
     let kernelMasked: MLXFast.MLXFastKernel?
     let kernelOutputOnly: MLXFast.MLXFastKernel?
+    let kernelOutputOnlyTree: MLXFast.MLXFastKernel?
     let kernelStateAfterValid: MLXFast.MLXFastKernel?
     let kernelStateAfterValidConv: MLXFast.MLXFastKernel?
     let fusedGateKernel: MLXFast.MLXFastKernel?
     let fusedGateKernelMasked: MLXFast.MLXFastKernel?
     let fusedGateKernelOutputOnly: MLXFast.MLXFastKernel?
+    let fusedGateKernelOutputOnlyTree: MLXFast.MLXFastKernel?
     let fusedGateKernelStateAfterValid: MLXFast.MLXFastKernel?
     let fusedGateKernelStateAfterValidConv: MLXFast.MLXFastKernel?
 
@@ -272,6 +306,7 @@ private final class GatedDeltaKernelManager: Sendable {
         kernel = makeGatedDeltaKernel(.full(masked: false), fusedGates: false)
         kernelMasked = makeGatedDeltaKernel(.full(masked: true), fusedGates: false)
         kernelOutputOnly = makeGatedDeltaKernel(.outputOnly, fusedGates: false)
+        kernelOutputOnlyTree = makeGatedDeltaKernel(.outputOnlyTree, fusedGates: false)
         kernelStateAfterValid = makeGatedDeltaKernel(
             .stateAfterValid(conv: false), fusedGates: false)
         kernelStateAfterValidConv = makeGatedDeltaKernel(
@@ -279,6 +314,7 @@ private final class GatedDeltaKernelManager: Sendable {
         fusedGateKernel = makeGatedDeltaKernel(.full(masked: false), fusedGates: true)
         fusedGateKernelMasked = makeGatedDeltaKernel(.full(masked: true), fusedGates: true)
         fusedGateKernelOutputOnly = makeGatedDeltaKernel(.outputOnly, fusedGates: true)
+        fusedGateKernelOutputOnlyTree = makeGatedDeltaKernel(.outputOnlyTree, fusedGates: true)
         fusedGateKernelStateAfterValid = makeGatedDeltaKernel(
             .stateAfterValid(conv: false), fusedGates: true)
         fusedGateKernelStateAfterValidConv = makeGatedDeltaKernel(
@@ -289,10 +325,12 @@ private final class GatedDeltaKernelManager: Sendable {
         switch (variant, fusedGates) {
         case (.full(let masked), false): masked ? kernelMasked : kernel
         case (.outputOnly, false): kernelOutputOnly
+        case (.outputOnlyTree, false): kernelOutputOnlyTree
         case (.stateAfterValid(let conv), false):
             conv ? kernelStateAfterValidConv : kernelStateAfterValid
         case (.full(let masked), true): masked ? fusedGateKernelMasked : fusedGateKernel
         case (.outputOnly, true): fusedGateKernelOutputOnly
+        case (.outputOnlyTree, true): fusedGateKernelOutputOnlyTree
         case (.stateAfterValid(let conv), true):
             conv ? fusedGateKernelStateAfterValidConv : fusedGateKernelStateAfterValid
         }
@@ -436,6 +474,10 @@ private func gatedDeltaKernel(
         outputDTypes = [inputType, stateType]
     case .outputOnly:
         inputs = [q!, k, v] + gateInputs + [state, MLXArray(T)]
+        outputShapes = [[B, T, Hv, Dv]]
+        outputDTypes = [inputType]
+    case .outputOnlyTree:
+        inputs = [q!, k, v] + gateInputs + [state, MLXArray(T), extra!.asType(.int32)]
         outputShapes = [[B, T, Hv, Dv]]
         outputDTypes = [inputType]
     case .stateAfterValid(let conv):
@@ -726,6 +768,22 @@ public func gatedDeltaOutput(
     }
     let (g, beta) = gates.materialized
     return gatedDeltaOps(q: q, k: k, v: v, g: g, beta: beta, state: state).0
+}
+
+/// The scan's output over a tree block in topological order: a step whose
+/// `commits` flag (int32 `[B, S]`) is zero runs on a copy of the state, so
+/// a leaf row's output comes from the state its parent left, and the next
+/// committing row continues from that state too. Rows that commit form the
+/// chain; each computes exactly what ``gatedDeltaOutput(q:k:v:gates:state:)``
+/// computes for it. Nil without the fused kernel.
+public func gatedDeltaOutput(
+    q: MLXArray, k: MLXArray, v: MLXArray, gates: GatedDeltaGates, state: MLXArray,
+    commits: MLXArray
+) -> MLXArray? {
+    guard usesFusedKernel(keyDimension: q.dim(3)) else { return nil }
+    let state = float32State(state, batch: q.dim(0), v: v, k: k)
+    return gatedDeltaKernel(
+        .outputOnlyTree, q: q, k: k, v: v, gates: gates, state: state, extra: commits)[0]
 }
 
 /// Value rows each scan thread carries: two independent chains per thread

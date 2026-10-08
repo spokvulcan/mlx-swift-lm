@@ -19,7 +19,7 @@ import MLX
 /// statements and the silu in MLX's bf16 expression: the form that is
 /// bitwise with the ops chain (explicit fma, contraction off and the
 /// float-rounded silu intermediates were not).
-private func makeGatedDeltaConvNormKernel() -> MLXFast.MLXFastKernel? {
+private func makeGatedDeltaConvNormKernel(tree: Bool) -> MLXFast.MLXFastKernel? {
     let source = """
         constexpr int N_READS = 4;
         constexpr int ROWS = 2 * HK + HV;
@@ -38,10 +38,11 @@ private func makeGatedDeltaConvNormKernel() -> MLXFast.MLXFastKernel? {
         device T* cat = concat + ((size_t)b * (S_ + K - 1)) * D + ch0;
         device T* nx = next + ((size_t)b * (K - 1)) * D + ch0;
 
-        // Virtual conv input row s + t: state rows first, then projection rows.
+        // Virtual conv input row s + t: state rows first, then projection
+        // rows. A tree block reads its row's ancestors from a window table.
         T taps[K][N_READS];
         for (int t = 0; t < K; ++t) {
-          const uint vr = s + t;
+          const uint vr = \(tree ? "(uint)win[((size_t)b * S_ + s) * K + t]" : "s + t");
           const device T* src = (vr < (uint)(K - 1))
               ? (st + (size_t)vr * D)
               : (pr + (size_t)(vr - (K - 1)) * ROW);
@@ -111,8 +112,8 @@ private func makeGatedDeltaConvNormKernel() -> MLXFast.MLXFastKernel? {
         }
         """
     return MLXFast.metalKernel(
-        name: "gdn_conv_norm_qkv",
-        inputNames: ["state", "rows", "w", "scales", "eps", "dims"],
+        name: tree ? "gdn_conv_norm_qkv_tree" : "gdn_conv_norm_qkv",
+        inputNames: ["state", "rows", "w", "scales", "eps", "dims"] + (tree ? ["win"] : []),
         outputNames: ["q", "k", "v", "concat", "next"],
         source: source
     )
@@ -121,8 +122,10 @@ private func makeGatedDeltaConvNormKernel() -> MLXFast.MLXFastKernel? {
 private final class GatedDeltaConvNormKernelManager: Sendable {
     static let shared = GatedDeltaConvNormKernelManager()
     let kernel: MLXFast.MLXFastKernel?
+    let treeKernel: MLXFast.MLXFastKernel?
     private init() {
-        kernel = makeGatedDeltaConvNormKernel()
+        kernel = makeGatedDeltaConvNormKernel(tree: false)
+        treeKernel = makeGatedDeltaConvNormKernel(tree: true)
     }
 }
 
@@ -133,12 +136,16 @@ private final class GatedDeltaConvNormKernelManager: Sendable {
 /// `[B, S, row]` (the fused input projection, or a plain `[B, S, D]` at 0).
 /// Also returns the conv input block `[B, S + K - 1, D]` (what a replay
 /// gathers its conv state from) and the next conv state, its last `K - 1`
-/// rows. Nil when the kernel does not cover the shape: bf16 only, a 128-wide
-/// head dim shared by keys and values, `weight` `[D, K, 1]`, `scales` the
-/// `[q, k]` pair in the activation dtype.
+/// rows. With `windows` (int32 `[B, S, K]`, indices into the virtual conv
+/// input: `K - 1` state rows, then the `S` rows), row `s` convolves those
+/// rows instead of `s ..< s + K` — a tree block's rows convolve their own
+/// ancestors; the conv input block and next state are written as for a
+/// chain. Nil when the kernel does not cover the shape: bf16 only, a
+/// 128-wide head dim shared by keys and values, `weight` `[D, K, 1]`,
+/// `scales` the `[q, k]` pair in the activation dtype.
 public func gatedDeltaConvNormQKV(
     convState: MLXArray, rows: MLXArray, rowOffset: Int, weight: MLXArray, numKHeads: Int,
-    numVHeads: Int, headDim: Int, scales: MLXArray, eps: Float
+    numVHeads: Int, headDim: Int, scales: MLXArray, eps: Float, windows: MLXArray? = nil
 ) -> (q: MLXArray, k: MLXArray, v: MLXArray, convInput: MLXArray, nextConvState: MLXArray)? {
     guard rows.dtype == .bfloat16, convState.dtype == rows.dtype, weight.dtype == rows.dtype,
         scales.dtype == rows.dtype, headDim == 128, rows.ndim == 3, convState.ndim == 3,
@@ -151,12 +158,15 @@ public func gatedDeltaConvNormQKV(
     let K = weight.dim(1)
     guard S >= 1, K >= 2, weight.dim(2) == 1, D == (2 * numKHeads + numVHeads) * headDim,
         convState.dim(0) == B, convState.dim(1) == K - 1, convState.dim(2) == D,
-        rowOffset >= 0, rowOffset + D <= rowLength
+        rowOffset >= 0, rowOffset + D <= rowLength,
+        windows.map { $0.size == B * S * K && $0.dtype == .int32 } ?? true
     else { return nil }
-    guard let kernel = GatedDeltaConvNormKernelManager.shared.kernel else { return nil }
+    let manager = GatedDeltaConvNormKernelManager.shared
+    guard let kernel = windows == nil ? manager.kernel : manager.treeKernel else { return nil }
     let headRows = B * S * (2 * numKHeads + numVHeads)
     let outputs = kernel(
-        [convState, rows, weight, scales, MLXArray([eps]), MLXArray([Int32(S)])],
+        [convState, rows, weight, scales, MLXArray([eps]), MLXArray([Int32(S)])]
+            + (windows.map { [$0] } ?? []),
         template: [
             ("T", rows.dtype), ("D", D), ("K", K), ("HK", numKHeads), ("HV", numVHeads),
             ("HD", headDim), ("ROW", rowLength), ("ROFF", rowOffset),
