@@ -355,3 +355,89 @@ func testDFlash2TreeAttentionMatchesTheChainKernel(spot: (position: Int, upper: 
             == 0)
 
 }
+
+/// Opt-in timing (`TEST_RUNNER_TREE_ATTENTION_BENCH=1`): one verify pass's
+/// attention over 16 layers at the Qwen3.8-27B shape, MLX's SDPA on a chain
+/// block against the tree kernels on a chain block and on a tree with three
+/// leaves. `TEST_RUNNER_TREE_ATTENTION_BENCH_CONTEXTS=600,6000` picks N.
+@Test(
+    .enabled(if: ProcessInfo.processInfo.environment["TREE_ATTENTION_BENCH"] == "1"),
+    .serialized)
+func benchDFlash2TreeAttention() throws {
+    let (B, HQ, HK, S, D, layers) = (1, 24, 4, 8, 256, 16)
+    let contexts =
+        (ProcessInfo.processInfo.environment["TREE_ATTENTION_BENCH_CONTEXTS"] ?? "600,6000,16000")
+        .split(separator: ",").compactMap { Int($0) }
+    for context in contexts {
+        let capacity = context + 256
+        let visible = context + S
+        let (q, keys, values) = withRandomState(MLXRandom.RandomState(seed: 5)) {
+            (
+                MLXRandom.normal([B, HQ, S, D]).asType(.bfloat16),
+                (0 ..< layers).map { _ in MLXRandom.normal([B, HK, capacity, D]).asType(.bfloat16)
+                },
+                (0 ..< layers).map { _ in MLXRandom.normal([B, HK, capacity, D]).asType(.bfloat16) }
+            )
+        }
+        eval([q] + keys + values)
+        let scale: Float = 1 / Float(D).squareRoot()
+        let position = MLXArray([Int32(context)])
+        let columns = MLXArray(Int32(0) ..< Int32(visible)).reshaped([1, visible])
+        let rows = (MLXArray(Int32(context)) + MLXArray(Int32(0) ..< Int32(S))).reshaped([S, 1])
+        let mask = columns .<= rows
+        let chainRows = MLXArray(Int32(0) ..< Int32(S))
+        let treeDepths = MLXArray([Int32(0), 1, 2, 2, 3, 3, 4, 5])
+        let treeSlots = MLXArray([Int32(0), 1, 6, 2, 7, 3, 4, 5])
+        func measure(_ body: () -> [MLXArray]) -> Double {
+            let start = Date()
+            for _ in 0 ..< 20 { eval(body()) }
+            return Date().timeIntervalSince(start) * 1000 / 20
+        }
+        let variants: [(String, () -> [MLXArray])] = [
+            (
+                "MLX SDPA, chain",
+                {
+                    (0 ..< layers).map { l in
+                        MLXFast.scaledDotProductAttention(
+                            queries: q, keys: keys[l][.ellipsis, ..<visible, 0...],
+                            values: values[l][.ellipsis, ..<visible, 0...], scale: scale,
+                            mask: .array(mask))
+                    }
+                }
+            ),
+            (
+                "tree kernel, chain",
+                {
+                    (0 ..< layers).map { l in
+                        dflash2TreeAttention(
+                            queries: q, keys: keys[l], values: values[l], position: position,
+                            depths: chainRows, slots: chainRows, visibleLength: visible,
+                            scale: scale)!
+                    }
+                }
+            ),
+            (
+                "tree kernel, 2 leaves",
+                {
+                    (0 ..< layers).map { l in
+                        dflash2TreeAttention(
+                            queries: q, keys: keys[l], values: values[l], position: position,
+                            depths: treeDepths, slots: treeSlots, visibleLength: visible,
+                            scale: scale)!
+                    }
+                }
+            ),
+        ]
+        for (_, body) in variants { for _ in 0 ..< 3 { eval(body()) } }
+        var samples = Array(repeating: [Double](), count: variants.count)
+        for _ in 0 ..< 7 {
+            for (i, variant) in variants.enumerated() { samples[i].append(measure(variant.1)) }
+        }
+        for (i, variant) in variants.enumerated() {
+            let median = samples[i].sorted()[samples[i].count / 2]
+            print(
+                "[TREE-ATTN-BENCH] N \(visible) \(variant.0): \(String(format: "%.3f", median)) ms / 16 layers (median of 7)"
+            )
+        }
+    }
+}
