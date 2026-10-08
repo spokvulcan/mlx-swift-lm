@@ -1671,12 +1671,6 @@ public class Qwen35TextModelInner: Module {
             let kernel = layers.first { $0.isLinear }?.linearAttn?.convKernelSize ?? 4
             return [tree.convWindows(kernel: kernel), tree.commits.asType(.int32)]
         }
-        // Each tree row's visible block slots as bits, for caches that attend
-        // by position.
-        let treeAncestry = request.tree.map { tree in
-            (tree.ancestry.asType(.uint32)
-                * (MLXArray(UInt32(1)) << MLXArray(UInt32(0) ..< UInt32(length)))).sum(axis: 1)
-        }
 
         for (segmentIndex, segment) in decodeSegments.enumerated() {
             var args: [MLXArray] = [carry] + pendingAttention
@@ -1745,7 +1739,7 @@ public class Qwen35TextModelInner: Module {
                 let attention = kvCache.dflash2Attention(
                     queries: outputs[next], keys: keys, values: values,
                     position: request.position, visibleLength: visibleLength, mask: mask,
-                    treeAncestry: treeAncestry, scale: layers[pre].selfAttn!.kernelScale)
+                    tree: request.tree, scale: layers[pre].selfAttn!.kernelScale)
                 pendingAttention = [attention, outputs[next + 1]]
             }
         }

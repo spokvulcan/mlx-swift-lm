@@ -174,8 +174,9 @@ extension DFlash2DrafterModel {
 /// A verify block whose rows form a tree: a chain from the anchor plus leaf
 /// rows that branch off it, in topological order (every row after its
 /// parent). Each row attends to its ancestors, rotates at its depth, and
-/// convolves and scans along its own ancestry; the chain rows compute
-/// exactly what they compute in a plain block.
+/// convolves and scans along its own ancestry. Every row computes exactly
+/// what a chain block of its own path computes: a leaf's attention reads
+/// its own key at its depth (``dflash2TreeAttention(queries:keys:values:position:depths:slots:visibleLength:scale:)``).
 public struct DFlash2TreeLayout {
     /// `[S]` int32 depth of each row (0 for the anchor): its position past
     /// the block's.
@@ -195,7 +196,7 @@ public struct DFlash2TreeLayout {
     /// the block: the anchor and the chain by depth first, exactly where a
     /// chain block puts them, then the leaves. A chain row's attention then
     /// reads the same keys in the same slots as in a chain block, so it
-    /// reduces in the same order.
+    /// reduces in the same order; a leaf's reads its own key at its depth.
     public var slotRows: MLXArray
     /// `[S]` int32: each row's slot (the inverse of ``slotRows``).
     public var slots: MLXArray
@@ -453,15 +454,14 @@ public struct GatedDeltaCapture {
 /// `position` (a `[1]` int32, possibly lazy) without moving `offset` and
 /// attends over the first `visibleLength` rows, row `i` seeing columns up to
 /// `position + i`. `mask` is that position mask (`[S, visibleLength]` bool);
-/// a conformer may rebuild it from `position` instead. A tree block's mask
-/// lets row `i` see the rows before `position` and the block rows
-/// `position + j` whose bit `j` is set in `treeAncestry[i]` (`[S]` uint32,
-/// nil for a chain). The iterator then commits the accepted prefix with
-/// ``commitRows(count:)``.
+/// a conformer may rebuild it from `position` instead. A tree block (`tree`,
+/// nil for a chain) arrives in slot order; its mask lets each row see the
+/// rows before `position`, its ancestors and itself. The iterator then
+/// commits the accepted prefix with ``commitRows(count:)``.
 package protocol DFlash2AttentionCache: KVCache {
     func dflash2Attention(
         queries: MLXArray, keys: MLXArray, values: MLXArray, position: MLXArray,
-        visibleLength: Int, mask: MLXArray, treeAncestry: MLXArray?, scale: Float
+        visibleLength: Int, mask: MLXArray, tree: DFlash2TreeLayout?, scale: Float
     ) -> MLXArray
 
     func commitRows(count: Int)
@@ -481,18 +481,28 @@ extension DFlash2AttentionCache {
     ) -> MLXArray {
         dflash2Attention(
             queries: queries, keys: keys, values: values, position: position,
-            visibleLength: visibleLength, mask: mask, treeAncestry: nil, scale: scale)
+            visibleLength: visibleLength, mask: mask, tree: nil, scale: scale)
     }
 }
 
 extension KVCacheSimple: DFlash2AttentionCache {
     package func dflash2Attention(
         queries: MLXArray, keys newKeys: MLXArray, values newValues: MLXArray,
-        position: MLXArray, visibleLength: Int, mask: MLXArray, treeAncestry: MLXArray?,
+        position: MLXArray, visibleLength: Int, mask: MLXArray, tree: DFlash2TreeLayout?,
         scale: Float
     ) -> MLXArray {
         let (keys, values) = writeRows(
             keys: newKeys, values: newValues, position: position, visibleLength: visibleLength)
+        // A tree row reads its own key where a chain block holds its token,
+        // so it reduces exactly as that chain block would.
+        if let tree, let bufferKeys = self.keys, let bufferValues = self.values,
+            let attention = dflash2TreeAttention(
+                queries: queries, keys: bufferKeys, values: bufferValues, position: position,
+                depths: tree.depths, slots: tree.slots, visibleLength: visibleLength,
+                scale: scale)
+        {
+            return attention
+        }
         return MLXFast.scaledDotProductAttention(
             queries: queries, keys: keys, values: values, scale: scale, mask: .array(mask))
     }
@@ -503,10 +513,18 @@ extension TurboQuantKVCache: DFlash2AttentionCache {
     /// not by `mask`.
     package func dflash2Attention(
         queries: MLXArray, keys newKeys: MLXArray, values newValues: MLXArray,
-        position: MLXArray, visibleLength: Int, mask: MLXArray, treeAncestry: MLXArray?,
+        position: MLXArray, visibleLength: Int, mask: MLXArray, tree: DFlash2TreeLayout?,
         scale: Float
     ) -> MLXArray {
-        verifyAttention(
+        // Each tree row's visible block slots as bits.
+        let treeAncestry = tree.map { tree in
+            let S = tree.ancestry.dim(1)
+            return
+                (tree.ancestry.asType(.uint32)
+                * (MLXArray(UInt32(1)) << MLXArray(Int32(0) ..< Int32(S)).asType(.uint32)))
+                .sum(axis: 1)
+        }
+        return verifyAttention(
             queries: queries, keys: newKeys, values: newValues, position: position,
             visibleLength: visibleLength, scale: scale, treeAncestry: treeAncestry)
     }
