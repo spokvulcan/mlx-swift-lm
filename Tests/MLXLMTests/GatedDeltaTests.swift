@@ -258,4 +258,35 @@ public class GatedDeltaTests: XCTestCase {
         )
     }
 
+    /// A tree scan: each row's output is the chain scan's over the committed
+    /// rows before it followed by the row itself, bit for bit, so leaf rows
+    /// never disturb the state the chain carries on.
+    func testGatedDeltaTreeOutputMatchesEachPath() throws {
+        let T = 8
+        let inputs = makeInputs(T: T, seed: 7)
+        let (g, beta) = gatedDeltaGates(
+            a: inputs.a, b: inputs.b, aLog: inputs.aLog, dtBias: inputs.dtBias)
+        let state = withRandomState(MLXRandom.RandomState(seed: 9)) {
+            MLXRandom.normal([1, 4, 16, 32]) * MLXArray(0.1)
+        }
+        let commits = [1, 1, 0, 1, 1, 0, 1, 0]
+        guard
+            let tree = gatedDeltaOutput(
+                q: inputs.q, k: inputs.k, v: inputs.v, gates: .precomputed(g: g, beta: beta),
+                state: state, commits: MLXArray(commits.map(Int32.init)).reshaped([1, T]))
+        else { throw XCTSkip("The tree scan needs the fused kernel.") }
+        for row in 0 ..< T {
+            let path = MLXArray(((0 ..< row).filter { commits[$0] == 1 } + [row]).map(Int32.init))
+            let chain = gatedDeltaOutput(
+                q: take(inputs.q, path, axis: 1), k: take(inputs.k, path, axis: 1),
+                v: take(inputs.v, path, axis: 1),
+                gates: .precomputed(g: take(g, path, axis: 1), beta: take(beta, path, axis: 1)),
+                state: state)
+            let difference = abs(
+                tree[0..., row].asType(.float32) - chain[0..., -1].asType(.float32)
+            ).max()
+            XCTAssertEqual(difference.item(Float.self), 0, "row \(row)")
+        }
+    }
+
 }

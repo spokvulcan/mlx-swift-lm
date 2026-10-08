@@ -119,8 +119,10 @@ private func makeAttentionNormRopeKernel() -> MLXFast.MLXFastKernel? {
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        const int batch_offset = pos[b * POS_STRIDE];
-        const float lf = rope[1] * static_cast<float>(l + batch_offset);
+        // Each row's position: the batch offset plus the row, or (a tree
+        // block, whose rows are not consecutive) read per row.
+        const int position = ROW_POS ? pos[bl] : (int)l + pos[b * POS_STRIDE];
+        const float lf = rope[1] * static_cast<float>(position);
         constexpr uint hlf = (uint)(RD / 2);
         device T* dst = (isQ ? (q + ((size_t)(b * HQ + h) * seq + l) * HD)
                              : (k + ((size_t)(b * HK + h) * seq + l) * HD)) + lid * N_READS;
@@ -165,7 +167,8 @@ private final class AttentionNormRopeKernelManager: Sendable {
 /// `[B, L, row]`: query head `h` occupies `queryOffset + h * queryHeadStride
 /// ..< + headDim` (a stride of `2 * headDim` skips an interleaved gate),
 /// key head `h` `keyOffset + h * keyHeadStride`. `offset` is the rope's
-/// position offset, a `[1]` or `[B]` int array. Returns the rotated
+/// position offset, a `[1]` or `[B]` int array, or `[B * L]` absolute
+/// positions, one per row (a tree block). Returns the rotated
 /// queries `[B, HQ, L, headDim]` and keys `[B, HK, L, headDim]` (with
 /// `queryHeads` 0 the queries output is a placeholder). Nil when the kernel
 /// does not cover the shape: bf16/f16 rows, head dim a multiple of 4 up to
@@ -185,7 +188,8 @@ public func attentionNormRope(
     let B = rows.dim(0)
     let L = rows.dim(1)
     let rowLength = rows.dim(2)
-    guard L >= 1, offset.size == 1 || offset.size == B,
+    let rowPositions = L > 1 && offset.size == B * L
+    guard L >= 1, offset.size == 1 || offset.size == B || rowPositions,
         keyOffset >= 0, keyOffset + (keyHeads - 1) * keyHeadStride + headDim <= rowLength,
         queryHeads == 0
             || (queryOffset >= 0
@@ -204,7 +208,7 @@ public func attentionNormRope(
             ("T", rows.dtype), ("HD", headDim), ("HQ", queryHeads), ("HK", keyHeads),
             ("ROW", rowLength), ("QOFF", queryOffset), ("QSTRIDE", queryHeadStride),
             ("KOFF", keyOffset), ("KSTRIDE", keyHeadStride), ("RD", rope.dimensions),
-            ("POS_STRIDE", offset.size == 1 ? 0 : 1),
+            ("POS_STRIDE", offset.size == 1 ? 0 : 1), ("ROW_POS", rowPositions ? 1 : 0),
         ],
         grid: (groups * threads, 1, 1),
         threadGroup: (threads, 1, 1),
