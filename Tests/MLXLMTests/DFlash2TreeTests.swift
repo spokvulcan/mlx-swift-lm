@@ -224,16 +224,9 @@ func testQwen35TreeVerifyComputesEachRowAsItsPathsChain() throws {
         ).logits
         let actual = treeLogits[0, row].asType(.float32)
         let expected = chainLogits[0, path.count - 1].asType(.float32)
-        let difference = abs(actual - expected).max().item(Float.self)
-        if tree.commits[row] == 1 {
-            // A chain row reads its keys in the same slots: bit for bit.
-            #expect(difference == 0, "row \(row)")
-        } else {
-            // A leaf's own key sits past the chain, so its attention sums
-            // in another order: equal up to that rounding.
-            let scale = abs(expected).max().item(Float.self)
-            #expect(difference <= 0.02 * scale, "row \(row): \(difference) of \(scale)")
-        }
+        // Chain rows read their keys in the same slots, and a leaf reads
+        // its own key at its depth: bit for bit either way.
+        #expect(abs(actual - expected).max().item(Float.self) == 0, "row \(row)")
     }
 }
 
@@ -294,4 +287,71 @@ func testQwen35TreeVerifyOverTurboQuantTracksThePlainCache(keyBits: Int) throws 
             abs(after.keys[0..., 0..., ..<position] - before.keys[0..., 0..., ..<position]).max()
                 .item(Float.self) == 0)
     }
+}
+
+/// The tree attention kernel is MLX's one-pass vector SDPA bit for bit: on a
+/// chain block it reproduces `scaledDotProductAttention`, and a leaf row
+/// reproduces it as computed with its own key at its depth, where a chain
+/// block puts the token.
+@Test(arguments: [
+    (position: 300, upper: 307), (position: 800, upper: 803), (position: 1100, upper: 1104),
+    (position: 3001, upper: 3008), (position: 6140, upper: 6141),
+])
+func testDFlash2TreeAttentionMatchesTheChainKernel(spot: (position: Int, upper: Int)) throws {
+    let (B, HQ, HK, S, D) = (1, 24, 4, 8, 256)
+    let capacity = 6400
+    let visible = spot.upper + S
+    let (q, chainKeys, chainValues, leafKey, leafValue) = withRandomState(
+        MLXRandom.RandomState(seed: 23)
+    ) {
+        (
+            (MLXRandom.normal([B, HQ, S, D]) * 2).asType(.bfloat16),
+            (MLXRandom.normal([B, HK, capacity, D]) * 2).asType(.bfloat16),
+            MLXRandom.normal([B, HK, capacity, D]).asType(.bfloat16),
+            (MLXRandom.normal([B, HK, 1, D]) * 2).asType(.bfloat16),
+            MLXRandom.normal([B, HK, 1, D]).asType(.bfloat16)
+        )
+    }
+    let scale: Float = 1 / Float(D).squareRoot()
+    let position = MLXArray([Int32(spot.position)])
+    let columns = MLXArray(Int32(0) ..< Int32(visible)).reshaped([1, visible])
+    let rows = (MLXArray(Int32(spot.position)) + MLXArray(Int32(0) ..< Int32(S))).reshaped([S, 1])
+    let chainMask = columns .<= rows
+
+    // A chain block: the kernel equals MLX's SDPA.
+    let reference = MLXFast.scaledDotProductAttention(
+        queries: q, keys: chainKeys[.ellipsis, ..<visible, 0...],
+        values: chainValues[.ellipsis, ..<visible, 0...], scale: scale, mask: .array(chainMask))
+    let chainRows = MLXArray(Int32(0) ..< Int32(S))
+    let chain = try #require(
+        dflash2TreeAttention(
+            queries: q, keys: chainKeys, values: chainValues, position: position,
+            depths: chainRows, slots: chainRows, visibleLength: visible, scale: scale))
+    #expect(abs(chain.asType(.float32) - reference.asType(.float32)).max().item(Float.self) == 0)
+
+    // A leaf at depth 2 cached in slot 6: as a chain block holding it at
+    // slot 2 computes it.
+    let leafSlot = spot.position + 6
+    let treeKeys = dynamicSliceUpdated(
+        chainKeys, update: leafKey, start: MLXArray([Int32(leafSlot)]), axes: [2])
+    let treeValues = dynamicSliceUpdated(
+        chainValues, update: leafValue, start: MLXArray([Int32(leafSlot)]), axes: [2])
+    let pathKeys = dynamicSliceUpdated(
+        chainKeys, update: leafKey, start: MLXArray([Int32(spot.position + 2)]), axes: [2])
+    let pathValues = dynamicSliceUpdated(
+        chainValues, update: leafValue, start: MLXArray([Int32(spot.position + 2)]), axes: [2])
+    let pathReference = MLXFast.scaledDotProductAttention(
+        queries: q, keys: pathKeys[.ellipsis, ..<visible, 0...],
+        values: pathValues[.ellipsis, ..<visible, 0...], scale: scale, mask: .array(chainMask))
+    let tree = try #require(
+        dflash2TreeAttention(
+            queries: q, keys: treeKeys, values: treeValues, position: position,
+            depths: MLXArray([Int32(0), 1, 2, 3, 4, 5, 6, 7]),
+            slots: MLXArray([Int32(0), 1, 6, 3, 4, 5, 2, 7]), visibleLength: visible,
+            scale: scale))
+    let leafRow = tree[0..., 0..., 2, 0...].asType(.float32)
+    #expect(
+        abs(leafRow - pathReference[0..., 0..., 2, 0...].asType(.float32)).max().item(Float.self)
+            == 0)
+
 }
