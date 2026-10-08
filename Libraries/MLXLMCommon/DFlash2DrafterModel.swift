@@ -159,7 +159,7 @@ public protocol DFlash2TargetModel: LanguageModel {
     /// LM head the drafter borrows; nil when tied to the embedding.
     var dflash2Head: Linear? { get }
 
-    /// Whether the verify pass can drive this cache: ``DFlash2AttentionCache``
+    /// Whether the verify pass can drive this cache: `DFlash2AttentionCache`
     /// attention entries and `MambaCache` recurrent entries.
     func dflash2SupportsCache(_ cache: [KVCache]) -> Bool
 

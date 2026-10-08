@@ -676,7 +676,7 @@ public func gatedDeltaUpdate(
         useKernel: useKernel)
 }
 
-/// ``gatedDeltaUpdate(q:k:v:a:b:aLog:dtBias:state:mask:)`` with the gates as
+/// ``gatedDeltaUpdate(q:k:v:a:b:aLog:dtBias:state:mask:useKernel:)`` with the gates as
 /// ``GatedDeltaGates``: a `.source` lets the kernel compute them per step
 /// (bitwise the ops' values; no gate launches, no gate arrays).
 public func gatedDeltaUpdate(
@@ -709,7 +709,8 @@ public func gatedDeltaUpdate(
 }
 
 /// The scan's output alone, from precomputed gates; the final state is never
-/// stored. Same arithmetic as ``gatedDeltaUpdate(q:k:v:a:b:aLog:dtBias:state:mask:)``.
+/// stored. Same arithmetic as
+/// ``gatedDeltaUpdate(q:k:v:a:b:aLog:dtBias:state:mask:useKernel:)``.
 public func gatedDeltaOutput(
     q: MLXArray, k: MLXArray, v: MLXArray, g: MLXArray, beta: MLXArray, state: MLXArray
 ) -> MLXArray {
