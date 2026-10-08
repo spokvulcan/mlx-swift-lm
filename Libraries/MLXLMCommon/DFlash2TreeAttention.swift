@@ -146,7 +146,7 @@ private func makeTreeAttentionMMAKernel() -> MLXFast.MLXFastKernel? {
 
         const int kv_head_idx = (int)tid.x;
         const int batch_idx = (int)tid.y;
-        const int part_idx = (int)tid.z;
+        const int part_idx = params[2] + (int)tid.z;
 
         threadgroup float sS[2 * 6 * QL * BK];
         threadgroup T sP[6 * QL * BK];
@@ -193,9 +193,18 @@ private func makeTreeAttentionMMAKernel() -> MLXFast.MLXFastKernel? {
         float mRun = NEG;
         float lRun = 0;
 
-        // Tree: row smRow sees keys up to its own index, its depth.
+        // Tree: row smRow sees keys up to its own index, its depth. The
+        // leaves' own indices bound the blocks that need a patch.
         const int pos0 = position[0];
         const int selfIndex = pos0 + depth[smRow];
+        int leafLo = N;
+        int leafHi = -1;
+        for (int r = 0; r < QL; ++r) {
+          if (TREE && slot[r] != depth[r]) {
+            leafLo = min(leafLo, pos0 + depth[r]);
+            leafHi = max(leafHi, pos0 + depth[r]);
+          }
+        }
 
         threadgroup float* sSMine = sS + (dhalf * gqa + stripe) * (QL * BK);
         threadgroup float* sSOther = sS + ((1 - dhalf) * gqa + stripe) * (QL * BK);
@@ -239,11 +248,7 @@ private func makeTreeAttentionMMAKernel() -> MLXFast.MLXFastKernel? {
           // Tree: a leaf row whose depth index falls in this block scores
           // its own key there. Patch the K tile's row, rerun that column
           // group's MMAs, keep the leaf row's entry, restore the row.
-          bool anyLeaf = false;
-          for (int r = 0; r < QL; ++r) {
-            const int idx = pos0 + depth[r];
-            anyLeaf = anyLeaf || (slot[r] != depth[r] && idx >= n0 && idx < n0 + BK);
-          }
+          const bool anyLeaf = TREE && leafHi >= n0 && leafLo < n0 + BK;
           if (anyLeaf) {
             threadgroup float* scratch = (threadgroup float*)sP + (dhalf * 6 + stripe) * 64;
             for (int r = 0; r < QL; ++r) {
@@ -450,7 +455,9 @@ private func makeTreeAttentionMMAKernel() -> MLXFast.MLXFastKernel? {
     )
 }
 
-/// MLX's two-pass merge (`sdpa_vector_2pass_2`), unchanged.
+/// MLX's two-pass merge (`sdpa_vector_2pass_2`), reading partitions below
+/// `split[0]` from the first pass-1 launch and the rest from the second; the
+/// arithmetic is MLX's.
 private func makeTreeAttentionMergeKernel() -> MLXFast.MLXFastKernel? {
     let source = """
         constexpr int BN = 32;
@@ -469,33 +476,38 @@ private func makeTreeAttentionMergeKernel() -> MLXFast.MLXFastKernel? {
         const int head_idx = tid.x;
         const int q_seq_idx = tid.y;
         const int q_offset = head_idx * tpg.y + q_seq_idx;
-        const device T* pp = partials + q_offset * BLOCKS * D + simd_gid * D + simd_lid * elem_per_thread;
-        const device float* sp = sums + q_offset * BLOCKS;
-        const device float* mp = maxs + q_offset * BLOCKS;
+        const int cut = split[0];
+        const device T* ppA = partials_a + q_offset * BLOCKS * D + simd_lid * elem_per_thread;
+        const device T* ppB = partials_b + q_offset * BLOCKS * D + simd_lid * elem_per_thread;
+        const device float* spA = sums_a + q_offset * BLOCKS;
+        const device float* spB = sums_b + q_offset * BLOCKS;
+        const device float* mpA = maxs_a + q_offset * BLOCKS;
+        const device float* mpB = maxs_b + q_offset * BLOCKS;
         device T* op = out + q_offset * D + simd_gid * elem_per_thread;
 
         U sum_exp_score = 0.0;
         U max_score = -metal::numeric_limits<U>::max();
 
         for (int b = 0; b < BLOCKS / BN; ++b) {
-          max_score = max(max_score, mp[simd_lid + BN * b]);
+          const int j = simd_lid + BN * b;
+          max_score = max(max_score, j < cut ? mpA[j] : mpB[j]);
         }
         max_score = simd_max(max_score);
 
         for (int b = 0; b < BLOCKS / BN; ++b) {
-          U factor = fast::exp(mp[simd_lid + BN * b] - max_score);
-          sum_exp_score += factor * sp[simd_lid + BN * b];
+          const int j = simd_lid + BN * b;
+          U factor = fast::exp((j < cut ? mpA[j] : mpB[j]) - max_score);
+          sum_exp_score += factor * (j < cut ? spA[j] : spB[j]);
         }
         sum_exp_score = simd_sum(sum_exp_score);
 
         for (int b = 0; b < BLOCKS / BN; ++b) {
-          U factor = fast::exp(mp[simd_gid] - max_score);
+          const int j = simd_gid + BN * b;
+          U factor = fast::exp((j < cut ? mpA[j] : mpB[j]) - max_score);
+          const device T* pp = (j < cut ? ppA : ppB) + (size_t)j * D;
           for (int i = 0; i < elem_per_thread; i++) {
             o[i] += factor * static_cast<U>(pp[i]);
           }
-          mp += BN;
-          sp += BN;
-          pp += BN * D;
         }
 
         for (int i = 0; i < elem_per_thread; i++) {
@@ -514,7 +526,7 @@ private func makeTreeAttentionMergeKernel() -> MLXFast.MLXFastKernel? {
         """
     return MLXFast.metalKernel(
         name: "fastmath_dflash2_tree_sdpa_merge",
-        inputNames: ["partials", "sums", "maxs"],
+        inputNames: ["partials_a", "sums_a", "maxs_a", "partials_b", "sums_b", "maxs_b", "split"],
         outputNames: ["out"],
         source: source
     )
@@ -566,20 +578,42 @@ public func dflash2TreeAttention(
             let merge = manager.merge
         else { return nil }
         let blocks = visibleLength < 2048 ? 32 : 64
-        let partials = pass1(
-            [
-                queries, keys, values, position.asType(.int32).reshaped([1]),
-                depths.asType(.int32).reshaped([S]), slots.asType(.int32).reshaped([S]),
-                MLXArray([scale]), MLXArray([Int32(visibleLength), Int32(keys.dim(2))]),
-            ],
-            template: [("T", queries.dtype), ("D", headDim), ("BLOCKS", blocks)],
-            grid: (keys.dim(1) * 32, B * 2, blocks * gqa),
-            threadGroup: (32, 2, gqa),
-            outputShapes: [[B, HQ, S, blocks, headDim], [B, HQ, S, blocks], [B, HQ, S, blocks]],
-            outputDTypes: [queries.dtype, .float32, .float32]
-        )
+        let span = 32 * ((visibleLength + blocks * 32 - 1) / (blocks * 32))
+        // The block's rows start in the 15 keys before the visible end
+        // (position is at most the upper bound, visibleLength - 8, and at
+        // most 7 below it), so only partitions from that key on can hold a
+        // leaf's own index. They run as their own launch with the leaves'
+        // keys; the rest run without the tree code, which costs registers.
+        let split = Swift.max(0, visibleLength - 15) / span
+        let inputs = [
+            queries, keys, values, position.asType(.int32).reshaped([1]),
+            depths.asType(.int32).reshaped([S]), slots.asType(.int32).reshaped([S]),
+            MLXArray([scale]),
+        ]
+        func launch(_ tree: Bool, partitions: Range<Int>) -> [MLXArray] {
+            pass1(
+                inputs + [
+                    MLXArray([
+                        Int32(visibleLength), Int32(keys.dim(2)), Int32(partitions.lowerBound),
+                    ])
+                ],
+                template: [
+                    ("T", queries.dtype), ("D", headDim), ("BLOCKS", blocks),
+                    ("TREE", tree ? 1 : 0),
+                ],
+                grid: (keys.dim(1) * 32, B * 2, partitions.count * gqa),
+                threadGroup: (32, 2, gqa),
+                outputShapes: [
+                    [B, HQ, S, blocks, headDim], [B, HQ, S, blocks], [B, HQ, S, blocks],
+                ],
+                outputDTypes: [queries.dtype, .float32, .float32])
+        }
+        // The leaf launch is encoded first: its few threadgroups then start
+        // in the first wave instead of trailing the plain launch's.
+        let leafSide = launch(true, partitions: split ..< blocks)
+        let firstSide = split > 0 ? launch(false, partitions: 0 ..< split) : leafSide
         return merge(
-            partials,
+            firstSide + leafSide + [MLXArray([Int32(split)])],
             template: [("T", queries.dtype), ("D", headDim), ("BLOCKS", blocks)],
             grid: (B * HQ * 1024, S, 1),
             threadGroup: (1024, 1, 1),
