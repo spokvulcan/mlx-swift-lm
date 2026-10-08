@@ -509,24 +509,16 @@ extension KVCacheSimple: DFlash2AttentionCache {
 }
 
 extension TurboQuantKVCache: DFlash2AttentionCache {
-    /// The compressed verify attends by position (and a tree's slot masks),
-    /// not by `mask`.
+    /// The compressed verify attends by position (and a tree's depths and
+    /// slots), not by `mask`.
     package func dflash2Attention(
         queries: MLXArray, keys newKeys: MLXArray, values newValues: MLXArray,
         position: MLXArray, visibleLength: Int, mask: MLXArray, tree: DFlash2TreeLayout?,
         scale: Float
     ) -> MLXArray {
-        // Each tree row's visible block slots as bits.
-        let treeAncestry = tree.map { tree in
-            let S = tree.ancestry.dim(1)
-            return
-                (tree.ancestry.asType(.uint32)
-                * (MLXArray(UInt32(1)) << MLXArray(Int32(0) ..< Int32(S)).asType(.uint32)))
-                .sum(axis: 1)
-        }
-        return verifyAttention(
+        verifyAttention(
             queries: queries, keys: newKeys, values: newValues, position: position,
-            visibleLength: visibleLength, scale: scale, treeAncestry: treeAncestry)
+            visibleLength: visibleLength, scale: scale, tree: tree)
     }
 }
 
