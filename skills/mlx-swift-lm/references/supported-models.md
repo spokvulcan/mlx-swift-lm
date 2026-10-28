@@ -150,7 +150,7 @@ VLMRegistry.paligemma3bMix448_8bit // mlx-community/paligemma-3b-mix-448-8bit
 | `pixtral` | Pixtral |
 | `mistral3` | Mistral 3 VLM |
 | `lfm2_vl`, `lfm2-vl` | LFM2 VL |
-| `lfm3_vl` | LFM3 VL (images; video is not supported yet) |
+| `lfm3_vl` | LFM3 VL (images and video) |
 | `lfm3_audio` | LFM3 Audio (speech in; text out here, speech out with `LFM3AudioGenerator` and `LFM3AudioCodec`) |
 | `muse_glimmer` | Meta Muse Glimmer (text, image, reasoning, and ATEM tool calls) |
 

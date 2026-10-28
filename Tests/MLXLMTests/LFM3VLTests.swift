@@ -1,5 +1,6 @@
 // Copyright © 2026 Apple Inc.
 
+import AVFoundation
 import CoreImage
 import Foundation
 import MLX
@@ -49,8 +50,13 @@ private func tinyModel() throws -> LFM3VL {
     return model
 }
 
-/// Expands the image placeholder of a two-turn prompt into `count` image tokens.
+/// The tiny model's ids for the media tokens, and `1000 +` the code point of any other
+/// character. The template is the media markup of the messages between ids 5 and 6.
 private struct PlaceholderTokenizer: Tokenizer {
+    static let special = [
+        "<|image|>": 60, "<|video|>": 61, "<|vision_start|>": 62, "<|vision_end|>": 63,
+    ]
+
     var bosToken: String? { nil }
     var eosToken: String? { nil }
     var unknownToken: String? { nil }
@@ -58,33 +64,40 @@ private struct PlaceholderTokenizer: Tokenizer {
     func encode(text: String, addSpecialTokens: Bool) -> [Int] {
         var tokens = [Int]()
         var rest = Substring(text)
-        while !rest.isEmpty {
-            if rest.hasPrefix("<|vision_start|>") {
-                tokens.append(62)
-                rest = rest.dropFirst("<|vision_start|>".count)
-            } else if rest.hasPrefix("<|vision_end|>") {
-                tokens.append(63)
-                rest = rest.dropFirst("<|vision_end|>".count)
-            } else if rest.hasPrefix("<|image|>") {
-                tokens.append(60)
-                rest = rest.dropFirst("<|image|>".count)
+        while let character = rest.first {
+            if let (token, id) = Self.special.first(where: { rest.hasPrefix($0.key) }) {
+                tokens.append(id)
+                rest = rest.dropFirst(token.count)
             } else {
-                tokens.append(1)
+                tokens.append(1000 + Int(character.unicodeScalars.first!.value))
                 rest = rest.dropFirst()
             }
         }
         return tokens
     }
 
-    func decode(tokenIds: [Int], skipSpecialTokens: Bool) -> String { "" }
-    func convertTokenToId(_ token: String) -> Int? { nil }
-    func convertIdToToken(_ id: Int) -> String? { nil }
+    func decode(tokenIds: [Int], skipSpecialTokens: Bool) -> String {
+        tokenIds.map { id in
+            if let token = convertIdToToken(id) { return token }
+            return id >= 1000 ? String(Character(UnicodeScalar(UInt32(id - 1000))!)) : ""
+        }.joined()
+    }
+
+    func convertTokenToId(_ token: String) -> Int? { Self.special[token] }
+    func convertIdToToken(_ id: Int) -> String? { Self.special.first { $0.value == id }?.key }
 
     func applyChatTemplate(
         messages: [[String: any Sendable]], tools: [[String: any Sendable]]?,
         additionalContext: [String: any Sendable]?
     ) throws -> [Int] {
-        [5] + encode(text: "<|vision_start|><|image|><|vision_end|>", addSpecialTokens: false) + [6]
+        let markup = messages.flatMap { $0["content"] as? [[String: String]] ?? [] }.map {
+            switch $0["type"] {
+            case "image": "<|vision_start|><|image|><|vision_end|>"
+            case "video": "<|vision_start|><|video|><|vision_end|>"
+            default: ""
+            }
+        }
+        return [5] + encode(text: markup.joined(), addSpecialTokens: false) + [6]
     }
 }
 
@@ -151,6 +164,147 @@ struct LFM3VLTests {
             height: sizes.0, width: sizes.1, factor: 32, minPixels: 65_536, maxPixels: sizes.2)
         #expect(size.height == sizes.3)
         #expect(size.width == sizes.4)
+    }
+
+    // MARK: - Video
+
+    @Test("The video settings decode from video_processor, with the reference defaults")
+    func videoProcessorConfiguration() throws {
+        let video = try decode(
+            LFM3VLProcessorConfiguration.self,
+            """
+            {"image_processor": {"patch_size": 16}, "video_processor": {
+              "fps": 1.5, "min_frames": 2, "max_frames": 64, "patch_size": 14,
+              "size": {"longest_edge": 1000000, "shortest_edge": 2048}}}
+            """
+        ).videoProcessor
+        #expect(video.fps == 1.5)
+        #expect(video.minFrames == 2 && video.maxFrames == 64)
+        #expect(video.patchSize == 14 && video.mergeSize == 2 && video.temporalPatchSize == 2)
+        #expect(video.minPixels == 2048 && video.maxPixels == 1_000_000)
+
+        let defaults = try decode(LFM3VLProcessorConfiguration.self, "{}").videoProcessor
+        #expect(defaults.fps == 2 && defaults.minFrames == 4 && defaults.maxFrames == 768)
+        #expect(defaults.minPixels == 4_096 && defaults.maxPixels == 25_165_824)
+    }
+
+    @Test(
+        "Frames are sampled at 2 fps by index, rounded half to even as numpy rounds",
+        arguments: [
+            // (total, fps) -> indices, from the reference rule
+            (75, 30.0, [0, 18, 37, 56, 74]),
+            (30, 12.0, [0, 7, 14, 22, 29]),
+            (10, 30.0, [0, 3, 6, 9]),
+            (3, 30.0, [0, 1, 2]),
+            (
+                300, 30_000.0 / 1001,
+                [
+                    0, 16, 31, 47, 63, 79, 94, 110, 126, 142, 157, 173, 189, 205, 220, 236, 252,
+                    268, 283, 299,
+                ]
+            ),
+        ])
+    func frameIndices(sample: (Int, Double, [Int])) throws {
+        let indices = try LFM3VLProcessor.frameIndices(
+            total: sample.0, fps: sample.1, settings: .init(), sampling: .init())
+        #expect(indices == sample.2)
+    }
+
+    @Test("A long clip keeps 768 frames, and the sampling options set the rate or the count")
+    func frameIndexLimits() throws {
+        let settings = LFM3VLProcessorConfiguration.VideoProcessor()
+        let long = try LFM3VLProcessor.frameIndices(
+            total: 30_000, fps: 30, settings: settings, sampling: .init())
+        #expect(long.count == 768)
+        #expect(Array(long.prefix(6)) == [0, 39, 78, 117, 156, 196])
+        #expect(Array(long.suffix(3)) == [29_921, 29_960, 29_999])
+        #expect(long.reduce(0, +) == 11_519_616)
+
+        let faster = try LFM3VLProcessor.frameIndices(
+            total: 75, fps: 30, settings: settings, sampling: .init(targetFramesPerSecond: 4))
+        #expect(faster.count == 10)
+        let fixed = try LFM3VLProcessor.frameIndices(
+            total: 75, fps: 30, settings: settings, sampling: .init(targetFrames: 3))
+        #expect(fixed == [0, 37, 74])
+        #expect(throws: VLMError.self) {
+            try LFM3VLProcessor.frameIndices(
+                total: 75, fps: 0, settings: settings, sampling: .init())
+        }
+    }
+
+    @Test(
+        "A clip resizes to fit all its frames in the pixel budget, as the video smart_resize",
+        arguments: [
+            // (frames, height, width, maxPixels) -> expected, from the checkpoint's Python function
+            (5, 360, 640, 25_165_824, 352, 640),
+            (20, 1080, 1920, 25_165_824, 832, 1472),
+            (768, 1080, 1920, 25_165_824, 128, 224),
+            (4, 2160, 3840, 25_165_824, 1856, 3328),
+            (4, 20, 1000, 25_165_824, 32, 1600),
+            (2, 16, 16, 25_165_824, 64, 64),
+            // 5 frames count as 4 (half to even), which fit; 6 do not.
+            (5, 64, 64, 20_000, 64, 64),
+            (6, 64, 64, 20_000, 32, 32),
+        ])
+    func videoTargetSize(sizes: (Int, Int, Int, Int, Int, Int)) throws {
+        let size = try LFM3VLProcessor.videoTargetSize(
+            frames: sizes.0, height: sizes.1, width: sizes.2, factor: 32, temporalFactor: 2,
+            minPixels: 4096, maxPixels: sizes.3)
+        #expect(size.height == sizes.4)
+        #expect(size.width == sizes.5)
+    }
+
+    @Test("A clip needs two frames and an aspect ratio within 200")
+    func videoTargetSizeLimits() {
+        #expect(throws: VLMError.self) {
+            try LFM3VLProcessor.videoTargetSize(
+                frames: 1, height: 64, width: 64, factor: 32, temporalFactor: 2, minPixels: 4096,
+                maxPixels: 25_165_824)
+        }
+        #expect(throws: VLMError.self) {
+            try LFM3VLProcessor.videoTargetSize(
+                frames: 4, height: 32, width: 6432, factor: 32, temporalFactor: 2,
+                minPixels: 4096, maxPixels: 25_165_824)
+        }
+    }
+
+    @Test("Each temporal group is labeled with the mean time of its frames")
+    func videoPlaceholders() throws {
+        let seconds = LFM3VLProcessor.groupSeconds(
+            [0, 18, 37, 56, 74].map { Double($0) / 30 }, groupSize: 2)
+        // The last frame fills the last group. The double nearest 1.55 lies above it: "1.6".
+        #expect(seconds == [0.3, 1.55, 2.466666666666667])
+
+        let tokenizer = PlaceholderTokenizer()
+        let template = tokenizer.encode(
+            text: "a<|vision_start|><|video|><|vision_end|>b", addSpecialTokens: false)
+        let tokens = try LFM3VLProcessor.expandVideoPlaceholders(
+            template, clips: [(seconds, 2)], tokenizer: tokenizer)
+        let group = "<|vision_start|><|video|><|video|><|vision_end|>"
+        #expect(
+            tokenizer.decode(tokenIds: tokens, skipSpecialTokens: false)
+                == "a<|vision_start|><0.3 seconds>\(group)<1.6 seconds>\(group)<2.5 seconds>\(group)<|vision_end|>b"
+        )
+        #expect(throws: VLMError.self) {
+            try LFM3VLProcessor.expandVideoPlaceholders(template, clips: [], tokenizer: tokenizer)
+        }
+    }
+
+    @Test("A video file is sampled by frame index into labeled temporal groups")
+    func processorSamplesVideoFile() async throws {
+        let url = try await writeGrayClip(frames: 30, fps: 12, width: 96, height: 64)
+        defer { try? FileManager.default.removeItem(at: url) }
+        try await expectGrayClipInput(.url(url))
+    }
+
+    @Test("Decoded frames are sampled as a clip at the rate of their timestamps")
+    func processorSamplesFrames() async throws {
+        let frames = (0 ..< 30).map {
+            UserInput.VideoFrame(
+                image: .ciImage(grayImage(8 * $0, width: 96, height: 64)),
+                timeStamp: CMTime(value: CMTimeValue($0), timescale: 12))
+        }
+        try await expectGrayClipInput(.frames(frames))
     }
 
     // MARK: - Processor
@@ -232,6 +386,36 @@ struct LFM3VLTests {
             #expect(token != nil)
             #expect(token == bare.next())
         }
+    }
+
+    @Test("A video's temporal groups encode one at a time, in order, into its video tokens")
+    func videoPrefill() throws {
+        let model = try tinyModel()
+        // Two temporal groups of a 4 x 4 patch grid: 32 patches, 8 video tokens.
+        let pixels = MLXRandom.normal([32, 24], key: MLXRandom.key(3))
+        let features = try model.features(pixels, grids: [THW(2, 4, 4)])
+        let apart = try model.features(pixels, grids: [THW(1, 4, 4), THW(1, 4, 4)])
+        expectClose(features, apart, atol: 1e-5, reducedAtol: 1e-3)
+
+        let group = [Int32(62), 61, 61, 61, 61, 63]
+        let ids = MLXArray([Int32(1)] + group + group + [2])[.newAxis]
+        let input = LMInput(
+            text: .init(tokens: ids, mask: ones(like: ids).asType(.int8)),
+            video: .init(pixels: pixels, frames: [THW(2, 4, 4)]))
+        let embeddings = try model.inputEmbeddings(input)
+        let videoPositions = MLXArray([Int32(2), 3, 4, 5, 8, 9, 10, 11])
+        expectClose(embeddings[0][videoPositions], features, atol: 1e-6, reducedAtol: 1e-6)
+
+        let cache = try model.newCache(parameters: nil)
+        guard
+            case .logits(let output) = try model.prepare(
+                input, cache: cache, state: nil, prefill: .init(stepSize: 5))
+        else {
+            Issue.record("Expected logits from a video prefill")
+            return
+        }
+        let expected = model.languageModel(nil, cache: nil, inputEmbeddings: embeddings)
+        expectClose(output.logits[0, -1], expected[0, -1], atol: 1e-4, reducedAtol: 2e-2)
     }
 
     @Test("A warm cache prefilled with the split suffix matches a cold prefill")
@@ -331,18 +515,99 @@ struct LFM3VLTests {
         .enabled(if: ProcessInfo.processInfo.environment["MLX_LFM3_VL_FIXTURE"] != nil))
     func localCheckpointParity() async throws {
         let environment = ProcessInfo.processInfo.environment
-        let directory = URL(fileURLWithPath: try #require(environment["MLX_LFM3_VL_MODEL"]))
-        let prefix = try #require(environment["MLX_LFM3_VL_FIXTURE"])
-        let fixture = try JSONDecoder().decode(
+        let reference = try await LocalReference(
+            fixture: try #require(environment["MLX_LFM3_VL_FIXTURE"]))
+        let ids = reference.ids
+        try reference.expectGeneration(
+            LMInput(
+                text: .init(tokens: ids, mask: ones(like: ids).asType(.int8)),
+                image: .init(pixels: reference.pixels, frames: reference.grids)))
+
+        if let imagePath = environment["MLX_LFM3_VL_IMAGE"] {
+            let processor = LFM3VLProcessor(
+                try reference.processorConfiguration(), tokenizer: PlaceholderTokenizer())
+            let image = try #require(CIImage(contentsOf: URL(fileURLWithPath: imagePath)))
+            let (swiftPixels, grid) = try processor.preprocess(image: image, processing: nil)
+            #expect([grid.t, grid.h, grid.w] == reference.fixture.grid[0])
+            let pixelError = abs(swiftPixels - reference.pixels).mean().item(Float.self)
+            #expect(pixelError < 0.02, "preprocessed pixels differ by \(pixelError) on average")
+        }
+    }
+
+    /// ``localCheckpointParity()`` for a video fixture, set in `MLX_LFM3_VL_VIDEO_FIXTURE`. With
+    /// `MLX_LFM3_VL_VIDEO` set to the fixture's video, the Swift processor must also sample the
+    /// reference's frames and build its prompt ids, with pixels close to the reference's.
+    @Test(
+        "A local checkpoint matches the mlx-vlm reference on a video",
+        .enabled(if: ProcessInfo.processInfo.environment["MLX_LFM3_VL_VIDEO_FIXTURE"] != nil))
+    func localCheckpointVideoParity() async throws {
+        let environment = ProcessInfo.processInfo.environment
+        let reference = try await LocalReference(
+            fixture: try #require(environment["MLX_LFM3_VL_VIDEO_FIXTURE"]))
+        let ids = reference.ids
+        try reference.expectGeneration(
+            LMInput(
+                text: .init(tokens: ids, mask: ones(like: ids).asType(.int8)),
+                video: .init(pixels: reference.pixels, frames: reference.grids)))
+
+        if let videoPath = environment["MLX_LFM3_VL_VIDEO"] {
+            let fixture = reference.fixture
+            let url = URL(fileURLWithPath: videoPath)
+            let track = try #require(
+                try await AVURLAsset(url: url).loadTracks(withMediaType: .video).first)
+            let (total, fps) = try await LFM3VLProcessor.frameCountAndRate(of: track)
+            #expect(total == fixture.totalFrames)
+            #expect(abs(fps - (fixture.fps ?? 0)) < 1e-9, "the clip's frame rate is \(fps)")
+            let config = try reference.processorConfiguration()
+            let indices = try LFM3VLProcessor.frameIndices(
+                total: total, fps: fps, settings: config.videoProcessor, sampling: .init())
+            #expect(indices == fixture.frameIndices)
+
+            let processor = LFM3VLProcessor(config, tokenizer: FixtureTokenizer(fixture))
+            let input = try await processor.prepare(
+                input: UserInput(chat: [
+                    .user("Describe this video in one sentence.", videos: [.url(url)])
+                ]))
+            #expect(input.text.tokens.asArray(Int.self) == fixture.ids)
+            #expect(input.video?.frames?.map { [$0.t, $0.h, $0.w] } == fixture.grid)
+            let swiftPixels = try #require(input.video?.pixels)
+            try #require(swiftPixels.shape == reference.pixels.shape)
+            let pixelError = abs(swiftPixels - reference.pixels).mean().item(Float.self)
+            // AVFoundation decodes the H.264 frames about 2 levels (0.016) from OpenCV
+            // (measured): most of the 0.015 this clip shows.
+            #expect(pixelError < 0.02, "preprocessed pixels differ by \(pixelError) on average")
+        }
+    }
+}
+
+/// A local checkpoint, `MLX_LFM3_VL_MODEL`, with a fixture made by mlx-vlm's `lfm3_vl`.
+private struct LocalReference {
+    let directory: URL
+    let fixture: VisionFixture
+    let model: LFM3VL
+    /// The fixture's patch pixels and their grids.
+    let pixels: MLXArray
+    let grids: [THW]
+
+    var exact: Bool { fixture.dtype == "float32" }
+    var ids: MLXArray { MLXArray(fixture.ids.map(Int32.init))[.newAxis] }
+
+    /// Loads the checkpoint in the fixture's dtype and compares the vision features of the
+    /// fixture's pixels with the reference ones.
+    init(fixture prefix: String) async throws {
+        directory = URL(
+            fileURLWithPath: try #require(ProcessInfo.processInfo.environment["MLX_LFM3_VL_MODEL"]))
+        fixture = try JSONDecoder().decode(
             VisionFixture.self, from: Data(contentsOf: URL(fileURLWithPath: prefix + ".json")))
         let tensors = try loadArrays(url: URL(fileURLWithPath: prefix + ".safetensors"))
-        let pixels = try #require(tensors["pixel_values"])
+        pixels = try #require(tensors["pixel_values"])
         let referenceFeatures = try #require(tensors["features"])
+        grids = fixture.grid.map { THW($0[0], $0[1], $0[2]) }
         let exact = fixture.dtype == "float32"
 
         let data = try Data(contentsOf: directory.appendingPathComponent("config.json"))
         let base = try JSONDecoder().decode(BaseConfiguration.self, from: data)
-        let model = LFM3VL(try JSONDecoder().decode(LFM3VLConfiguration.self, from: data))
+        model = LFM3VL(try JSONDecoder().decode(LFM3VLConfiguration.self, from: data))
         try await loadWeights(
             modelDirectory: directory, model: model,
             perLayerQuantization: base.perLayerQuantization)
@@ -353,23 +618,28 @@ struct LFM3VLTests {
                 }, verify: .none)
         }
 
-        let grids = fixture.grid.map { THW($0[0], $0[1], $0[2]) }
         let features = try model.features(pixels, grids: grids).asType(.float32)
         let featureError =
             (norm(features - referenceFeatures) / norm(referenceFeatures)).item(Float.self)
         // bfloat16 runs of either port sit 2% from float32 (measured), so they differ by 2.5%.
         #expect(featureError < (exact ? 1e-4 : 0.05), "features differ by \(featureError)")
+    }
 
-        let ids = MLXArray(fixture.ids.map(Int32.init))[.newAxis]
-        let input = LMInput(
-            text: .init(tokens: ids, mask: ones(like: ids).asType(.int8)),
-            image: .init(pixels: pixels, frames: grids))
+    func processorConfiguration() throws -> LFM3VLProcessorConfiguration {
+        try JSONDecoder().decode(
+            LFM3VLProcessorConfiguration.self,
+            from: Data(contentsOf: directory.appendingPathComponent("processor_config.json")))
+    }
+
+    /// Prefills `input`, the fixture's prompt with its media, and compares the last logits and
+    /// the greedy tokens with the reference ones.
+    func expectGeneration(_ input: LMInput) throws {
         let cache = try model.newCache(parameters: nil)
         guard
             case .logits(let output) = try model.prepare(
                 input, cache: cache, state: nil, prefill: .init())
         else {
-            Issue.record("Expected logits from an image prefill")
+            Issue.record("Expected logits from a media prefill")
             return
         }
         let last = output.logits[0, -1].asType(.float32)
@@ -393,19 +663,6 @@ struct LFM3VLTests {
         #expect(
             agreeing >= (exact ? generated.count : 2),
             "greedy tokens agree for \(agreeing) of \(generated.count)")
-
-        if let imagePath = environment["MLX_LFM3_VL_IMAGE"] {
-            let configData = try Data(
-                contentsOf: directory.appendingPathComponent("processor_config.json"))
-            let processor = LFM3VLProcessor(
-                try JSONDecoder().decode(LFM3VLProcessorConfiguration.self, from: configData),
-                tokenizer: PlaceholderTokenizer())
-            let image = try #require(CIImage(contentsOf: URL(fileURLWithPath: imagePath)))
-            let (swiftPixels, grid) = try processor.preprocess(image: image, processing: nil)
-            #expect([grid.t, grid.h, grid.w] == fixture.grid[0])
-            let pixelError = abs(swiftPixels - pixels).mean().item(Float.self)
-            #expect(pixelError < 0.02, "preprocessed pixels differ by \(pixelError) on average")
-        }
     }
 }
 
@@ -416,11 +673,138 @@ private struct VisionFixture: Decodable {
     let lastTopIds: [Int]
     let lastTopLogits: [Float]
     let greedyTokens: [Int]
+    // Video fixtures only: what `FixtureTokenizer` answers, and the frames the reference sampled.
+    let templateIds: [Int]?
+    let textIds: [String: [Int]]?
+    let totalFrames: Int?
+    let fps: Double?
+    let frameIndices: [Int]?
 
     enum CodingKeys: String, CodingKey {
-        case dtype, ids, grid
+        case dtype, ids, grid, fps
         case lastTopIds = "last_top_ids"
         case lastTopLogits = "last_top_logits"
         case greedyTokens = "greedy_tokens"
+        case templateIds = "template_ids"
+        case textIds = "text_ids"
+        case totalFrames = "total_frames"
+        case frameIndices = "frame_indices"
     }
+}
+
+/// The checkpoint tokenizer's answers for one video fixture: the ids of its chat template and
+/// of each text the processor encodes or looks up. Any other text encodes to -1.
+private struct FixtureTokenizer: Tokenizer {
+    let fixture: VisionFixture
+
+    init(_ fixture: VisionFixture) {
+        self.fixture = fixture
+    }
+
+    var bosToken: String? { nil }
+    var eosToken: String? { nil }
+    var unknownToken: String? { nil }
+
+    func encode(text: String, addSpecialTokens: Bool) -> [Int] {
+        fixture.textIds?[text] ?? [-1]
+    }
+
+    func decode(tokenIds: [Int], skipSpecialTokens: Bool) -> String { "" }
+
+    func convertTokenToId(_ token: String) -> Int? {
+        fixture.textIds?[token].flatMap { $0.count == 1 ? $0[0] : nil }
+    }
+
+    func convertIdToToken(_ id: Int) -> String? { nil }
+
+    func applyChatTemplate(
+        messages: [[String: any Sendable]], tools: [[String: any Sendable]]?,
+        additionalContext: [String: any Sendable]?
+    ) throws -> [Int] {
+        fixture.templateIds ?? []
+    }
+}
+
+// MARK: - Video clips
+
+/// An opaque gray of `level` out of 255, as decoded 8-bit sRGB.
+private func grayImage(_ level: Int, width: Int, height: Int) -> CIImage {
+    let pixel = [UInt8(level), UInt8(level), UInt8(level), 255]
+    return CIImage(
+        bitmapData: Data(repeatElement(pixel, count: width * height).joined()),
+        bytesPerRow: width * 4, size: CGSize(width: width, height: height), format: .RGBA8,
+        colorSpace: CGColorSpace(name: CGColorSpace.sRGB))
+}
+
+/// Writes an H.264 clip of `frames` frames at `fps` whose frame i is gray 8i.
+private func writeGrayClip(frames: Int, fps: Int32, width: Int, height: Int) async throws -> URL {
+    let url = FileManager.default.temporaryDirectory
+        .appendingPathComponent("lfm3-vl-\(UUID().uuidString).mp4")
+    let writer = try AVAssetWriter(outputURL: url, fileType: .mp4)
+    let input = AVAssetWriterInput(
+        mediaType: .video,
+        outputSettings: [
+            AVVideoCodecKey: AVVideoCodecType.h264, AVVideoWidthKey: width,
+            AVVideoHeightKey: height,
+            // Near lossless, so each frame keeps its gray.
+            AVVideoCompressionPropertiesKey: [AVVideoAverageBitRateKey: 20_000_000],
+        ])
+    let adaptor = AVAssetWriterInputPixelBufferAdaptor(
+        assetWriterInput: input,
+        sourcePixelBufferAttributes: [
+            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+            kCVPixelBufferWidthKey as String: width, kCVPixelBufferHeightKey as String: height,
+        ])
+    writer.add(input)
+    guard writer.startWriting(), let pool = adaptor.pixelBufferPool else {
+        throw writer.error ?? CocoaError(.fileWriteUnknown)
+    }
+    writer.startSession(atSourceTime: .zero)
+    for index in 0 ..< frames {
+        while !input.isReadyForMoreMediaData {
+            try await Task.sleep(for: .milliseconds(1))
+        }
+        var created: CVPixelBuffer?
+        CVPixelBufferPoolCreatePixelBuffer(nil, pool, &created)
+        let buffer = try #require(created)
+        CVPixelBufferLockBaseAddress(buffer, [])
+        let bytes = CVPixelBufferGetBaseAddress(buffer)!.assumingMemoryBound(to: UInt8.self)
+        for row in 0 ..< height {
+            for column in 0 ..< width {
+                let pixel = bytes + row * CVPixelBufferGetBytesPerRow(buffer) + column * 4
+                (pixel[0], pixel[1], pixel[2], pixel[3]) = (
+                    UInt8(8 * index), UInt8(8 * index), UInt8(8 * index), 255
+                )
+            }
+        }
+        CVPixelBufferUnlockBaseAddress(buffer, [])
+        adaptor.append(
+            buffer, withPresentationTime: CMTime(value: CMTimeValue(index), timescale: fps))
+    }
+    input.markAsFinished()
+    // The last frame lasts as long as the others.
+    writer.endSession(atSourceTime: CMTime(value: CMTimeValue(frames), timescale: fps))
+    await writer.finishWriting()
+    guard writer.status == .completed else { throw writer.error ?? CocoaError(.fileWriteUnknown) }
+    return url
+}
+
+/// Checks the processor's input for a 2.5 s clip at 12 fps whose frame i is gray 8i: frames 0,
+/// 7, 14, 22 and 29 (repeated to fill the last group) at 64 × 96, in three groups of 6 tokens
+/// labeled with their mean times.
+private func expectGrayClipInput(_ video: UserInput.Video) async throws {
+    let processor = LFM3VLProcessor(
+        try decode(LFM3VLProcessorConfiguration.self, "{}"), tokenizer: PlaceholderTokenizer())
+    let input = try await processor.prepare(input: UserInput(chat: [.user("hi", videos: [video])]))
+    #expect(input.video?.frames?.map { [$0.t, $0.h, $0.w] } == [[3, 4, 6]])
+    let group = "<|vision_start|>" + String(repeating: "<|video|>", count: 6) + "<|vision_end|>"
+    #expect(
+        PlaceholderTokenizer().decode(
+            tokenIds: input.text.tokens.asArray(Int.self), skipSpecialTokens: false)
+            == "<|vision_start|><0.3 seconds>\(group)<1.5 seconds>\(group)<2.4 seconds>\(group)<|vision_end|>"
+    )
+    // Patch rows are [group, patch] and their values [channel, temporal slot, pixel].
+    let pixels = try #require(input.video?.pixels).reshaped(3, 24, 3, 2, 256)
+    let frames = MLX.round((pixels.mean(axes: [1, 2, 4]) + 1) * 255 / 16).asType(.int32)
+    #expect(frames.asArray(Int32.self) == [0, 7, 14, 22, 29, 29])
 }

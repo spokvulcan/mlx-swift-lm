@@ -2,6 +2,7 @@
 
 // Port of https://github.com/Blaizzy/mlx-vlm/tree/main/mlx_vlm/models/lfm3_vl
 
+import AVFoundation
 import CoreImage
 import Foundation
 import MLX
@@ -390,6 +391,10 @@ public final class LFM3VL: Module, VLMModel, KVCacheDimensionProvider {
 
 /// Images at native resolution in 32-pixel steps, as Qwen-VL lays them out: 16-pixel patches
 /// grouped in 2 × 2 merge blocks, each image repeated over the two temporal slots.
+///
+/// Videos follow the reference: 2 frames a second, all resized to one size so the whole clip
+/// fits its pixel budget, and each pair of frames a temporal group that the prompt labels with
+/// its time.
 public struct LFM3VLProcessor: UserInputProcessor {
     private let config: LFM3VLProcessorConfiguration
     private let tokenizer: any Tokenizer
@@ -456,30 +461,293 @@ public struct LFM3VLProcessor: UserInputProcessor {
     }
 
     public func prepare(input: UserInput) async throws -> LMInput {
-        if !input.videos.isEmpty {
-            throw VLMError.processing("LFM3-VL video input is not supported yet")
-        }
         let messages = LFM3VLMessageGenerator().generate(
             from: input.removingSpecialTokenLabels(using: tokenizer))
         var promptTokens = try tokenizer.applyChatTemplate(
             messages: messages, tools: input.tools, additionalContext: input.additionalContext)
 
-        guard !input.images.isEmpty else {
+        guard !input.images.isEmpty || !input.videos.isEmpty else {
             return LMInput(tokens: MLXArray(promptTokens).expandedDimensions(axis: 0))
         }
 
-        let images = try input.images.map {
-            try preprocess(image: $0.asCIImage(), processing: input.processing)
+        var image: LMInput.ProcessedImage?
+        if !input.images.isEmpty {
+            let images = try input.images.map {
+                try preprocess(image: $0.asCIImage(), processing: input.processing)
+            }
+            let frames = images.map(\.1)
+            promptTokens = try QwenVL.replacePaddingTokens(
+                in: promptTokens, frames: frames, paddingToken: "<|image|>",
+                mergeSize: config.imageProcessor.mergeSize, tokenizer: tokenizer)
+            image = .init(pixels: concatenated(images.map(\.0)), frames: frames)
         }
-        let frames = images.map(\.1)
-        promptTokens = try QwenVL.replacePaddingTokens(
-            in: promptTokens, frames: frames, paddingToken: "<|image|>",
-            mergeSize: config.imageProcessor.mergeSize, tokenizer: tokenizer)
+
+        var video: LMInput.ProcessedVideo?
+        if !input.videos.isEmpty {
+            var clips = [(pixels: MLXArray, grid: THW, seconds: [Double])]()
+            for item in input.videos {
+                clips.append(try await preprocess(video: item, processing: input.processing))
+            }
+            let mergeLength = config.videoProcessor.mergeSize * config.videoProcessor.mergeSize
+            promptTokens = try Self.expandVideoPlaceholders(
+                promptTokens,
+                clips: clips.map { ($0.seconds, $0.grid.h * $0.grid.w / mergeLength) },
+                tokenizer: tokenizer)
+            video = .init(pixels: concatenated(clips.map(\.pixels)), frames: clips.map(\.grid))
+        }
 
         let promptArray = MLXArray(promptTokens).expandedDimensions(axis: 0)
         return LMInput(
             text: .init(tokens: promptArray, mask: ones(like: promptArray).asType(.int8)),
-            image: .init(pixels: concatenated(images.map(\.0)), frames: frames))
+            image: image, video: video)
+    }
+
+    // MARK: Video
+
+    /// One clip as the reference prepares it: the sampled frames resized to one size within the
+    /// clip's pixel budget and patchified like images, with the time of each temporal group.
+    func preprocess(video: UserInput.Video, processing: UserInput.Processing) async throws
+        -> (pixels: MLXArray, grid: THW, seconds: [Double])
+    {
+        let settings = config.videoProcessor
+        // The time of each sampled frame, then each decoded frame by its place in the sample.
+        var seconds = [Double]()
+        var decoded = [Int: MLXArray]()
+        var size: CGSize?
+
+        // Frames are resized as they are decoded, so a long clip never holds them at full size.
+        func add(_ frame: CIImage, at position: Int) throws {
+            let frame = MediaProcessing.apply(frame, processing: processing)
+            if size == nil {
+                let target = try Self.videoTargetSize(
+                    frames: seconds.count, height: Int(frame.extent.height.rounded()),
+                    width: Int(frame.extent.width.rounded()),
+                    factor: settings.patchSize * settings.mergeSize,
+                    temporalFactor: settings.temporalPatchSize, minPixels: settings.minPixels,
+                    maxPixels: settings.maxPixels)
+                size = CGSize(width: target.width, height: target.height)
+            }
+            // In the sRGB tone-curve space, as for images.
+            let resized = MediaProcessing.resampleBicubic(
+                MediaProcessing.inSRGBToneCurveSpace(frame), to: size!)
+            decoded[position] = MediaProcessing.asMLXArray(
+                MediaProcessing.normalize(
+                    resized, mean: settings.imageMeanTuple, std: settings.imageStdTuple))
+        }
+
+        func decode(_ asset: AVAsset) async throws {
+            guard let track = try await asset.loadTracks(withMediaType: .video).first else {
+                throw VLMError.noVideoTrackFound
+            }
+            guard try await track.load(.isDecodable) else { throw VLMError.videoNotDecodable }
+            let (total, fps) = try await Self.frameCountAndRate(of: track)
+            let indices = try Self.frameIndices(
+                total: total, fps: fps, settings: settings, sampling: processing.video)
+            // The reference labels frame i with i / fps, the rate rounded to 6 decimals.
+            let labelRate = (fps * 1_000_000).rounded() / 1_000_000
+            seconds = indices.map { Double($0) / labelRate }
+
+            // The middle of each frame, so rounding cannot select a neighbor.
+            let start = try await track.load(.timeRange).start.seconds
+            let times = indices.map {
+                CMTime(
+                    seconds: start + (Double($0) + 0.5) / fps, preferredTimescale: 1_000_000)
+            }
+            let generator = AVAssetImageGenerator(asset: asset)
+            generator.appliesPreferredTrackTransform = true
+            generator.requestedTimeToleranceBefore = .zero
+            generator.requestedTimeToleranceAfter = .zero
+            for await result in generator.images(for: times) {
+                guard case .success(let requested, let image, _) = result,
+                    let position = times.firstIndex(of: requested)
+                else { continue }
+                try add(
+                    CIImage(
+                        cgImage: image,
+                        options: [.colorSpace: CGColorSpace(name: CGColorSpace.sRGB)!]),
+                    at: position)
+            }
+        }
+
+        switch video.source {
+        case .frames(let frames):
+            let indices = try Self.frameIndices(
+                of: frames, settings: settings, sampling: processing.video)
+            seconds = indices.map { (frames[$0].timeStamp - frames[0].timeStamp).seconds }
+            for (position, index) in indices.enumerated() {
+                try add(frames[index].image.asCIImage(), at: position)
+            }
+        case .url(let url):
+            try await decode(AVURLAsset(url: url))
+        case .avAsset(let asset):
+            try await decode(asset)
+        }
+
+        let positions = decoded.keys.sorted()
+        guard positions.count >= settings.temporalPatchSize else {
+            throw VLMError.processing(
+                "LFM3-VL needs at least \(settings.temporalPatchSize) video frames, got \(positions.count)"
+            )
+        }
+        let (pixels, grid) = try QwenVL.patchify(
+            images: positions.map { decoded[$0]! }, mergeSize: settings.mergeSize,
+            patchSize: settings.patchSize, temporalPatchSize: settings.temporalPatchSize)
+        return (
+            pixels, grid,
+            Self.groupSeconds(positions.map { seconds[$0] }, groupSize: settings.temporalPatchSize)
+        )
+    }
+
+    /// The frame count and rate of a video track as OpenCV reads them: its samples, over the sum
+    /// of their durations.
+    static func frameCountAndRate(of track: AVAssetTrack) async throws -> (count: Int, fps: Double)
+    {
+        if try await track.load(.canProvideSampleCursors),
+            let first = track.makeSampleCursorAtFirstSampleInDecodeOrder(),
+            let last = track.makeSampleCursorAtLastSampleInDecodeOrder()
+        {
+            let duration = last.decodeTimeStamp + last.currentSampleDuration - first.decodeTimeStamp
+            // A step count past Int32.max moves the cursor nowhere.
+            let count = Int(first.stepInDecodeOrder(byCount: Int64(Int32.max))) + 1
+            if count > 0, duration.isNumeric, duration.value > 0 {
+                return (count, Double(count) * Double(duration.timescale) / Double(duration.value))
+            }
+        }
+        let (timeRange, rate) = try await track.load(.timeRange, .nominalFrameRate)
+        return (Int((timeRange.duration.seconds * Double(rate)).rounded()), Double(rate))
+    }
+
+    /// The reference frame indices: `settings.fps` frames a second, at least `minFrames` and at
+    /// most `maxFrames` and the clip's frames, placed as numpy's
+    /// `linspace(0, total - 1, count).round()` places them. `sampling` overrides the rate or
+    /// the count.
+    static func frameIndices(
+        total: Int, fps: Double, settings: LFM3VLProcessorConfiguration.VideoProcessor,
+        sampling: UserInput.VideoProcessing
+    ) throws -> [Int] {
+        let count: Int
+        if let target = sampling.targetFrames {
+            count = min(target, total)
+        } else {
+            let rate = sampling.targetFramesPerSecond ?? settings.fps
+            guard fps.isFinite, fps > 0, rate.isFinite, rate > 0 else {
+                throw VLMError.processing(
+                    "Video frame rates must be positive: clip \(fps), sampling \(rate)")
+            }
+            let wanted = Int(min(Double(total) / fps * rate, Double(total)))
+            count = min(max(wanted, settings.minFrames), settings.maxFrames, total)
+        }
+        guard count > 1 else { return count == 1 ? [0] : [] }
+        let step = Double(total - 1) / Double(count - 1)
+        return (0 ..< count).map {
+            $0 == count - 1 ? total - 1 : Int((Double($0) * step).rounded(.toNearestOrEven))
+        }
+    }
+
+    /// Frame indices of decoded frames, sampled as a clip whose rate their timestamps give.
+    static func frameIndices(
+        of frames: [UserInput.VideoFrame], settings: LFM3VLProcessorConfiguration.VideoProcessor,
+        sampling: UserInput.VideoProcessing
+    ) throws -> [Int] {
+        guard let first = frames.first, let last = frames.last else {
+            throw VLMError.processing("Video frame input must contain at least one frame.")
+        }
+        let span = last.timeStamp - first.timeStamp
+        // The reference assumes 24 fps for a clip of unknown rate.
+        let fps =
+            frames.count > 1 && span.isNumeric && span.value > 0
+            ? Double(frames.count - 1) * Double(span.timescale) / Double(span.value) : 24
+        return try frameIndices(
+            total: frames.count, fps: fps, settings: settings, sampling: sampling)
+    }
+
+    /// The video `smart_resize`: like the image one, but the pixel bounds hold for the whole
+    /// clip, its frame count rounded to the temporal patch size (half to even), and sides
+    /// shorter than `factor` are first scaled up to it.
+    static func videoTargetSize(
+        frames: Int, height: Int, width: Int, factor: Int, temporalFactor: Int, minPixels: Int,
+        maxPixels: Int
+    ) throws -> (height: Int, width: Int) {
+        guard frames >= temporalFactor else {
+            throw VLMError.processing(
+                "LFM3-VL needs at least \(temporalFactor) video frames, got \(frames)")
+        }
+        guard height > 0, width > 0 else {
+            throw VLMError.imageProcessingFailure("Video frame has no pixels: \(width) × \(height)")
+        }
+        var (height, width) = (height, width)
+        if height < factor || width < factor {
+            let scale = max(Double(factor) / Double(height), Double(factor) / Double(width))
+            (height, width) = (Int(Double(height) * scale), Int(Double(width) * scale))
+        }
+        guard Double(max(height, width)) / Double(min(height, width)) <= 200 else {
+            throw VLMError.imageProcessingFailure(
+                "Absolute aspect ratio must be smaller than 200: \(width) × \(height)")
+        }
+        let (t, h, w, f) = (Double(frames), Double(height), Double(width), Double(factor))
+        var hBar = Int((h / f).rounded(.toNearestOrEven)) * factor
+        var wBar = Int((w / f).rounded(.toNearestOrEven)) * factor
+        let tBar =
+            Int((t / Double(temporalFactor)).rounded(.toNearestOrEven)) * temporalFactor
+        if tBar * hBar * wBar > maxPixels {
+            let beta = (t * h * w / Double(maxPixels)).squareRoot()
+            hBar = max(factor, Int((h / beta / f).rounded(.down)) * factor)
+            wBar = max(factor, Int((w / beta / f).rounded(.down)) * factor)
+        } else if tBar * hBar * wBar < minPixels {
+            let beta = (Double(minPixels) / (t * h * w)).squareRoot()
+            hBar = Int((h * beta / f).rounded(.up)) * factor
+            wBar = Int((w * beta / f).rounded(.up)) * factor
+        }
+        return (hBar, wBar)
+    }
+
+    /// The time of each temporal group: the mean of its first and last frame times, the last
+    /// frame repeated to fill the final group.
+    static func groupSeconds(_ seconds: [Double], groupSize: Int) -> [Double] {
+        guard let last = seconds.last else { return [] }
+        let padded =
+            seconds
+            + repeatElement(last, count: (groupSize - seconds.count % groupSize) % groupSize)
+        return stride(from: 0, to: padded.count, by: groupSize).map {
+            (padded[$0] + padded[$0 + groupSize - 1]) / 2
+        }
+    }
+
+    /// Each `<|video|>` of the template, in order, replaced by its clip: per temporal group, its
+    /// time, then its tokens between vision markers. The template's own markers stay around
+    /// the clip, as in the reference.
+    static func expandVideoPlaceholders(
+        _ tokens: [Int], clips: [(seconds: [Double], tokensPerGroup: Int)],
+        tokenizer: any Tokenizer
+    ) throws -> [Int] {
+        guard let videoToken = tokenizer.convertTokenToId("<|video|>"),
+            let startToken = tokenizer.convertTokenToId("<|vision_start|>"),
+            let endToken = tokenizer.convertTokenToId("<|vision_end|>")
+        else {
+            throw VLMError.processing("The tokenizer has no LFM3-VL video tokens")
+        }
+        let found = tokens.filter { $0 == videoToken }.count
+        guard found == clips.count else {
+            throw VLMError.processing(
+                "Found \(found) video placeholders in the prompt but received \(clips.count) videos"
+            )
+        }
+        var result = [Int]()
+        var next = clips.makeIterator()
+        for token in tokens {
+            guard token == videoToken, let clip = next.next() else {
+                result.append(token)
+                continue
+            }
+            for seconds in clip.seconds {
+                result += tokenizer.encode(
+                    text: String(format: "<%.1f seconds>", seconds), addSpecialTokens: false)
+                result.append(startToken)
+                result += repeatElement(videoToken, count: clip.tokensPerGroup)
+                result.append(endToken)
+            }
+        }
+        return result
     }
 }
 
@@ -667,7 +935,8 @@ extension LFM3VLConfiguration: ModelConfigurationValidating {
     }
 }
 
-/// `processor_config.json`: the image settings under `image_processor` (or at the top level).
+/// `processor_config.json`: the image settings under `image_processor` (or at the top level),
+/// the video settings under `video_processor`.
 public struct LFM3VLProcessorConfiguration: Codable, Sendable {
 
     public struct ImageProcessor: Codable, Sendable {
@@ -728,10 +997,73 @@ public struct LFM3VLProcessorConfiguration: Codable, Sendable {
         }
     }
 
+    /// Frame sampling, and pixel bounds that hold for a whole clip.
+    public struct VideoProcessor: Codable, Sendable {
+        public var imageMean: [CGFloat] = [0.5, 0.5, 0.5]
+        public var imageStd: [CGFloat] = [0.5, 0.5, 0.5]
+        public var patchSize = 16
+        public var temporalPatchSize = 2
+        public var mergeSize = 2
+        public var size: ImageProcessor.Size?
+        /// Frames sampled per second of video.
+        public var fps: Double = 2
+        public var minFrames = 4
+        public var maxFrames = 768
+        private var _minPixels: Int?
+        private var _maxPixels: Int?
+
+        /// Bounds on the pixels of all of a clip's frames together.
+        public var minPixels: Int { _minPixels ?? size?.shortestEdge ?? 4_096 }
+        public var maxPixels: Int { _maxPixels ?? size?.longestEdge ?? 25_165_824 }
+        public var imageMeanTuple: (CGFloat, CGFloat, CGFloat) {
+            (imageMean[0], imageMean[1], imageMean[2])
+        }
+        public var imageStdTuple: (CGFloat, CGFloat, CGFloat) {
+            (imageStd[0], imageStd[1], imageStd[2])
+        }
+
+        enum CodingKeys: String, CodingKey {
+            case imageMean = "image_mean"
+            case imageStd = "image_std"
+            case patchSize = "patch_size"
+            case temporalPatchSize = "temporal_patch_size"
+            case mergeSize = "merge_size"
+            case size
+            case fps
+            case minFrames = "min_frames"
+            case maxFrames = "max_frames"
+            case _minPixels = "min_pixels"
+            case _maxPixels = "max_pixels"
+        }
+
+        /// The defaults of the checkpoint's `Lfm3VlVideoProcessor`.
+        public init() {}
+
+        public init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            imageMean =
+                try container.decodeIfPresent([CGFloat].self, forKey: .imageMean) ?? imageMean
+            imageStd = try container.decodeIfPresent([CGFloat].self, forKey: .imageStd) ?? imageStd
+            patchSize = try container.decodeIfPresent(Int.self, forKey: .patchSize) ?? patchSize
+            temporalPatchSize =
+                try container.decodeIfPresent(Int.self, forKey: .temporalPatchSize)
+                ?? temporalPatchSize
+            mergeSize = try container.decodeIfPresent(Int.self, forKey: .mergeSize) ?? mergeSize
+            size = try container.decodeIfPresent(ImageProcessor.Size.self, forKey: .size)
+            fps = try container.decodeIfPresent(Double.self, forKey: .fps) ?? fps
+            minFrames = try container.decodeIfPresent(Int.self, forKey: .minFrames) ?? minFrames
+            maxFrames = try container.decodeIfPresent(Int.self, forKey: .maxFrames) ?? maxFrames
+            _minPixels = try container.decodeIfPresent(Int.self, forKey: ._minPixels)
+            _maxPixels = try container.decodeIfPresent(Int.self, forKey: ._maxPixels)
+        }
+    }
+
     public var imageProcessor: ImageProcessor
+    public var videoProcessor: VideoProcessor
 
     enum CodingKeys: String, CodingKey {
         case imageProcessor = "image_processor"
+        case videoProcessor = "video_processor"
     }
 
     public init(from decoder: Decoder) throws {
@@ -739,6 +1071,9 @@ public struct LFM3VLProcessorConfiguration: Codable, Sendable {
         self.imageProcessor =
             try container.decodeIfPresent(ImageProcessor.self, forKey: .imageProcessor)
             ?? ImageProcessor(from: decoder)
+        self.videoProcessor =
+            try container.decodeIfPresent(VideoProcessor.self, forKey: .videoProcessor)
+            ?? VideoProcessor()
     }
 }
 
