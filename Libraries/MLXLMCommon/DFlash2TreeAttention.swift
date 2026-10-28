@@ -6,15 +6,16 @@ import MLX
 // MARK: - Tree verify attention
 
 /// MLX's one-pass vector SDPA (`sdpa_vector`, the kernel a verify pass runs
-/// below 1024 keys) for a tree block, with each row's own key read where a
-/// chain block would hold it. Row `i` sees the rows before `position` and
-/// block rows `position ..< position + depth[i]`, its ancestors, which the
-/// tree caches at their depths; at index `position + depth[i]` it reads its
-/// own key and value from block slot `slot[i]`. Each key keeps the index a
-/// chain block gives it, so it lands in the same simdgroup in the same order
-/// and the row reduces exactly as it does when its token is verified in a
-/// chain block. The rest of the arithmetic is MLX's: the `fastmath_` name
-/// compiles it the way the AOT metallib is compiled.
+/// below the two-pass threshold, `mlxRunsTwoPassSDPA(keys:gqa:)`) for a tree
+/// block, with each row's own key read where a chain block would hold it.
+/// Row `i` sees the rows before `position` and block rows
+/// `position ..< position + depth[i]`, its ancestors, which the tree caches
+/// at their depths; at index `position + depth[i]` it reads its own key and
+/// value from block slot `slot[i]`. Each key keeps the index a chain block
+/// gives it, so it lands in the same simdgroup in the same order and the row
+/// reduces exactly as it does when its token is verified in a chain block.
+/// The rest of the arithmetic is MLX's: the `fastmath_` name compiles it the
+/// way the AOT metallib is compiled.
 private func makeTreeAttentionKernel() -> MLXFast.MLXFastKernel? {
     let source = """
         constexpr int BN = 32;
@@ -117,13 +118,13 @@ private func makeTreeAttentionKernel() -> MLXFast.MLXFastKernel? {
 }
 
 /// MLX's two-pass MMA SDPA, pass 1 (`sdpa_vector_2pass_1_mma`, the kernel a
-/// verify pass runs from 1024 keys on: q [B, HQ, 8, 256], gqa <= 6), for a
-/// tree block. Every key block runs as MLX's does; in the block that holds a
-/// leaf row's depth index, the row's score and value for that column come
-/// from its own key, through the same MMA sequence a chain block runs with
-/// the key at that column: the K (then V) tile's row is patched, the
-/// column group's MMAs rerun, and only the leaf row's results are kept.
-/// Other rows add exact zeros in the extra MMAs.
+/// verify pass runs from the two-pass threshold on: q [B, HQ, 8, 256],
+/// gqa <= 6), for a tree block. Every key block runs as MLX's does; in the
+/// block that holds a leaf row's depth index, the row's score and value for
+/// that column come from its own key, through the same MMA sequence a chain
+/// block runs with the key at that column: the K (then V) tile's row is
+/// patched, the column group's MMAs rerun, and only the leaf row's results
+/// are kept. Other rows add exact zeros in the extra MMAs.
 private func makeTreeAttentionMMAKernel() -> MLXFast.MLXFastKernel? {
     let source = """
         constexpr int BK = 32;
@@ -544,6 +545,21 @@ private final class TreeAttentionKernelManager: Sendable {
     }
 }
 
+/// MLX's GPU class for SDPA routing: an architecture name ending in 'd' or
+/// 's'. MLX reads `MLX_METAL_GPU_ARCH` before the device's name; so does this.
+private let mlxSeesALargeGPU: Bool = {
+    let override = ProcessInfo.processInfo.environment["MLX_METAL_GPU_ARCH"] ?? ""
+    let architecture = override.isEmpty ? GPU.deviceInfo().architecture : override
+    return architecture.last == "d" || architecture.last == "s"
+}()
+
+/// Whether MLX's SDPA runs its two-pass kernels for a block of up to 8 query
+/// rows over `keys` keys: from 1024 keys on a large GPU, from 4096 with GQA
+/// on any. Below that it runs `sdpa_vector`.
+private func mlxRunsTwoPassSDPA(keys: Int, gqa: Int) -> Bool {
+    (mlxSeesALargeGPU && keys >= 1024) || (gqa > 1 && keys >= 4096)
+}
+
 /// A tree block's attention over a whole bf16/f16 cache buffer, each row's
 /// own key at its depth (see `makeTreeAttentionKernel()`).
 ///
@@ -574,9 +590,9 @@ public func dflash2TreeAttention(
     let (B, HQ, S) = (queries.dim(0), queries.dim(1), queries.dim(2))
     let gqa = HQ / keys.dim(1)
     let manager = TreeAttentionKernelManager.shared
-    if visibleLength >= 1024 {
-        // MLX's pick from 1024 keys (Apple GPU families 'd' and 's'): the
-        // MMA kernel for an 8-row block at head dim 256 and gqa <= 6.
+    if mlxRunsTwoPassSDPA(keys: visibleLength, gqa: gqa) {
+        // MLX's two-pass pick: the MMA kernel for an 8-row block at head
+        // dim 256 and gqa <= 6.
         guard S == 8, headDim == 256, gqa <= 6, let pass1 = manager.mmaPass1,
             let merge = manager.merge
         else { return nil }
