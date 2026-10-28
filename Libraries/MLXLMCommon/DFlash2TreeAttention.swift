@@ -545,15 +545,18 @@ private final class TreeAttentionKernelManager: Sendable {
 }
 
 /// A tree block's attention over a whole bf16/f16 cache buffer, each row's
-/// own key at its depth (see ``makeTreeAttentionKernel()``).
+/// own key at its depth (see `makeTreeAttentionKernel()`).
 ///
 /// - Parameters:
 ///   - queries: `[B, HQ, S, D]`, row-contiguous.
-///   - keys, values: the cache's whole buffers, `[B, HK, capacity, D]`,
-///     holding the block's rows at `position` in slot order.
+///   - keys: the cache's whole key buffer, `[B, HK, capacity, D]`, holding
+///     the block's rows at `position` in slot order.
+///   - values: the value buffer, shaped like `keys`.
 ///   - position: `[1]` int32, possibly lazy: the block's first row.
-///   - depths, slots: `[S]` int32 per row.
+///   - depths: `[S]` int32, each row's depth.
+///   - slots: `[S]` int32, each row's cache slot.
 ///   - visibleLength: rows the pass may read.
+///   - scale: the attention scale.
 /// - Returns: `[B, HQ, S, D]`, or nil where MLX would run another kernel
 ///   than these two (the two-pass vector kernels) or the shape is not served.
 public func dflash2TreeAttention(

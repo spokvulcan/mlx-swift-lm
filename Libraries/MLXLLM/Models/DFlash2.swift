@@ -790,7 +790,7 @@ public final class DFlash2DraftModel: Module, DFlash2DrafterModel {
     }
 
     /// The greedy proposal as a tree: the selector's greedy chain plus leaf
-    /// siblings (``dflash2TreeProposal(lattice:anchor:siblingRanks:)``).
+    /// siblings (`dflash2TreeProposal(lattice:anchor:siblingRanks:temperature:)`).
     public func proposeTree(
         block: MLXArray,
         targetHidden: MLXArray,
