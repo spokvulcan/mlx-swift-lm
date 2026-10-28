@@ -396,7 +396,7 @@ final class LFM3AudioDepthDecoder: Module {
 /// LFM3-Audio: the LFM3 language model, a speech encoder for input, and a depth decoder that
 /// writes speech frames of 12 codebook codes for output.
 ///
-/// Through the standard ``LanguageModel`` interface the model reads text and speech and writes
+/// Through the standard `LanguageModel` interface the model reads text and speech and writes
 /// text: speech markers are suppressed. ``LFM3AudioGenerator`` writes speech and interleaved
 /// text and speech, and ``LFM3AudioCodec`` turns the codes into 24 kHz audio.
 public final class LFM3Audio: Module, VLMModel, KVCacheDimensionProvider, SuppressedTokensProviding

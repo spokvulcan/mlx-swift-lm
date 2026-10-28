@@ -82,6 +82,7 @@ public struct LFM3AudioGenerator: Sequence, IteratorProtocol {
     private var history = [MLXArray]()
 
     /// - Parameters:
+    ///   - model: the LFM3-Audio model that writes the answer.
     ///   - input: a prompt from ``LFM3AudioProcessor``: text, and speech in `audio`.
     ///   - output: what to write; see ``LFM3AudioOutput``.
     ///   - parameters: text sampling. The model card decodes text greedily.

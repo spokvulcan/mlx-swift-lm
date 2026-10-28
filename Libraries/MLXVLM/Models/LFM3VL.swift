@@ -264,7 +264,7 @@ private final class LFM3VLProjector: Module, UnaryLayer {
 
 /// LFM3-VL: the LFM3 language model with an in-house convolution and attention vision encoder.
 ///
-/// The language model is MLXLLM's ``LFM3Model``, so text-only prompts take its prefill.
+/// The language model is MLXLLM's `LFM3Model`, so text-only prompts take its prefill.
 public final class LFM3VL: Module, VLMModel, KVCacheDimensionProvider {
     @ModuleInfo(key: "vision_tower") private var visionTower: LFM3Vision.VisionModel
     @ModuleInfo(key: "multi_modal_projector") private var projector: LFM3VLProjector
