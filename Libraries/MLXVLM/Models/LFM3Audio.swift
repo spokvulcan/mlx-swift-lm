@@ -480,7 +480,8 @@ public final class LFM3Audio: Module, VLMModel, KVCacheDimensionProvider, Suppre
         _ input: LMInput, cache: [any KVCache], state: LMOutput.State?, prefill: PrefillParameters
     ) throws -> PrepareResult {
         guard input.audio != nil else {
-            return try languageModel.prepare(input, cache: cache, state: state, prefill: prefill)
+            return try languageModel.prepare(
+                input.unbatchedText, cache: cache, state: state, prefill: prefill)
         }
         let embeddings = try inputEmbeddings(input.text.tokens, audio: input.audio)
         return try withPreparedCache(cache, lengths: input.text.sequenceLengths) {

@@ -217,6 +217,23 @@ struct LFM3VLTests {
         #expect(model(MLXArray([Int32(4)])[.newAxis], cache: cache).shape == [1, 1, 64])
     }
 
+    @Test("A text prompt batched as the processor batches it decodes as the bare tokens do")
+    func textOnlyDecode() throws {
+        let model = try tinyModel()
+        let ids = MLXArray([Int32(1), 2, 3, 4, 5])
+        var parameters = GenerateParameters(maxTokens: 3, temperature: 0)
+        parameters.prefill = .init(stepSize: 2)
+        var batched = try TokenIterator(
+            input: LMInput(tokens: ids[.newAxis]), model: model, parameters: parameters)
+        var bare = try TokenIterator(
+            input: LMInput(tokens: ids), model: model, parameters: parameters)
+        for _ in 0 ..< 3 {
+            let token = batched.next()
+            #expect(token != nil)
+            #expect(token == bare.next())
+        }
+    }
+
     @Test("A warm cache prefilled with the split suffix matches a cold prefill")
     func splitPreparedInput() throws {
         let model = try tinyModel()

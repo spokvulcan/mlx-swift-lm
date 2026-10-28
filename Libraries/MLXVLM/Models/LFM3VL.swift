@@ -328,7 +328,8 @@ public final class LFM3VL: Module, VLMModel, KVCacheDimensionProvider {
         _ input: LMInput, cache: [any KVCache], state: LMOutput.State?, prefill: PrefillParameters
     ) throws -> PrepareResult {
         guard input.image != nil || input.video != nil else {
-            return try languageModel.prepare(input, cache: cache, state: state, prefill: prefill)
+            return try languageModel.prepare(
+                input.unbatchedText, cache: cache, state: state, prefill: prefill)
         }
 
         let embeddings = try inputEmbeddings(input)
@@ -738,6 +739,15 @@ public struct LFM3VLProcessorConfiguration: Codable, Sendable {
         self.imageProcessor =
             try container.decodeIfPresent(ImageProcessor.self, forKey: .imageProcessor)
             ?? ImageProcessor(from: decoder)
+    }
+}
+
+extension LMInput {
+    /// Text-only input as an LLM's `prepare` takes it. The processors batch the tokens, and the
+    /// iterator adds a batch axis to whatever `prepare` hands back for it to step.
+    var unbatchedText: LMInput {
+        guard text.tokens.ndim == 2, text.tokens.dim(0) == 1 else { return self }
+        return LMInput(text: .init(tokens: text.tokens[0], mask: text.mask?[0]))
     }
 }
 
