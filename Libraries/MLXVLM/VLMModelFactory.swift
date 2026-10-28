@@ -108,6 +108,8 @@ public enum VLMTypeRegistry {
         "mistral3": create(Mistral3VLMConfiguration.self, Mistral3VLM.init),
         "lfm2_vl": create(LFM2VLConfiguration.self, LFM2VL.init),
         "lfm2-vl": create(LFM2VLConfiguration.self, LFM2VL.init),
+        "lfm3_vl": create(LFM3VLConfiguration.self, LFM3VL.init),
+        "lfm3_audio": create(LFM3AudioConfiguration.self, LFM3Audio.init),
         "glm_ocr": create(GlmOcrConfiguration.self, GlmOcr.init),
         "muse_glimmer": create(MuseGlimmerConfiguration.self, MuseGlimmer.init),
     ])
@@ -151,6 +153,10 @@ public enum VLMProcessorTypeRegistry {
             Mistral3VLMProcessorConfiguration.self, Mistral3VLMProcessor.init),
         "Lfm2VlProcessor": create(
             LFM2VLProcessorConfiguration.self, LFM2VLProcessor.init),
+        "Lfm3VlProcessor": create(
+            LFM3VLProcessorConfiguration.self, LFM3VLProcessor.init),
+        "Lfm3AudioProcessor": create(
+            LFM3AudioProcessorConfiguration.self, LFM3AudioProcessor.init),
         "Glm46VProcessor": create(
             GlmOcrProcessorConfiguration.self, GlmOcrProcessor.init),
         "MuseGlimmerProcessor": create(
@@ -210,6 +216,16 @@ public class VLMRegistry: AbstractModelRegistry, @unchecked Sendable {
 
     static public let lfm2_vl_1_6B_4bit = ModelConfiguration(
         id: "mlx-community/LFM2-VL-1.6B-4bit",
+        defaultPrompt: ""
+    )
+
+    static public let lfm3_vl_2B_4bit = ModelConfiguration(
+        id: "LiquidAI/LFM3-VL-2B-MLX-4bit",
+        defaultPrompt: "Describe the image in English"
+    )
+
+    static public let lfm3_audio_2B_4bit = ModelConfiguration(
+        id: "LiquidAI/LFM3-Audio-2B-MLX-4bit",
         defaultPrompt: ""
     )
 
@@ -324,6 +340,8 @@ public class VLMRegistry: AbstractModelRegistry, @unchecked Sendable {
             gemma4_31B_it_4bit,
             smolvlm,
             fastvlm,
+            lfm3_vl_2B_4bit,
+            lfm3_audio_2B_4bit,
             qwen3_5_27B_4bit,
             qwen3_5_35B_A3B_4bit,
             qwen3_8_27B_4bit,

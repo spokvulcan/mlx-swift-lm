@@ -139,7 +139,7 @@ for layer in status.layers {
 print(status.memoryBytes)
 ```
 
-Hybrid attention / state-space models (Qwen3.5, Jamba, LFM2, Falcon-H1, …)
+Hybrid attention / state-space models (Qwen3.5, Jamba, LFM2, LFM3, Falcon-H1, …)
 apply `maxKVSize` only to attention layers. Architecture sliding-window layers
 use `min(slidingWindow, maxKVSize)`. State-space caches are never token-windowed.
 

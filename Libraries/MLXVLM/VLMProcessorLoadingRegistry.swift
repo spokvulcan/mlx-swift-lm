@@ -73,6 +73,8 @@ public final class VLMProcessorLoadingRegistry: @unchecked Sendable {
         ModelTypeProcessorResolver(processorTypes: [
             "mistral3": "Mistral3Processor",
             "gemma4_unified": "Gemma4UnifiedProcessor",
+            // `preprocessor_config.json`, which the factory prefers, names no processor.
+            "lfm3_audio": "Lfm3AudioProcessor",
         ]),
     ])
 

@@ -100,6 +100,7 @@ LLMRegistry.mellum2_1_12b_a2_5b_thinking_6bit  // mlx-community/Mellum2.1-12B-A2
 | `smollm3` | SmolLM 3 |
 | `ernie4_5` | ERNIE 4.5 |
 | `lfm2`, `lfm2_moe` | LFM 2 |
+| `lfm3` | LFM 3 |
 | `exaone4` | EXAONE 4 |
 | `olmo2`, `olmo3`, `olmoe` | OLMo |
 | `falcon_h1` | Falcon H1 |
@@ -149,6 +150,8 @@ VLMRegistry.paligemma3bMix448_8bit // mlx-community/paligemma-3b-mix-448-8bit
 | `pixtral` | Pixtral |
 | `mistral3` | Mistral 3 VLM |
 | `lfm2_vl`, `lfm2-vl` | LFM2 VL |
+| `lfm3_vl` | LFM3 VL (images; video is not supported yet) |
+| `lfm3_audio` | LFM3 Audio (speech in; text out here, speech out with `LFM3AudioGenerator` and `LFM3AudioCodec`) |
 | `muse_glimmer` | Meta Muse Glimmer (text, image, reasoning, and ATEM tool calls) |
 
 ## Loading Any Model
