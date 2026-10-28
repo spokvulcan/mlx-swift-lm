@@ -8,11 +8,14 @@ import MLX
 
 // MARK: - Residual add + RMS norm
 
-/// `h = x + r` and `rmsNorm(h, weight, eps)` in one launch. The kernel is
-/// MLX's `rms_looped` with the residual add folded into the row read: the
+/// `h = x + r` and `rmsNorm(h, weight, eps)` in one launch. The kernel writes
+/// each thread's elements of `h`, then runs MLX's `rms_looped` on them: the
 /// same thread geometry, the same per-thread accumulation order and the same
 /// simd reductions, so `h` and the normed output are bitwise what the
-/// separate `Add` and `RMSNorm` launches produce.
+/// separate `Add` and `RMSNorm` launches produce. It squares `h` as stored,
+/// read back after a barrier, as MLX's kernel squares its input: under fast
+/// math a compiler may skip rounding a register copy to `T` (the paravirtual
+/// GPU of GitHub's macOS runners does).
 private func makeRMSNormResidualKernel() -> MLXFast.MLXFastKernel? {
     let source = """
         constexpr int N_READS = 4;
@@ -35,21 +38,32 @@ private func makeRMSNormResidualKernel() -> MLXFast.MLXFastKernel? {
         device T* outr = out + row;
         const device T* wr = w + lid * N_READS;
 
+        for (uint i0 = 0; i0 < axis_size; i0 += lsize * N_READS) {
+          if (i0 + lid * N_READS + N_READS <= axis_size) {
+            for (int i = 0; i < N_READS; i++) {
+              hr[i + i0] = (T)((float)xr[i + i0] + (float)rr[i + i0]);
+            }
+          } else {
+            for (int i = 0; i < N_READS; i++) {
+              if ((i0 + lid * N_READS + i) < axis_size) {
+                hr[i + i0] = (T)((float)xr[i + i0] + (float)rr[i + i0]);
+              }
+            }
+          }
+        }
+        threadgroup_barrier(mem_flags::mem_device);
+
         float acc = 0;
         for (uint i0 = 0; i0 < axis_size; i0 += lsize * N_READS) {
           if (i0 + lid * N_READS + N_READS <= axis_size) {
             for (int i = 0; i < N_READS; i++) {
-              const T hi = (T)((float)xr[i + i0] + (float)rr[i + i0]);
-              hr[i + i0] = hi;
-              const float xi = hi;
+              const float xi = hr[i + i0];
               acc += xi * xi;
             }
           } else {
             for (int i = 0; i < N_READS; i++) {
               if ((i0 + lid * N_READS + i) < axis_size) {
-                const T hi = (T)((float)xr[i + i0] + (float)rr[i + i0]);
-                hr[i + i0] = hi;
-                const float xi = hi;
+                const float xi = hr[i + i0];
                 acc += xi * xi;
               }
             }
