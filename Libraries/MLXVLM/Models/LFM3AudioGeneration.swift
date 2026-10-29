@@ -90,14 +90,16 @@ public struct LFM3AudioGenerator: Sequence, IteratorProtocol {
     ///   - maxSlots: the most text tokens and speech frames to write.
     ///   - endOfTurnTokenIds: tokens that end the answer (`<|im_end|>`).
     ///   - frameOrders: the MaskGIT reveal order of each frame, random when `nil`.
+    ///   - components: custom logit processing, applied to the text tokens only.
     ///   - prefill: the chunking of the prompt.
     public init(
         model: LFM3Audio, input: LMInput, output: LFM3AudioOutput = .automatic,
         parameters: GenerateParameters = GenerateParameters(temperature: 0),
         audio: LFM3AudioSampling = .init(), maxSlots: Int = 2048,
         endOfTurnTokenIds: Set<Int> = [124_900], frameOrders: [[Int]]? = nil,
-        prefill: PrefillParameters = .init()
+        components: GenerationComponents = .init(), prefill: PrefillParameters = .init()
     ) throws {
+        try components.validate(parameters: parameters)
         let config = model.config
         self.model = model
         self.config = config
@@ -134,7 +136,7 @@ public struct LFM3AudioGenerator: Sequence, IteratorProtocol {
         self.suppressor = SuppressTokensProcessor(tokenIds: suppressed)
 
         let tokens = MLXArray(ids.map(Int32.init))
-        var processor = parameters.processor()
+        var processor = components.logitProcessor(parameters: parameters)
         processor?.prompt(tokens)
         self.processor = processor
 

@@ -54,6 +54,24 @@ private func tinyModel() throws -> LFM3Audio {
     return model
 }
 
+/// Leaves only `token` at the first sampled step.
+private struct OnlyFirstToken: LogitProcessor {
+    let token: Int
+    var sampled = false
+
+    mutating func prompt(_ prompt: MLXArray) {}
+
+    func process(logits: MLXArray) -> MLXArray {
+        guard !sampled else { return logits }
+        let only = MLXArray(0 ..< Int32(logits.dim(-1))) .== Int32(token)
+        return MLX.where(only, logits, MLXArray(-Float.infinity))
+    }
+
+    mutating func didSample(token: MLXArray) {
+        sampled = true
+    }
+}
+
 /// Features of a tiny clip for the tiny model: 16 mel bins.
 private func tinyFeatures(frames: Int) -> MLXArray {
     MLXRandom.normal([16, frames], key: MLXRandom.key(3))
@@ -244,6 +262,40 @@ struct LFM3AudioTests {
         for case .speech(let codes) in slots {
             #expect(codes.count == 4 && codes.allSatisfy { (0 ..< 8).contains($0) })
         }
+    }
+
+    @Test("A custom logit processor picks the first token")
+    func customProcessor() throws {
+        let model = try tinyModel()
+        let input = LMInput(tokens: MLXArray([Int32(1), 2, 3])[.newAxis])
+        for first in [5, 7] {
+            let components = GenerationComponents().appendingLogitProcessor {
+                OnlyFirstToken(token: first)
+            }
+            var generator = try LFM3AudioGenerator(
+                model: model, input: input, maxSlots: 4, endOfTurnTokenIds: [],
+                components: components)
+            #expect(generator.next() == .text(first))
+        }
+    }
+
+    @Test("Opening with `<|mixed_start|>` answers interleaved")
+    func openingInterleaved() throws {
+        let model = try tinyModel()
+        let input = LMInput(tokens: MLXArray([Int32(1), 2, 3])[.newAxis])
+        let components = GenerationComponents().appendingLogitProcessor {
+            OnlyFirstToken(token: 59)
+        }
+        let slots = Array(
+            try LFM3AudioGenerator(
+                model: model, input: input, audio: .init(temperature: 0), maxSlots: 6,
+                endOfTurnTokenIds: [], components: components))
+        #expect(slots.first == .text(59))
+        // Two text tokens, then speech.
+        #expect(
+            slots.dropFirst().prefix(3).contains {
+                if case .text = $0 { false } else { true }
+            })
     }
 
     @Test("Original checkpoints map their export names and torch layouts")
